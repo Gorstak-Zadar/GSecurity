@@ -52,29 +52,26 @@ call :clean_usb_devices
 :GSecurity
 call :log "GSecurity..."
 call :GSecurity
+goto :complete
 
 :complete
 call :log "System cleanup complete."
-:: No exit here, script will continue
 goto :cleanup
 
 :: Core Functions
 :get_current_date
     for /f "tokens=1 delims=." %%a in ('wmic os get localdatetime ^| find "."') do set "DTS=%%a"
     set "CUR_DATE=!DTS:~0,4!-!DTS:~4,2!-!DTS:~6,2!"
-    :: Return control to the caller
     goto :eof
 
 :log
     echo %CUR_DATE% %TIME%   %~1 >> "%LOGPATH%\%LOGFILE%"
     echo %CUR_DATE% %TIME%   %~1
-    :: Return control to the caller
     goto :eof
 
 :check_admin_rights
     net session >nul 2>&1 || (
         call :log "ERROR: Administrative privileges required."
-        :: No exit here, returning control
         goto :eof
     )
     goto :eof
@@ -161,7 +158,7 @@ goto :cleanup
     del /F /S /Q "%~1\AppData\Roaming\Macromedia\Flash Player\*" >> "%LOGPATH%\%LOGFILE%" 2>NUL
     goto :eof
 
-:: USB Device Cleanup (Removed third-party tools)
+:: USB Device Cleanup
 :clean_usb_devices
     call :log "Cleaning USB device registry..."
     reg delete "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" /f >> "%LOGPATH%\%LOGFILE%" 2>NUL
@@ -169,8 +166,6 @@ goto :cleanup
     goto :eof
 
 :GSecurity
-
-@echo off
 set KEY=HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Network
 set SETACL=%~dp0SetACL.exe
 set DEVCON=%~dp0devcon.exe
@@ -181,91 +176,102 @@ echo Starting network cleanup at %DATE% %TIME% > %LOGFILE%
 :: Verify devcon.exe exists
 if not exist %DEVCON% (
     echo Error: devcon.exe not found at %DEVCON%. Please download from Microsoft WDK or Support Tools. >> %LOGFILE%
-    exit /b 1
+    call :log "Error: devcon.exe not found, skipping device-related operations."
+) else (
+    :: List all network adapters
+    echo Listing network adapters... >> %LOGFILE%
+    netsh interface show interface >> %LOGFILE%
+    %DEVCON% find *NET* >> %LOGFILE%
+
+    :: Unbridge network adapters
+    echo Checking for network bridges... >> %LOGFILE%
+    netsh bridge show adapter >> %LOGFILE%
+    echo Unbridging adapters... >> %LOGFILE%
+    netsh bridge uninstall
+    if %ERRORLEVEL% NEQ 0 (
+        echo Failed to unbridge adapters! Continuing... >> %LOGFILE%
+        call :log "Warning: Failed to unbridge network adapters."
+    )
+
+    :: Disable unauthorized adapters (placeholder - replace with actual adapter names)
+    echo Disabling unauthorized adapters... >> %LOGFILE%
+    :: Example: netsh interface set interface "TAP-Windows Adapter V9" disable
+    :: netsh interface set interface "<AdapterName>" disable
+    :: if %ERRORLEVEL% NEQ 0 (
+    ::     echo Failed to disable adapter <AdapterName>! >> %LOGFILE%
+    ::     call :log "Warning: Failed to disable adapter <AdapterName>."
+    :: )
+
+    :: Remove unauthorized adapters (placeholder - replace with actual DeviceIDs from devcon)
+    echo Removing unauthorized adapters... >> %LOGFILE%
+    :: Example: %DEVCON% remove @PCI\VEN_8086&DEV_...
+    :: %DEVCON% remove @<DeviceID>
+    :: if %ERRORLEVEL% NEQ 0 (
+    ::     echo Failed to remove adapter <DeviceID>! >> %LOGFILE%
+    ::     call :log "Warning: Failed to remove adapter <DeviceID>."
+    :: )
 )
 
-:: Backup registry permissions
-echo Backing up current registry permissions... >> %LOGFILE%
-%SETACL% -on "%KEY%" -ot reg -actn list -lst "f:sddl;w:dacl" -bckp "network_permissions_backup.txt"
-if %ERRORLEVEL% NEQ 0 (
-    echo Backup failed! Exiting... >> %LOGFILE%
-    exit /b %ERRORLEVEL%
+:: Verify SetACL.exe exists
+if not exist %SETACL% (
+    echo Error: SetACL.exe not found at %SETACL%. >> %LOGFILE%
+    call :log "Error: SetACL.exe not found, skipping registry permission changes."
+) else (
+    :: Backup registry permissions
+    echo Backing up current registry permissions... >> %LOGFILE%
+    %SETACL% -on "%KEY%" -ot reg -actn list -lst "f:sddl;w:dacl" -bckp "network_permissions_backup.txt"
+    if %ERRORLEVEL% NEQ 0 (
+        echo Backup failed! Continuing... >> %LOGFILE%
+        call :log "Warning: Registry permission backup failed."
+    )
+
+    :: Remove Everyone group
+    echo Removing Everyone group... >> %LOGFILE%
+    %SETACL% -on "%KEY%" -ot reg -actn trustee -trst "n1:Everyone;ta:remtrst;w:dacl"
+    if %ERRORLEVEL% NEQ 0 (
+        echo Failed to remove Everyone! Continuing... >> %LOGFILE%
+        call :log "Warning: Failed to remove Everyone group from registry permissions."
+    )
+
+    :: Set default permissions
+    echo Setting default permissions... >> %LOGFILE%
+    %SETACL% -on "%KEY%" -ot reg -actn ace -ace "n:Administrators;p:full" -rec cont_obj
+    %SETACL% -on "%KEY%" -ot reg -actn ace -ace "n:SYSTEM;p:full" -rec cont_obj
+    %SETACL% -on "%KEY%" -ot reg -actn ace -ace "n:Users;p:read" -rec cont_obj
+    %SETACL% -on "%KEY%" -ot reg -actn ace -ace "n:CREATOR OWNER;p:full;i:so,sc" -rec cont_obj
+    if %ERRORLEVEL% NEQ 0 (
+        echo Failed to set permissions! Continuing... >> %LOGFILE%
+        call :log "Warning: Failed to set registry permissions."
+    )
+
+    :: Set ownership to Administrators
+    echo Setting ownership to Administrators... >> %LOGFILE%
+    %SETACL% -on "%KEY%" -ot reg -actn setowner -ownr "n:Administrators" -rec cont_obj
+    if %ERRORLEVEL% NEQ 0 (
+        echo Failed to set ownership! Continuing... >> %LOGFILE%
+        call :log "Warning: Failed to set registry ownership."
+    )
+
+    :: Enable inheritance
+    echo Enabling inheritance... >> %LOGFILE%
+    %SETACL% -on "%KEY%" -ot reg -actn setprot -op "dacl:np;sacl:np"
+    if %ERRORLEVEL% NEQ 0 (
+        echo Failed to enable inheritance! Continuing... >> %LOGFILE%
+        call :log "Warning: Failed to enable registry inheritance."
+    )
+
+    :: Verify final state
+    echo Verifying registry permissions... >> %LOGFILE%
+    %SETACL% -on "%KEY%" -ot reg -actn list -lst "f:table;w:dacl" >> %LOGFILE%
 )
 
-:: Remove Everyone group
-echo Removing Everyone group... >> %LOGFILE%
-%SETACL% -on "%KEY%" -ot reg -actn trustee -trst "n1:Everyone;ta:remtrst;w:dacl"
-if %ERRORLEVEL% NEQ 0 (
-    echo Failed to remove Everyone! Exiting... >> %LOGFILE%
-    exit /b %ERRORLEVEL%
-)
-
-:: Set default permissions
-echo Setting default permissions... >> %LOGFILE%
-%SETACL% -on "%KEY%" -ot reg -actn ace -ace "n:Administrators;p:full" -rec cont_obj
-%SETACL% -on "%KEY%" -ot reg -actn ace -ace "n:SYSTEM;p:full" -rec cont_obj
-%SETACL% -on "%KEY%" -ot reg -actn ace -ace "n:Users;p:read" -rec cont_obj
-%SETACL% -on "%KEY%" -ot reg -actn ace -ace "n:CREATOR OWNER;p:full;i:so,sc" -rec cont_obj
-if %ERRORLEVEL% NEQ 0 (
-    echo Failed to set permissions! Exiting... >> %LOGFILE%
-    exit /b %ERRORLEVEL%
-)
-
-:: Set ownership to Administrators
-echo Setting ownership to Administrators... >> %LOGFILE%
-%SETACL% -on "%KEY%" -ot reg -actn setowner -ownr "n:Administrators" -rec cont_obj
-if %ERRORLEVEL% NEQ 0 (
-    echo Failed to set ownership! Exiting... >> %LOGFILE%
-    exit /b %ERRORLEVEL%
-)
-
-:: Enable inheritance
-echo Enabling inheritance... >> %LOGFILE%
-%SETACL% -on "%KEY%" -ot reg -actn setprot -op "dacl:np;sacl:np"
-if %ERRORLEVEL% NEQ 0 (
-    echo Failed to enable inheritance! Exiting... >> %LOGFILE%
-    exit /b %ERRORLEVEL%
-)
-
-:: Unbridge network adapters
-echo Checking for network bridges... >> %LOGFILE%
-netsh bridge show adapter >> %LOGFILE%
-echo Unbridging adapters... >> %LOGFILE%
-netsh bridge uninstall
-if %ERRORLEVEL% NEQ 0 (
-    echo Failed to unbridge adapters! Continuing... >> %LOGFILE%
-)
-
-:: List all network adapters
-echo Listing network adapters... >> %LOGFILE%
-netsh interface show interface >> %LOGFILE%
-%DEVCON% find *NET* >> %LOGFILE%
-
-:: Disable unauthorized adapters (replace with actual adapter names)
-echo Disabling unauthorized adapters... >> %LOGFILE%
-:: Example: netsh interface set interface "TAP-Windows Adapter V9" disable
-:: netsh interface set interface "<AdapterName>" disable
-:: if %ERRORLEVEL% NEQ 0 (
-::     echo Failed to disable adapter <AdapterName>! >> %LOGFILE%
-:: )
-
-:: Remove unauthorized adapters (replace with actual DeviceIDs from devcon)
-echo Removing unauthorized adapters... >> %LOGFILE%
-:: Example: %DEVCON% remove @PCI\VEN_8086&DEV_...
-:: %DEVCON% remove @<DeviceID>
-:: if %ERRORLEVEL% NEQ 0 (
-::     echo Failed to remove adapter <DeviceID>! >> %LOGFILE%
-:: )
-
-:: Verify final state
-echo Verifying registry permissions... >> %LOGFILE%
-%SETACL% -on "%KEY%" -ot reg -actn list -lst "f:table;w:dacl" >> %LOGFILE%
+:: Verify network adapters
 echo Verifying network adapters... >> %LOGFILE%
+net-Echo Verifying network adapters... >> %LOGFILE%
 netsh interface show interface >> %LOGFILE%
 
-echo Cleanup completed at %DATE% %TIME%. Check %LOGFILE% for details.
-
-:: riddance
+:: User account cleanup (riddance)
+call :log "Cleaning up user accounts..."
 for /f "tokens=1,2*" %%x in ('whoami /user /fo list ^| findstr /i "name sid"') do (
     set "USERNAME=%%z"
     set "USERSID=%%y"
@@ -275,211 +281,347 @@ for /f "tokens=*" %%u in ('net user ^| findstr /i /c:"User" ^| find /v "command 
     set "USERLINE=%%u"
     set "USERRID=!USERLINE:~-4!"
     if !USERRID! neq !RID! (
-        echo Removing user: !USERLINE!
+        echo Removing user: !USERLINE! >> %LOGFILE%
         net user !USERLINE! /delete
+        if %ERRORLEVEL% NEQ 0 (
+            call :log "Warning: Failed to delete user !USERLINE!."
+        )
     )
 )
 reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v EnableLUA /t REG_DWORD /d 1 /f
-
-:: Perms
-takeown /f %windir%\System32\Oobe\useroobe.dll /A
-icacls %windir%\System32\Oobe\useroobe.dll /inheritance:r
-icacls "%systemdrive%\Users" /remove "Everyone"
-takeown /f "%USERPROFILE%\Desktop" /r /d y
-icacls "%USERPROFILE%\Desktop" /inheritance:r
-icacls "%USERPROFILE%\Desktop" /grant:r %username%:(OI)(CI)F /t /l /q /c
-icacls "%USERPROFILE%\Desktop" /remove "System" /t /c /l
-icacls "%USERPROFILE%\Desktop" /remove "Administrators" /t /c /l
-icacls "C:\Users\Public" /reset /T
-takeown /f "C:\Users\Public\Desktop" /r /d y
-icacls "C:\Users\Public\Desktop" /inheritance:r
-icacls "C:\Users\Public\Desktop" /grant:r %username%:(OI)(CI)F /t /l /q /c
-icacls "C:\Users\Public\Desktop" /remove "System" /t /c /l
-icacls "C:\Users\Public\Desktop" /remove "Administrators" /t /c /l
-
-:: consent
-takeown /f %windir%\system32\consent.exe /A
-icacls %windir%\system32\consent.exe /inheritance:r /T /C
-icacls %windir%\system32\consent.exe /grant:r "Console Logon":RX
-icacls %windir%\system32\consent.exe /remove "ALL APPLICATION PACKAGES"
-icacls %windir%\system32\consent.exe /remove "ALL RESTRICTED APPLICATION PACKAGES"
-icacls %windir%\system32\consent.exe /remove "System"
-icacls %windir%\system32\consent.exe /remove "Users"
-icacls %windir%\system32\consent.exe /remove "Authenticated Users"
-icacls %windir%\system32\consent.exe /remove "Administrators"
-icacls %windir%\system32\consent.exe /remove "NT SERVICE\TrustedInstaller"
-Reg.exe add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v "ConsentPromptBehaviorAdmin" /t REG_DWORD /d "1" /f
-Reg.exe add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v "ConsentPromptBehaviorUser" /t REG_DWORD /d "1" /f
-Reg.exe add "HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System" /v "ConsentPromptBehaviorAdmin" /t REG_DWORD /d "1" /f
-Reg.exe add "HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System" /v "ConsentPromptBehaviorUser" /t REG_DWORD /d "1" /f
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to enable UAC via registry."
+)
 
 :: Services stop and disable
+call :log "Stopping and disabling services..."
 sc stop LanmanWorkstation
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to stop LanmanWorkstation service."
+)
 sc stop LanmanServer
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to stop LanmanServer service."
+)
 sc stop seclogon
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to stop seclogon service."
+)
 sc config LanmanWorkstation start= disabled
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to disable LanmanWorkstation service."
+)
 sc config LanmanServer start= disabled
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to disable LanmanServer service."
+)
 sc config seclogon start= disabled
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to disable seclogon service."
+)
 
 :: Install RamCleaner
+call :log "Installing RamCleaner..."
 mkdir %windir%\Setup\Scripts
 mkdir %windir%\Setup\Scripts\Bin
 copy /y emptystandbylist.exe %windir%\Setup\Scripts\Bin\emptystandbylist.exe
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to copy emptystandbylist.exe."
+)
 copy /y RamCleaner.bat %windir%\Setup\Scripts\Bin\RamCleaner.bat
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to copy RamCleaner.bat."
+)
 schtasks /create /tn "RamCleaner" /xml "RamCleaner.xml" /ru "SYSTEM"
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to create RamCleaner scheduled task."
+)
 
-:: EDR
-rem setup.exe /s /v"/qn"
+:: EDR (commented out as it seems incomplete)
+:: rem setup.exe /s /v"/qn"
 
 :: Security Policy Import
+call :log "Importing security policy..."
 LGPO.exe /s GSecurity.inf
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to import security policy with LGPO.exe."
+)
 
 :: Install elam driver
+call :log "Installing ELAM driver..."
 pnputil /add-driver *.inf /subdirs /install
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to install ELAM driver."
+)
 
 :: Mini filter drivers
+call :log "Removing mini filter drivers..."
 fltmc unload bfs
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to unload bfs filter."
+)
 fltmc unload unionfs
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to unload unionfs filter."
+)
 takeown /f %windir%\system32\drivers\bfs.sys /A
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to take ownership of bfs.sys."
+)
 takeown /f %windir%\system32\drivers\unionfs.sys /A
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to take ownership of unionfs.sys."
+)
 icacls %windir%\system32\drivers\bfs.sys /reset
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to reset permissions on bfs.sys."
+)
 icacls %windir%\system32\drivers\unionfs.sys /reset
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to reset permissions on unionfs.sys."
+)
 icacls %windir%\system32\drivers\bfs.sys /inheritance:d
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to disable inheritance on bfs.sys."
+)
 icacls %windir%\system32\drivers\unionfs.sys /inheritance:d
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to disable inheritance on unionfs.sys."
+)
 del %windir%\system32\drivers\bfs.sys /Q
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to delete bfs.sys."
+)
 del %windir%\system32\drivers\unionfs.sys /Q
-
-set KEY=HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Network
-set LOGFILE=network_cleanup_log.txt
-
-echo Starting network cleanup at %DATE% %TIME% > %LOGFILE%
-
-:: Backup registry permissions
-echo Backing up current registry permissions... >> %LOGFILE%
-%SETACL% -on "%KEY%" -ot reg -actn list -lst "f:sddl" -bckp "network_permissions_backup.txt"
 if %ERRORLEVEL% NEQ 0 (
-    echo Backup failed! Exiting... >> %LOGFILE%
-    exit /b %ERRORLEVEL%
+    call :log "Warning: Failed to delete unionfs.sys."
 )
 
-:: Remove Everyone group
-echo Removing Everyone group... >> %LOGFILE%
-%SETACL% -on "%KEY%" -ot reg -actn trustee -trst "n1:Everyone;ta:remtrst;w:dacl"
+:: BIOS tweaks
+call :log "Applying BIOS tweaks..."
+set bcd=%windir%\system32\bcdedit.exe
+%bcd% /set nx AlwaysOff
 if %ERRORLEVEL% NEQ 0 (
-    echo Failed to remove Everyone! >> %LOGFILE%
-    exit /b %ERRORLEVEL%
+    call :log "Warning: Failed to set nx AlwaysOff."
+)
+%bcd% /set ems No
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set ems No."
+)
+%bcd% /set bootems No
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set bootems No."
+)
+%bcd% /set integrityservices disable
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set integrityservices disable."
+)
+%bcd% /set tpmbootentropy ForceDisable
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set tpmbootentropy ForceDisable."
+)
+%bcd% /set bootmenupolicy Legacy
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set bootmenupolicy Legacy."
+)
+%bcd% /set debug No
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set debug No."
+)
+%bcd% /set disableelamdrivers Yes
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set disableelamdrivers Yes."
+)
+%bcd% /set isolatedcontext No
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set isolatedcontext No."
+)
+%bcd% /set allowedinmemorysettings 0x0
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set allowedinmemorysettings 0x0."
+)
+%bcd% /set vm No
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set vm No."
+)
+%bcd% /set vsmlaunchtype Off
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set vsmlaunchtype Off."
+)
+%bcd% /set configaccesspolicy Default
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set configaccesspolicy Default."
+)
+%bcd% /set MSI Default
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set MSI Default."
+)
+%bcd% /set usephysicaldestination No
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set usephysicaldestination No."
+)
+%bcd% /set usefirmwarepcisettings No
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set usefirmwarepcisettings No."
+)
+%bcd% /set sos No
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set sos No."
+)
+%bcd% /set pae ForceDisable
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set pae ForceDisable."
+)
+%bcd% /set tscsyncpolicy legacy
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set tscsyncpolicy legacy."
+)
+%bcd% /set hypervisorlaunchtype off
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set hypervisorlaunchtype off."
+)
+%bcd% /set useplatformclock false
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set useplatformclock false."
+)
+%bcd% /set useplatformtick no
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set useplatformtick no."
+)
+%bcd% /set disabledynamictick yes
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set disabledynamictick yes."
+)
+%bcd% /set x2apicpolicy disable
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set x2apicpolicy disable."
+)
+%bcd% /set uselegacyapicmode yes
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set uselegacyapicmode yes."
 )
 
-:: Set default permissions
-echo Setting default permissions... >> %LOGFILE%
-%SETACL% -on "%KEY%" -ot reg -actn ace -ace "n:Administrators;p:full" -rec cont_obj
-%SETACL% -on "%KEY%" -ot reg -actn ace -ace "n:SYSTEM;p:full" -rec cont_obj
-%SETACL% -on "%KEY%" -ot reg -actn ace -ace "n:Users;p:read" -rec cont_obj
-%SETACL% -on "%KEY%" -ot reg -actn ace -ace "n:CREATOR OWNER;p:full;i:so,sc" -rec cont_obj
+:: Permissions
+call :log "Setting file and folder permissions..."
+takeown /f %windir%\System32\Oobe\useroobe.dll /A
 if %ERRORLEVEL% NEQ 0 (
-    echo Failed to set permissions! Exiting... >> %LOGFILE%
-    exit /b %ERRORLEVEL%
+    call :log "Warning: Failed to take ownership of useroobe.dll."
+)
+icacls %windir%\System32\Oobe\useroobe.dll /inheritance:r
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to disable inheritance on useroobe.dll."
+)
+icacls "%systemdrive%\Users" /remove "Everyone"
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to remove Everyone from Users directory."
+)
+takeown /f "%USERPROFILE%\Desktop" /r /d y
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to take ownership of Desktop."
+)
+icacls "%USERPROFILE%\Desktop" /inheritance:r
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to disable inheritance on Desktop."
+)
+icacls "%USERPROFILE%\Desktop" /grant:r %username%:(OI)(CI)F /t /l /q /c
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to grant permissions to %username% on Desktop."
+)
+icacls "%USERPROFILE%\Desktop" /remove "System" /t /c /l
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to remove System from Desktop permissions."
+)
+icacls "%USERPROFILE%\Desktop" /remove "Administrators" /t /c /l
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to remove Administrators from Desktop permissions."
+)
+icacls "C:\Users\Public" /reset /T
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to reset permissions on C:\Users\Public."
+)
+takeown /f "C:\Users\Public\Desktop" /r /d y
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to take ownership of Public Desktop."
+)
+icacls "C:\Users\Public\Desktop" /inheritance:r
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to disable inheritance on Public Desktop."
+)
+icacls "C:\Users\Public\Desktop" /grant:r %username%:(OI)(CI)F /t /l /q /c
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to grant permissions to %username% on Public Desktop."
+)
+icacls "C:\Users\Public\Desktop" /remove "System" /t /c /l
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to remove System from Public Desktop permissions."
+)
+icacls "C:\Users\Public\Desktop" /remove "Administrators" /t /c /l
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to remove Administrators from Public Desktop permissions."
 )
 
-:: Set ownership to Administrators
-echo Setting ownership to Administrators... >> %LOGFILE%
-%SETACL% -on "%KEY%" -ot reg -actn setowner -ownr "n:Administrators" -rec cont_obj
+:: Consent
+call :log "Configuring consent settings..."
+takeown /f %windir%\system32\consent.exe /A
 if %ERRORLEVEL% NEQ 0 (
-    echo Failed to set ownership! Exiting... >> %LOGFILE%
-    exit /b %ERRORLEVEL%
+    call :log "Warning: Failed to take ownership of consent.exe."
 )
-
-:: Enable inheritance
-echo Enabling inheritance... >> %LOGFILE%
-%SETACL% -on "%KEY%" -ot reg -actn setprot -op "dacl:np;sacl:np"
+icacls %windir%\system32\consent.exe /inheritance:r /T /C
 if %ERRORLEVEL% NEQ 0 (
-    echo Failed to enable inheritance! Exiting... >> %LOGFILE%
-    exit /b %ERRORLEVEL%
+    call :log "Warning: Failed to disable inheritance on consent.exe."
 )
-
-:: Unbridge network adapters
-echo Checking for network bridges... >> %LOGFILE%
-netsh bridge show adapter >> %LOGFILE%
-echo Unbridging adapters... >> %LOGFILE%
-netsh bridge uninstall
+icacls %windir%\system32\consent.exe /grant:r "Console Logon":RX
 if %ERRORLEVEL% NEQ 0 (
-    echo Failed to unbridge adapters! Continuing... >> %LOGFILE%
+    call :log "Warning: Failed to grant Console Logon read/execute on consent.exe."
 )
-
-:: List all network adapters
-echo Listing network adapters... >> %LOGFILE%
-netsh interface show interface >> %LOGFILE%
-%DEVCON% find *NET* >> %LOGFILE%
-
-:: Disable unauthorized adapters (replace <AdapterName> with actual names or add logic to detect)
-echo Disabling unauthorized adapters... >> %LOGFILE%
-:: Example: netsh interface set interface "TAP-Windows Adapter V9" disable
-:: netsh interface set interface "<AdapterName>" disable
-:: if %ERRORLEVEL% NEQ 0 (
-::     echo Failed to disable adapter <AdapterName>! >> %LOGFILE%
-:: )
-
-:: Remove unauthorized adapters (replace <DeviceID> with actual IDs from devcon)
-echo Removing unauthorized adapters... >> %LOGFILE%
-:: Example: %DEVCON% remove @PCI\VEN_8086&DEV_...
-:: %DEVCON% remove @<DeviceID>
-:: if %ERRORLEVEL% NEQ 0 (
-::     echo Failed to remove adapter <DeviceID>! >> %LOGFILE%
-:: )
-
-:: Verify final state
-echo Verifying registry permissions... >> %LOGFILE%
-%SETACL% -on "%KEY%" -ot reg -actn list -lst "f:tab" >> %LOGFILE%
-echo Verifying network adapters... >> %LOGFILE%
-netsh interface show interface >> %LOGFILE%
+icacls %windir%\system32\consent.exe /remove "ALL APPLICATION PACKAGES"
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to remove ALL APPLICATION PACKAGES from consent.exe."
+)
+icacls %windir%\system32\consent.exe /remove "ALL RESTRICTED APPLICATION PACKAGES"
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to remove ALL RESTRICTED APPLICATION PACKAGES from consent.exe."
+)
+icacls %windir%\system32\consent.exe /remove "System"
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to remove System from consent.exe permissions."
+)
+icacls %windir%\system32\consent.exe /remove "Users"
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to remove Users from consent.exe permissions."
+)
+icacls %windir%\system32\consent.exe /remove "Authenticated Users"
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to remove Authenticated Users from consent.exe permissions."
+)
+icacls %windir%\system32\consent.exe /remove "Administrators"
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to remove Administrators from consent.exe permissions."
+)
+icacls %windir%\system32\consent.exe /remove "NT SERVICE\TrustedInstaller"
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to remove TrustedInstaller from consent.exe permissions."
+)
+reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v "ConsentPromptBehaviorAdmin" /t REG_DWORD /d "1" /f
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set ConsentPromptBehaviorAdmin in HKLM."
+)
+reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v "ConsentPromptBehaviorUser" /t REG_DWORD /d "1" /f
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set ConsentPromptBehaviorUser in HKLM."
+)
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System" /v "ConsentPromptBehaviorAdmin" /t REG_DWORD /d "1" /f
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set ConsentPromptBehaviorAdmin in HKCU."
+)
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System" /v "ConsentPromptBehaviorUser" /t REG_DWORD /d "1" /f
+if %ERRORLEVEL% NEQ 0 (
+    call :log "Warning: Failed to set ConsentPromptBehaviorUser in HKCU."
+)
 
 echo Cleanup completed at %DATE% %TIME%. Check %LOGFILE% for details.
+goto :eof
 
-:: riddance
-for /f "tokens=1,2*" %%x in ('whoami /user /fo list ^| findstr /i "name sid"') do (
-    set "USERNAME=%%z"
-    set "USERSID=%%y"
-)
-for /f "tokens=5 delims=-" %%r in ("!USERSID!") do set "RID=%%r"
-for /f "tokens=*" %%u in ('net user ^| findstr /i /c:"User" ^| find /v "command completed successfully"') do (
-    set "USERLINE=%%u"
-    set "USERRID=!USERLINE:~-4!"
-    if !USERRID! neq !RID! (
-        echo Removing user: !USERLINE!
-        net user !USERLINE! /delete
-    )
-)
-reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v EnableLUA /t REG_DWORD /d 1 /f
-
-:: Bios tweaks
-set bcd=%windir%\system32\%bcd%.exe
-%bcd% /set nx AlwaysOff
-%bcd% /set ems No
-%bcd% /set bootems No
-%bcd% /set integrityservices disable
-%bcd% /set tpmbootentropy ForceDisable
-%bcd% /set bootmenupolicy Legacy
-%bcd% /set debug No
-%bcd% /set disableelamdrivers Yes
-%bcd% /set isolatedcontext No
-%bcd% /set allowedinmemorysettings 0x0
-%bcd% /set vm NO
-%bcd% /set vsmlaunchtype Off
-%bcd% /set configaccesspolicy Default
-%bcd% /set MSI Default
-%bcd% /set usephysicaldestination No
-%bcd% /set usefirmwarepcisettings No
-%bcd% /set sos no
-%bcd% /set pae ForceDisable
-%bcd% /set tscsyncpolicy legacy
-%bcd% /set hypervisorlaunchtype off
-%bcd% /set useplatformclock false
-%bcd% /set useplatformtick no
-%bcd% /set disabledynamictick yes
-%bcd% /set x2apicpolicy disable
-%bcd% /set uselegacyapicmode yes
-
-    goto :eof
 :cleanup
     popd
     goto :eof
