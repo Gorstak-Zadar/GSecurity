@@ -1,5 +1,3 @@
-param([switch]$Uninstall)
-
 #Requires -Version 5.1
 
 # ============================================================================
@@ -7,12 +5,10 @@ param([switch]$Uninstall)
 # Author: Gorstak
 # ============================================================================
 
-# Unique script identifier (GUID) - used for process identification and mutex naming
-$Script:ScriptGUID = "539EF6B5-578B-4AF3-A5C7-FD564CB9C8FB"
-
-$Script:InstallPath = "C:\ProgramData\AntivirusProtection"
-$Script:ScriptName = Split-Path -Leaf $PSCommandPath
-$Script:MaxRestartAttempts = 3
+# PORTABLE MODE: Use the script's directory as the base path
+$Script:ScriptPath = if ($PSCommandPath) { $PSCommandPath } elseif ($MyInvocation.MyCommand.Path) { $MyInvocation.MyCommand.Path } else { $PWD.Path }
+$Script:InstallPath = Split-Path -Parent $Script:ScriptPath
+if (-not $Script:InstallPath -or $Script:InstallPath -eq '') { $Script:InstallPath = $PWD.Path }
 $Script:StabilityLogPath = "$Script:InstallPath\Logs\stability_log.txt"
 
 $Script:ManagedJobConfig = @{
@@ -29,7 +25,6 @@ $Script:ManagedJobConfig = @{
     DLLHijackingDetectionIntervalSeconds = 90
     TokenManipulationDetectionIntervalSeconds = 60
     ProcessHollowingDetectionIntervalSeconds = 30
-    KeyloggerDetectionIntervalSeconds = 45
     KeyScramblerManagementIntervalSeconds = 60
     RansomwareDetectionIntervalSeconds = 15
     NetworkAnomalyDetectionIntervalSeconds = 30
@@ -98,9 +93,7 @@ $Config = @{
     WhitelistPath = "$Script:InstallPath\Data\whitelist.json"
     ReportsPath = "$Script:InstallPath\Reports"
     HMACKeyPath = "$Script:InstallPath\Data\db_integrity.hmac"
-    PIDFilePath = "$Script:InstallPath\Data\antivirus.pid"
     HashDatabaseFile = "$Script:InstallPath\Data\known_files.db"
-    MutexName = "Local\AntivirusProtection_Mutex_{0}_{1}_{2}" -f $env:COMPUTERNAME, $env:USERNAME, $Script:ScriptGUID
 
     CirclHashLookupUrl = "https://hashlookup.circl.lu/lookup/sha256"
     CymruApiUrl = "https://api.malwarehash.cymru.com/v1/hash"
@@ -125,54 +118,16 @@ $Config = @{
     CymruDetectionThreshold = 60
 }
 
-# <CHANGE> Add graceful elevation check function (insert after $Config block, ~line 99)
+# Check if running as admin
 function Test-IsAdmin {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]$identity
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Request-Elevation {
-    param([string]$Reason = "This operation requires administrator privileges.")
-    
-    # <CHANGE> Use a global mutex - if elevated instance owns it, children skip
-    $mutexName = "Global\AntivirusProtection_Elevated"
-    
-    if (Test-IsAdmin) {
-        # Try to own the mutex (elevated parent holds it)
-        $script:ElevationMutex = New-Object System.Threading.Mutex($false, $mutexName)
-        try {
-            $script:ElevationMutex.WaitOne(0) | Out-Null
-        } catch {}
-        return
-    }
-    
-    # <CHANGE> Check if mutex exists (means elevated instance is running)
-    $mutex = New-Object System.Threading.Mutex($false, $mutexName)
-    $hasHandle = $false
-    try {
-        $hasHandle = $mutex.WaitOne(0, $false)
-    } catch {}
-    
-    if (-not $hasHandle) {
-        # Mutex held by elevated parent - we're a child, skip elevation
-        return
-    }
-    
-    # Release it - we're the first non-elevated instance, need to elevate
-    $mutex.ReleaseMutex()
-    $mutex.Dispose()
-    
-    Write-Warning $Reason
-    Start-Process powershell.exe -ArgumentList "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`"" -Verb RunAs
-    exit
-}
-
 $Global:AntivirusState = @{
     Running = $false
-    Installed = $false
     Jobs = @{}
-    Mutex = $null
     ThreatCount = 0
     FilesScanned = 0
     FilesQuarantined = 0
@@ -181,11 +136,6 @@ $Global:AntivirusState = @{
 
 $Script:LoopCounter = 0
 $script:ManagedJobs = @{}
-
-# Termination protection variables
-$Script:TerminationAttempts = 0
-$Script:MaxTerminationAttempts = 5
-$Script:AutoRestart = $true
 $Script:SelfPID = $PID
 
 # Hash caching system - prevents redundant API calls for known files
@@ -328,7 +278,7 @@ function Write-AVLog {
     # Check if Config exists and LogPath is not null
     if ($null -eq $configVar -or $null -eq $configVar.LogPath -or [string]::IsNullOrWhiteSpace($configVar.LogPath)) {
         # Fallback to default log path if Config is not available
-        $logPath = if ($Script:InstallPath) { "$Script:InstallPath\Logs" } else { "C:\ProgramData\AntivirusProtection\Logs" }
+        $logPath = if ($Script:InstallPath) { "$Script:InstallPath\Logs" } else { ".\Logs" }
         $logFilePath = Join-Path $logPath $LogFile
         
         if (!(Test-Path $logPath)) {
@@ -387,445 +337,22 @@ function Write-StabilityLog {
 }
 
 
-function Register-ExitCleanup {
-    if ($script:ExitCleanupRegistered) {
-        return
-    }
-
-    try {
-        Register-EngineEvent -SourceIdentifier "AntivirusProtection_ExitCleanup" -EventName PowerShell.Exiting -Action {
-            # Cleanup actions if needed
-        } | Out-Null
-        $script:ExitCleanupRegistered = $true
-    }
-    catch {
-    }
+function Initialize-Directories {
+    Write-Host "`n=== Antivirus Starting ===`n" -ForegroundColor Cyan
+    Write-Host "[*] Running from: $Script:InstallPath" -ForegroundColor Cyan
+    Write-Host "[*] PID: $PID" -ForegroundColor Cyan
+    
+    # Create all required directories in one go
+    New-Item -ItemType Directory -Path @(
+        $Config.LogPath,
+        $Config.QuarantinePath,
+        $Config.DatabasePath,
+        $Config.ReportsPath
+    ) -Force -ErrorAction SilentlyContinue | Out-Null
+    
+    $Global:AntivirusState.Running = $true
 }
 
-function Install-Antivirus {
-    $targetScript = Join-Path $Script:InstallPath $Script:ScriptName
-    $currentPath = $PSCommandPath
-
-    # Set SelfPath to the installed script location (used by auto-restart and watchdog)
-    $Script:SelfPath = $targetScript
-
-    if ($currentPath -eq $targetScript) {
-        Write-Host "[+] Running from install location" -ForegroundColor Green
-        $Global:AntivirusState.Installed = $true
-        # Initialize mutex BEFORE creating persistence to prevent race conditions during setup
-        Initialize-Mutex
-        Install-Persistence
-        return $true
-    }
-
-    Write-Host "`n=== Installing Antivirus ===`n" -ForegroundColor Cyan
-
-    @("Data","Logs","Quarantine","Reports") | ForEach-Object {
-        $p = Join-Path $Script:InstallPath $_
-        if (!(Test-Path $p)) {
-            New-Item -ItemType Directory -Path $p -Force | Out-Null
-            Write-Host "[+] Created: $p"
-        }
-    }
-
-    Copy-Item -Path $PSCommandPath -Destination $targetScript -Force
-    Write-Host "[+] Copied main script to $targetScript"
-
-    # Initialize mutex BEFORE creating persistence to prevent race conditions during setupcomplete.cmd
-    # This ensures only one instance can acquire the mutex before scheduled tasks are created
-    Initialize-Mutex
-    Install-Persistence
-
-    Write-Host "`n[+] Installation complete. Continuing in this instance...`n" -ForegroundColor Green
-    $Global:AntivirusState.Installed = $true
-    return $true
-}
-
-function Install-Persistence {
-    Write-Host "`n[*] Setting up persistence for automatic startup...`n" -ForegroundColor Cyan
-
-    # Define paths for cleanup
-    $startupFolder = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup"
-    $shortcutPath = Join-Path $startupFolder "AntivirusProtection.lnk"
-    $runKeyPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
-    $runKeyName = "AntivirusProtection"
-
-    try {
-        # Remove old persistence methods
-        Get-ScheduledTask -TaskName "AntivirusProtection" -ErrorAction SilentlyContinue |
-            Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
-
-        if (Test-Path $shortcutPath) {
-            Remove-Item $shortcutPath -Force -ErrorAction SilentlyContinue
-        }
-
-        # Add to HKCU Run key
-        $runCommand = "powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$($Script:InstallPath)\$($Script:ScriptName)`""
-        Set-ItemProperty -Path $runKeyPath -Name $runKeyName -Value $runCommand -ErrorAction Stop
-
-        Write-Host "[+] Registry Run key entry created for automatic startup" -ForegroundColor Green
-        Write-StabilityLog "Persistence setup completed - HKCU Run key created"
-    }
-    catch {
-        Write-Host "[!] Failed to create registry Run key entry: $_" -ForegroundColor Red
-        Write-StabilityLog "Persistence setup failed: $_" "ERROR"
-    }
-}
-
-function Uninstall-Antivirus {
-    Write-Host "`n=== Uninstalling Antivirus ===`n" -ForegroundColor Cyan
-    Write-StabilityLog "Starting uninstall process"
-
-    # First, stop all running instances
-    try {
-        Write-Host "[*] Stopping running instances..." -ForegroundColor Yellow
-        Write-StabilityLog "Stopping running antivirus instances"
-        
-        # Check PID file for running instance
-        if (Test-Path $Config.PIDFilePath) {
-            try {
-                $existingPID = [int](Get-Content $Config.PIDFilePath -ErrorAction Stop)
-                if ($existingPID -ne $PID) {
-                    $existingProcess = Get-Process -Id $existingPID -ErrorAction SilentlyContinue
-                    if ($existingProcess) {
-                        # Verify it's our script before killing
-                        $cmdLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $existingPID" -ErrorAction SilentlyContinue).CommandLine
-                        $scriptPath = if ($PSCommandPath) { $PSCommandPath } else { $Script:SelfPath }
-                        $isOurScript = $false
-                        if ($cmdLine) {
-                            if ($cmdLine -like "*$($Script:ScriptGUID)*" -or ($scriptPath -and $cmdLine -like "*$scriptPath*")) {
-                                $isOurScript = $true
-                            }
-                        }
-                        
-                        if ($isOurScript) {
-                            Write-Host "[+] Stopping instance (PID: $existingPID)" -ForegroundColor Green
-                            Stop-Process -Id $existingPID -Force -ErrorAction SilentlyContinue
-                            Start-Sleep -Seconds 2
-                        }
-                    }
-                }
-            } catch {
-                Write-StabilityLog "Error reading PID file during uninstall: $_" "WARN"
-            }
-        }
-        
-        # Also check for any PowerShell processes running our script
-        $scriptPath = if ($PSCommandPath) { $PSCommandPath } else { $Script:SelfPath }
-        $allProcesses = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction SilentlyContinue
-        foreach ($proc in $allProcesses) {
-            if ($proc.ProcessId -eq $PID) { continue }
-            try {
-                $cmdLine = $proc.CommandLine
-                if ($cmdLine -and ($cmdLine -like "*$($Script:ScriptGUID)*" -or ($scriptPath -and $cmdLine -like "*$scriptPath*"))) {
-                    Write-Host "[+] Stopping instance (PID: $($proc.ProcessId))" -ForegroundColor Green
-                    Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
-                }
-            } catch {}
-        }
-        
-        # Wait a moment for processes to terminate
-        Start-Sleep -Seconds 1
-    } catch {
-        Write-Host "[!] Warning: Could not stop all instances: $_" -ForegroundColor Yellow
-        Write-StabilityLog "Warning: Could not stop all instances during uninstall: $_" "WARN"
-    }
-
-    try {
-        if ($script:ManagedJobs) {
-            foreach ($k in @($script:ManagedJobs.Keys)) {
-                try { $script:ManagedJobs.Remove($k) } catch {}
-            }
-        }
-        if ($Global:AntivirusState -and $Global:AntivirusState.Jobs) {
-            $Global:AntivirusState.Jobs.Clear()
-        }
-    }
-    catch {
-        Write-StabilityLog "Failed to clear managed jobs during uninstall: $_" "WARN"
-    }
-
-    try {
-        # Remove registry Run key entry
-        $runKeyPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
-        $runKeyName = "AntivirusProtection"
-        if (Get-ItemProperty -Path $runKeyPath -Name $runKeyName -ErrorAction SilentlyContinue) {
-            Remove-ItemProperty -Path $runKeyPath -Name $runKeyName -Force -ErrorAction SilentlyContinue
-            Write-Host "[+] Removed registry Run key entry" -ForegroundColor Green
-            Write-StabilityLog "Removed registry Run key entry during uninstall"
-        }
-    }
-    catch {
-        Write-Host "[!] Failed to remove registry Run key entry: $_" -ForegroundColor Yellow
-        Write-StabilityLog "Failed to remove registry Run key entry: $_" "WARN"
-    }
-
-    # Clean up old persistence methods if they exist
-    try {
-        Get-ScheduledTask -TaskName "AntivirusProtection" -ErrorAction SilentlyContinue |
-            Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
-        Write-Host "[+] Removed scheduled task (if existed)" -ForegroundColor Green
-        Write-StabilityLog "Removed scheduled task during uninstall"
-    }
-    catch {
-        Write-Host "[!] Failed to remove scheduled task: $_" -ForegroundColor Yellow
-        Write-StabilityLog "Failed to remove scheduled task: $_" "WARN"
-    }
-
-    try {
-        $shortcutPath = Join-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup" "AntivirusProtection.lnk"
-        if (Test-Path $shortcutPath) {
-            Remove-Item $shortcutPath -Force -ErrorAction SilentlyContinue
-            Write-Host "[+] Removed startup shortcut (if existed)" -ForegroundColor Green
-            Write-StabilityLog "Removed startup shortcut during uninstall"
-        }
-    }
-    catch {
-        Write-Host "[!] Failed to remove startup shortcut: $_" -ForegroundColor Yellow
-        Write-StabilityLog "Failed to remove startup shortcut: $_" "WARN"
-    }
-
-    if (Test-Path $Script:InstallPath) {
-        Remove-Item -Path $Script:InstallPath -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Host "[+] Removed installation directory" -ForegroundColor Green
-        Write-StabilityLog "Removed installation directory during uninstall"
-    }
-
-    Write-Host "[+] Uninstall complete." -ForegroundColor Green
-    Write-StabilityLog "Uninstall process completed"
-    exit 0
-}
-
-function Initialize-Mutex {
-    $mutexName = $Config.MutexName
-
-    Write-StabilityLog "Initializing mutex and PID checks"
-
-    if (Test-Path $Config.PIDFilePath) {
-        try {
-            $existingPID = [int](Get-Content $Config.PIDFilePath -ErrorAction Stop)
-            
-            # Don't block if PID file contains our own PID (stale file from same instance)
-            if ($existingPID -eq $PID) {
-                Write-StabilityLog "PID file contains current PID - removing stale file" "INFO"
-                Remove-Item $Config.PIDFilePath -Force -ErrorAction SilentlyContinue
-            }
-            else {
-                $existingProcess = Get-Process -Id $existingPID -ErrorAction SilentlyContinue
-
-                if ($existingProcess) {
-                    # Check if the existing process is actually running our script
-                    try {
-                        $cmdLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $existingPID" -ErrorAction SilentlyContinue).CommandLine
-                        $scriptPath = if ($PSCommandPath) { $PSCommandPath } else { $Script:SelfPath }
-                        
-                        # Check if existing process is running our script (by GUID or path)
-                        $isOurScript = $false
-                        if ($cmdLine) {
-                            # Primary check: GUID (most reliable)
-                            if ($cmdLine -like "*$($Script:ScriptGUID)*") {
-                                $isOurScript = $true
-                            }
-                            # Secondary check: script path
-                            elseif ($scriptPath -and $cmdLine -like "*$scriptPath*") {
-                                $isOurScript = $true
-                            }
-                        }
-                        
-                        if ($isOurScript) {
-                            Write-StabilityLog "Blocked duplicate instance - existing PID: $existingPID" "WARN"
-                            Write-Host "[!] Another instance is already running (PID: $existingPID)" -ForegroundColor Yellow
-                            Write-AVLog "Blocked duplicate instance - existing PID: $existingPID" "WARN"
-                            throw "Another instance is already running (PID: $existingPID)"
-                        }
-                        else {
-                            # Existing process is not our script - remove stale PID file
-                            Write-StabilityLog "PID file contains different process (not our script) - removing stale file" "INFO"
-                            Remove-Item $Config.PIDFilePath -Force -ErrorAction SilentlyContinue
-                        }
-                    }
-                    catch {
-                        if ($_.Exception.Message -like "*already running*") {
-                            throw
-                        }
-                        # Can't determine if it's our script, but process exists - assume it's not our script and remove stale PID
-                        Write-StabilityLog "Could not verify existing process - removing potentially stale PID file" "INFO"
-                        Remove-Item $Config.PIDFilePath -Force -ErrorAction SilentlyContinue
-                    }
-                }
-                else {
-                    Remove-Item $Config.PIDFilePath -Force -ErrorAction SilentlyContinue
-                    Write-StabilityLog "Removed stale PID file (process $existingPID not running)"
-                    Write-AVLog "Removed stale PID file (process $existingPID not running)"
-                }
-            }
-        }
-        catch {
-            if ($_.Exception.Message -like "*already running*") {
-                throw
-            }
-            Remove-Item $Config.PIDFilePath -Force -ErrorAction SilentlyContinue
-            Write-StabilityLog "Removed invalid PID file"
-        }
-    }
-
-    try {
-        $Global:AntivirusState.Mutex = New-Object System.Threading.Mutex($false, $mutexName)
-        $acquired = $Global:AntivirusState.Mutex.WaitOne(3000)
-
-        if (!$acquired) {
-            # Mutex is locked - check if there's actually a running instance
-            Write-StabilityLog "Mutex locked - checking for running instances" "WARN"
-            
-            # Check for running instances, excluding our own PID
-            $scriptPath = if ($PSCommandPath) { $PSCommandPath } else { $Script:SelfPath }
-            $installedScriptPath = Join-Path $Script:InstallPath $Script:ScriptName
-            
-            $verifiedInstances = @()
-            $allPowerShellProcesses = Get-Process powershell -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID }
-            
-            foreach ($proc in $allPowerShellProcesses) {
-                try {
-                    # Verify process is actually responsive (not hung/dead)
-                    $procInfo = Get-Process -Id $proc.Id -ErrorAction Stop
-                    if (-not $procInfo.Responding) {
-                        Write-StabilityLog "Process $($proc.Id) is not responding - treating as dead" "WARN"
-                        continue
-                    }
-                    
-                    $cmdLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $($proc.Id)" -ErrorAction SilentlyContinue).CommandLine
-                    if (-not $cmdLine) {
-                        continue
-                    }
-                    
-                    # Strict verification: Primary check is GUID (most reliable), then script path
-                    $isOurScript = $false
-                    $matchedPath = $null
-                    $matchedBy = $null
-                    
-                    # PRIMARY: Check for GUID in command line (most reliable identifier)
-                    if ($cmdLine -like "*$($Script:ScriptGUID)*") {
-                        $isOurScript = $true
-                        $matchedBy = "GUID"
-                        # Also try to extract the script path for logging
-                        if ($cmdLine -match '-File\s+([^\s]+)') {
-                            $matchedPath = $matches[1].Trim('"').Trim("'")
-                        } else {
-                            $matchedPath = "GUID_Match"
-                        }
-                    }
-                    # SECONDARY: Check current script path
-                    elseif ($scriptPath -and $cmdLine -like "*$scriptPath*") {
-                        $isOurScript = $true
-                        $matchedPath = $scriptPath
-                        $matchedBy = "Path"
-                    }
-                    # TERTIARY: Check installed script path (if different from current)
-                    elseif ($installedScriptPath -and (Test-Path $installedScriptPath) -and $cmdLine -like "*$installedScriptPath*") {
-                        $isOurScript = $true
-                        $matchedPath = $installedScriptPath
-                        $matchedBy = "Path"
-                    }
-                    
-                    if ($isOurScript) {
-                        Write-StabilityLog "Verified process $($proc.Id) is running our script (matched by $matchedBy): $matchedPath" "INFO"
-                        $verifiedInstances += @{
-                            Id = $proc.Id
-                            CommandLine = $cmdLine
-                            Path = $matchedPath
-                            MatchedBy = $matchedBy
-                        }
-                    }
-                } catch {
-                    # Process doesn't exist or error checking - don't count it
-                    Write-StabilityLog "Error checking process $($proc.Id): $_" "WARN"
-                    continue
-                }
-            }
-            
-            if ($verifiedInstances.Count -gt 0) {
-                $instancePIDs = $verifiedInstances | ForEach-Object { $_.Id }
-                $instanceDetails = $verifiedInstances | ForEach-Object { "PID $($_.Id): $($_.Path)" }
-                Write-StabilityLog "Blocked duplicate instance - found $($verifiedInstances.Count) verified running instance(s) (PIDs: $($instancePIDs -join ', '))" "WARN"
-                Write-Host "[!] Another instance is already running (PIDs: $($instancePIDs -join ', '))" -ForegroundColor Yellow
-                Write-Host "[!] Running from: $($instanceDetails -join '; ')" -ForegroundColor Yellow
-                Write-AVLog "Blocked duplicate instance - found running processes: $($instancePIDs -join ', ')" "WARN"
-                $Global:AntivirusState.Mutex.Dispose()
-                throw "Another instance is already running (mutex locked)"
-            } else {
-                # No verified instances found - treat as stale mutex
-                # Since we've verified no process is running, we can safely proceed
-                Write-StabilityLog "Stale mutex detected (no running process found) - proceeding anyway" "WARN"
-                Write-Host "[!] Stale mutex detected but no process running - proceeding (stale mutex will be cleaned up)" -ForegroundColor Yellow
-                
-                # Dispose of the failed mutex reference
-                try {
-                    $Global:AntivirusState.Mutex.Dispose()
-                } catch {}
-                $Global:AntivirusState.Mutex = $null
-                
-                # Wait a bit to allow kernel cleanup
-                Start-Sleep -Milliseconds 500
-                
-                # Try to create a new mutex (Windows should have cleaned up the stale one)
-                # If it still fails, we'll proceed without mutex protection (since we verified no process is running)
-                try {
-                    $Global:AntivirusState.Mutex = New-Object System.Threading.Mutex($false, $mutexName)
-                    $acquired = $Global:AntivirusState.Mutex.WaitOne(2000)
-                    if ($acquired) {
-                        Write-StabilityLog "Successfully acquired mutex after stale detection" "INFO"
-                    } else {
-                        # Still can't acquire, but no process is running - proceed without mutex
-                        Write-StabilityLog "Mutex still locked but no process running - proceeding without mutex (stale mutex)" "WARN"
-                        Write-Host "[!] Warning: Proceeding without mutex (stale mutex detected). This is safe since no process is running." -ForegroundColor Yellow
-                        $Global:AntivirusState.Mutex.Dispose()
-                        $Global:AntivirusState.Mutex = $null
-                    }
-                } catch {
-                    # If we can't create the mutex, proceed anyway since we verified no process is running
-                    Write-StabilityLog "Could not create mutex after stale detection, but no process running - proceeding: $_" "WARN"
-                    Write-Host "[!] Warning: Proceeding without mutex protection due to stale mutex." -ForegroundColor Yellow
-                    $Global:AntivirusState.Mutex = $null
-                }
-            }
-        }
-
-        if (!(Test-Path (Split-Path $Config.PIDFilePath -Parent))) {
-            New-Item -ItemType Directory -Path (Split-Path $Config.PIDFilePath -Parent) -Force | Out-Null
-        }
-
-        $PID | Out-File -FilePath $Config.PIDFilePath -Force
-        $Global:AntivirusState.Running = $true
-        if ($Global:AntivirusState.Mutex) {
-            Write-StabilityLog "Mutex acquired, PID file written: $PID"
-        } else {
-            Write-StabilityLog "PID file written: $PID (running without mutex due to stale mutex)"
-        }
-        Write-AVLog "Antivirus started (PID: $PID)"
-        Write-Host "[+] Process ID: $PID" -ForegroundColor Green
-
-        Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
-            try {
-                Write-StabilityLog "PowerShell exiting - cleaning up mutex and PID"
-                if ($Global:AntivirusState.Mutex) {
-                    $Global:AntivirusState.Mutex.ReleaseMutex()
-                    $Global:AntivirusState.Mutex.Dispose()
-                }
-                if (Test-Path $Config.PIDFilePath) {
-                    Remove-Item $Config.PIDFilePath -Force -ErrorAction SilentlyContinue
-                }
-            }
-            catch {
-                Write-StabilityLog "Cleanup error: $_" "ERROR"
-            }
-        } | Out-Null
-
-    }
-    catch {
-        Write-StabilityLog "Mutex initialization failed: $_" "ERROR"
-        throw
-    }
-}
 
 function Select-BoundConfig {
     param(
@@ -842,138 +369,6 @@ function Select-BoundConfig {
         }
     }
     return $bound
-}
-
-function Register-TerminationProtection {
-    try {
-        # Monitor for unexpected termination attempts
-        $Script:UnhandledExceptionHandler = Register-ObjectEvent -InputObject ([AppDomain]::CurrentDomain) `
-            -EventName UnhandledException -Action {
-            param($src, $evtArgs)
-            
-            $errorMsg = "Unhandled exception: $($evtArgs.Exception.ToString())"
-            $errorMsg | Out-File "$using:quarantineFolder\crash_log.txt" -Append
-            
-            try {
-                # Log to security events
-                $securityEvent = @{
-                    Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
-                    EventType = "UnexpectedTermination"
-                    Severity = "Critical"
-                    Exception = $evtArgs.Exception.ToString()
-                    IsTerminating = $evtArgs.IsTerminating
-                }
-                $securityEvent | ConvertTo-Json -Compress | Out-File "$using:quarantineFolder\security_events.jsonl" -Append
-            } catch {}
-            
-            # Attempt auto-restart if configured
-            if ($using:Script:AutoRestart -and $evtArgs.IsTerminating) {
-                try {
-                    Start-Process "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -File `"$using:Script:SelfPath`"" `
-                        -WindowStyle Hidden -ErrorAction SilentlyContinue
-                } catch {}
-            }
-        }
-        
-        Write-StabilityLog "[PROTECTION] Termination protection registered"
-        
-    } catch {
-        Write-StabilityLog -Message "Failed to register termination protection" -Severity "Medium" -ErrorRecord $_
-    }
-}
-
-function Enable-CtrlCProtection {
-    try {
-        # Detect if running in ISE or console
-        if ($host.Name -eq "Windows PowerShell ISE Host") {
-            Write-Host "[PROTECTION] ISE detected - using trap-based Ctrl+C protection" -ForegroundColor Cyan
-            Write-Host "[PROTECTION] Ctrl+C protection enabled (requires $Script:MaxTerminationAttempts attempts to stop)" -ForegroundColor Green
-            return $true
-        }
-        
-        [Console]::TreatControlCAsInput = $false
-        
-        # Create scriptblock for the event handler
-        $cancelHandler = {
-            param($src, $evtArgs)
-            
-            $Script:TerminationAttempts++
-            
-            Write-Host "`n[PROTECTION] Termination attempt detected ($Script:TerminationAttempts/$Script:MaxTerminationAttempts)" -ForegroundColor Red
-            
-            try {
-                Write-SecurityEvent -EventType "TerminationAttemptBlocked" -Details @{
-                    PID = $PID
-                    AttemptNumber = $Script:TerminationAttempts
-                } -Severity "Critical"
-            } catch {}
-            
-            if ($Script:TerminationAttempts -ge $Script:MaxTerminationAttempts) {
-                Write-Host "[PROTECTION] Maximum termination attempts reached. Allowing graceful shutdown..." -ForegroundColor Yellow
-                $evtArgs.Cancel = $false
-            } else {
-                Write-Host "[PROTECTION] Termination blocked. Press Ctrl+C $($Script:MaxTerminationAttempts - $Script:TerminationAttempts) more times to force stop." -ForegroundColor Yellow
-                $evtArgs.Cancel = $true
-            }
-        }
-        
-        # Register the event handler
-        [Console]::add_CancelKeyPress($cancelHandler)
-        
-        Write-Host "[PROTECTION] Ctrl+C protection enabled (requires $Script:MaxTerminationAttempts attempts to stop)" -ForegroundColor Green
-        return $true
-    } catch {
-        Write-Host "[WARNING] Could not enable Ctrl+C protection: $($_.Exception.Message)" -ForegroundColor Yellow
-        return $false
-    }
-}
-
-function Enable-AutoRestart {
-    try {
-        $taskName = "AntivirusAutoRestart_$PID"
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-            -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Script:SelfPath`""
-        
-        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
-        
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-            -StartWhenAvailable -RunOnlyIfNetworkAvailable:$false
-        
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
-            -Settings $settings -Force -ErrorAction Stop | Out-Null
-        
-        Write-Host "[PROTECTION] Auto-restart scheduled task registered" -ForegroundColor Green
-    } catch {
-        Write-Host "[WARNING] Could not enable auto-restart: $($_.Exception.Message)" -ForegroundColor Yellow
-    }
-}
-
-function Start-ProcessWatchdog {
-    try {
-        $watchdogJob = Start-Job -ScriptBlock {
-            param($parentPID, $scriptPath, $autoRestart)
-            
-            while ($true) {
-                Start-Sleep -Seconds 30
-                
-                # Check if parent process is still alive
-                $process = Get-Process -Id $parentPID -ErrorAction SilentlyContinue
-                
-                if (-not $process) {
-                    # Parent died - restart if configured
-                    if ($autoRestart) {
-                        Start-Process "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`"" `
-                            -WindowStyle Hidden -ErrorAction SilentlyContinue
-                    }
-                    break
-                }
-            }
-        } -ArgumentList $PID, $Script:SelfPath, $Script:AutoRestart
-        
-        Write-Host "[PROTECTION] Process watchdog started (Job ID: $($watchdogJob.Id))" -ForegroundColor Green
-    } catch {
-        Write-Host "[WARNING] Could not start process watchdog: $($_.Exception.Message)" -ForegroundColor Yellow
-    }
 }
 
 function Register-ManagedJob {
@@ -1378,6 +773,41 @@ function Stop-ThreatProcess {
     param([int]$ProcessId, [string]$ProcessName)
     
     if ($ProcessId -eq $PID -or $ProcessId -eq $Script:SelfPID) { return }
+    
+    # CRITICAL: Never kill these Windows system processes - it will crash the system
+    $CriticalSystemProcesses = @(
+        'System', 'Idle', 'Registry', 'smss', 'csrss', 'wininit', 'services', 'lsass',
+        'svchost', 'winlogon', 'explorer', 'dwm', 'fontdrvhost', 'sihost', 'taskhostw',
+        'RuntimeBroker', 'SearchHost', 'SearchIndexer', 'ShellHost', 'StartMenuExperienceHost',
+        'TextInputHost', 'ctfmon', 'conhost', 'dllhost', 'audiodg', 'WmiPrvSE',
+        'spoolsv', 'MsMpEng', 'NisSrv', 'SecurityHealthService', 'SgrmBroker',
+        'SystemSettings', 'ApplicationFrameHost', 'WindowsInternal', 'backgroundTaskHost',
+        'CompPkgSrv', 'dasHost', 'LockApp', 'LogonUI', 'msiexec', 'MusNotification',
+        'PhoneExperienceHost', 'SearchApp', 'SettingSyncHost', 'smartscreen',
+        'SystemSettingsBroker', 'TabTip', 'TiWorker', 'TrustedInstaller', 'userinit',
+        'WerFault', 'wermgr', 'WUDFHost', 'YourPhone', 'Video.UI', 'GameBar',
+        'MicrosoftEdgeUpdate', 'OneDrive', 'SecurityHealthSystray', 'WidgetService',
+        'NVDisplay.Container', 'nvcontainer', 'amdfendrsr', 'RtkAudUService64',
+        'RstMwService', 'ipf_helper', 'ipf_uf', 'BraveCrashHandler', 'BraveCrashHandler64',
+        'powershell', 'pwsh', 'cmd', 'WindowsTerminal'
+    )
+    
+    $procBaseName = [IO.Path]::GetFileNameWithoutExtension($ProcessName)
+    if ($CriticalSystemProcesses -contains $procBaseName -or $CriticalSystemProcesses -contains $ProcessName) {
+        Write-AVLog "BLOCKED: Refusing to kill critical system process: $ProcessName (PID: $ProcessId)" "WARN"
+        return
+    }
+    
+    # Also check if it's running from Windows or Program Files directories
+    try {
+        $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if ($proc -and $proc.Path) {
+            if ($proc.Path -like 'C:\Windows\*' -or $proc.Path -like 'C:\Program Files*') {
+                Write-AVLog "BLOCKED: Refusing to kill system/program files process: $ProcessName (PID: $ProcessId) Path: $($proc.Path)" "WARN"
+                return
+            }
+        }
+    } catch { }
     
     try {
         Stop-Process -Id $ProcessId -Force -ErrorAction Stop
@@ -2234,7 +1664,7 @@ function Invoke-SystemWideAdvancedThreatDetection {
             }
             
             # Write detailed log
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\AdvancedThreatDetection_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\AdvancedThreatDetection_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force -ErrorAction SilentlyContinue | Out-Null
@@ -2580,7 +2010,7 @@ function Invoke-AMSIBypassDetection {
                 }
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\AMSIBypass_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\AMSIBypass_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -2849,7 +2279,7 @@ function Invoke-RegistryPersistenceDetection {
                 $Global:AntivirusState.ThreatCount++
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\RegistryPersistence_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\RegistryPersistence_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -2987,7 +2417,7 @@ function Invoke-DLLHijackingDetection {
                 }
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\DLLHijacking_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\DLLHijacking_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -3196,7 +2626,7 @@ function Invoke-ProcessHollowingDetection {
                 }
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\ProcessHollowing_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\ProcessHollowing_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -3208,199 +2638,6 @@ function Invoke-ProcessHollowingDetection {
         }
     } catch {
         Write-AVLog "Process hollowing detection error: $_" "ERROR" "process_hollowing_detections.log"
-    }
-    
-    return $detections.Count
-}
-
-function Invoke-KeyloggerDetection {
-    $detections = @()
-    
-    try {
-        # Keylogger signatures for advanced detection
-        $keyloggerSignatures = @{
-            "Keylogger" = @(
-                "keylogger", "keylog", "keystroke", "keyboard.*hook", "key.*capture",
-                "SetWindowsHookEx", "WH_KEYBOARD", "WH_KEYBOARD_LL", "GetAsyncKeyState",
-                "keyboard.*monitor", "keystroke.*logger", "key.*recorder"
-            )
-        }
-        
-        # Keylogger behavioral patterns
-        $keyloggerBehaviors = @{
-            "KeyboardHooking" = @(
-                "SetWindowsHookEx", "WH_KEYBOARD", "WH_KEYBOARD_LL", "keyboard.*hook",
-                "GetAsyncKeyState", "GetKeyState", "keylog"
-            )
-            "KeyCapture" = @(
-                "keystroke", "key.*capture", "key.*record", "keyboard.*monitor"
-            )
-        }
-        
-        # Check for processes with keyboard hooks
-        $processes = Get-Process -ErrorAction SilentlyContinue
-        
-        foreach ($proc in $processes) {
-            try {
-                $procPath = $proc.Path
-                if (-not $procPath -or -not (Test-Path $procPath)) { continue }
-                
-                $procCmdLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $($proc.Id)" -ErrorAction SilentlyContinue).CommandLine
-                
-                # Use advanced detection framework
-                $detectionResult = Invoke-AdvancedThreatDetection `
-                    -FilePath $procPath `
-                    -FileSignatures $keyloggerSignatures `
-                    -BehavioralIndicators $keyloggerBehaviors `
-                    -CommandLine $procCmdLine `
-                    -CheckEntropy $true
-                
-                if ($detectionResult.IsThreat) {
-                    $detections += @{
-                        ProcessId = $proc.Id
-                        ProcessName = $proc.ProcessName
-                        ThreatName = $detectionResult.ThreatName
-                        DetectionMethods = $detectionResult.DetectionMethods -join ", "
-                        Confidence = $detectionResult.Confidence
-                        Type = "Keylogger Detected via Advanced Framework"
-                        Risk = if ($detectionResult.Risk -eq "CRITICAL") { "Critical" } elseif ($detectionResult.Risk -eq "HIGH") { "High" } else { "Medium" }
-                    }
-                }
-                
-                # Legacy detection: Check for processes using keyboard hook DLLs
-                $modules = $proc.Modules | Where-Object {
-                    $_.ModuleName -match 'user32|keylog|hook|kbhook|keyboard'
-                }
-                
-                if ($modules.Count -gt 0) {
-                    # Exclude legitimate processes
-                    $legitProcesses = @("explorer.exe", "dwm.exe", "chrome.exe", "msedge.exe", "firefox.exe")
-                    if ($proc.ProcessName -notin $legitProcesses) {
-                        $detections += @{
-                            ProcessId = $proc.Id
-                            ProcessName = $proc.ProcessName
-                            HookModules = ($modules | Select-Object -ExpandProperty ModuleName) -join ', '
-                            Type = "Keyboard Hook Detected"
-                            Risk = "High"
-                        }
-                    }
-                }
-            } catch {
-                continue
-            }
-        }
-        
-        # Check for processes with SetWindowsHookEx API usage (keylogger indicator)
-        try {
-            $processes = Get-CimInstance Win32_Process | Select-Object ProcessId, Name, CommandLine
-            
-            foreach ($proc in $processes) {
-                if ($proc.CommandLine) {
-                    $keylogPatterns = @(
-                        'SetWindowsHookEx',
-                        'WH_KEYBOARD',
-                        'WH_KEYBOARD_LL',
-                        'keylog',
-                        'keyboard.*hook',
-                        'GetAsyncKeyState'
-                    )
-                    
-                    foreach ($pattern in $keylogPatterns) {
-                        if ($proc.CommandLine -match $pattern) {
-                            $procObj = Get-Process -Id $proc.ProcessId -ErrorAction SilentlyContinue
-                            if ($procObj) {
-                                $detections += @{
-                                    ProcessId = $proc.ProcessId
-                                    ProcessName = $proc.Name
-                                    CommandLine = $proc.CommandLine
-                                    Pattern = $pattern
-                                    Type = "Keylogger API Usage"
-                                    Risk = "Critical"
-                                }
-                            }
-                            break
-                        }
-                    }
-                }
-            }
-        } catch { }
-        
-        # Check for processes with unusual keyboard event monitoring
-        try {
-            $processes = Get-Process -ErrorAction SilentlyContinue
-            
-            foreach ($proc in $processes) {
-                try {
-                    # Check for processes with high keyboard-related handle counts
-                    $handles = Get-CimInstance Win32_ProcessHandle -Filter "ProcessId=$($proc.Id)" -ErrorAction SilentlyContinue
-                    $keyHandles = $handles | Where-Object { $_.Name -match 'keyboard|keylog' }
-                    
-                    if ($keyHandles.Count -gt 5) {
-                        $legitProcesses = @("explorer.exe", "dwm.exe")
-                        if ($proc.ProcessName -notin $legitProcesses) {
-                            $detections += @{
-                                ProcessId = $proc.Id
-                                ProcessName = $proc.ProcessName
-                                KeyboardHandles = $keyHandles.Count
-                                Type = "Unusual Keyboard Handle Count"
-                                Risk = "Medium"
-                            }
-                        }
-                    }
-                } catch {
-                    continue
-                }
-            }
-        } catch { }
-        
-        # Check for unsigned processes accessing keyboard
-        try {
-            $processes = Get-Process -ErrorAction SilentlyContinue |
-                Where-Object { $_.Modules.ModuleName -match "user32.dll" }
-            
-            foreach ($proc in $processes) {
-                try {
-                    if ($proc.Path -and (Test-Path $proc.Path)) {
-                        $sig = Get-AuthenticodeSignature -FilePath $proc.Path -ErrorAction SilentlyContinue
-                        if ($sig.Status -ne "Valid" -and $proc.ProcessName -notmatch "explorer|chrome|firefox|msedge") {
-                            $detections += @{
-                                ProcessId = $proc.Id
-                                ProcessName = $proc.ProcessName
-                                Type = "Unsigned Process with Keyboard Access"
-                                Risk = "High"
-                            }
-                        }
-                    }
-                } catch {
-                    continue
-                }
-            }
-        } catch { }
-        
-        if ($detections.Count -gt 0) {
-            foreach ($detection in $detections) {
-                Write-AVLog "KEYLOGGER DETECTED: $($detection.Type) - $($detection.ProcessName) (PID: $($detection.ProcessId))" "THREAT" "keylogger_detections.log"
-                $Global:AntivirusState.ThreatCount++
-                
-                if ($detection.ProcessId -and $Config.AutoKillThreats) {
-                    if ($detection.ProcessId -ne $PID -and $detection.ProcessId -ne $Script:SelfPID) {
-                        Stop-ThreatProcess -ProcessId $detection.ProcessId -ProcessName $detection.ProcessName
-                    }
-                }
-            }
-            
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\Keylogger_$(Get-Date -Format 'yyyy-MM-dd').log"
-            $logDir = Split-Path $logPath -Parent
-            if (!(Test-Path $logDir)) {
-                New-Item -ItemType Directory -Path $logDir -Force | Out-Null
-            }
-            $detections | ForEach-Object {
-                "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|$($_.Type)|$($_.Risk)|PID:$($_.ProcessId)|$($_.ProcessName)" |
-                    Add-Content -Path $logPath -ErrorAction SilentlyContinue
-            }
-        }
-    } catch {
-        Write-AVLog "Keylogger detection error: $_" "ERROR" "keylogger_detections.log"
     }
     
     return $detections.Count
@@ -3613,7 +2850,7 @@ function Invoke-RansomwareDetection {
                 }
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\Ransomware_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\Ransomware_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -4662,7 +3899,7 @@ function Invoke-BrowserExtensionMonitoring {
                 $Global:AntivirusState.ThreatCount++
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\BrowserExtension_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\BrowserExtension_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -4811,7 +4048,7 @@ function Invoke-USBMonitoring {
                 $Global:AntivirusState.ThreatCount++
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\USBMonitoring_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\USBMonitoring_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -5462,7 +4699,7 @@ function Invoke-MobileDeviceMonitoring {
             }
             
             # Write detailed log
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\MobileDeviceMonitoring_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\MobileDeviceMonitoring_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -6278,7 +5515,7 @@ function Invoke-AttackToolsDetection {
             }
             
             # Write detailed log
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\AttackToolsDetection_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\AttackToolsDetection_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -6699,7 +5936,7 @@ function Invoke-FilelessDetection {
 
         # 1. PowerShell encoded commands
         # Whitelist own process and script path
-        $ownScriptPath = if ($PSCommandPath) { $PSCommandPath } else { $Script:SelfPath }
+        $ownScriptPath = $Script:ScriptPath
         $PSProcesses = Get-Process | Where-Object { 
             $_.ProcessName -match "powershell|pwsh" -and 
             $_.Id -ne $PID -and
@@ -8492,7 +7729,7 @@ function Invoke-BeaconDetection {
                 }
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\BeaconDetection_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\BeaconDetection_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -8720,7 +7957,7 @@ function Invoke-CodeInjectionDetection {
                 }
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\CodeInjection_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\CodeInjection_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -8932,7 +8169,7 @@ function Invoke-ElfCatcher {
         }
         
         if ($detections.Count -gt 0) {
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\ElfCatcher_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\ElfCatcher_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -9065,7 +8302,7 @@ function Invoke-FileEntropyDetection {
         }
         
         if ($detections.Count -gt 0) {
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\FileEntropy_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\FileEntropy_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -9343,7 +8580,7 @@ function Invoke-ProcessCreationDetection {
                 }
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\ProcessCreation_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\ProcessCreation_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -10108,7 +9345,7 @@ function Invoke-ResponseAction {
                             # Check if this PID is running our script - if so, whitelist it
                             try {
                                 $cmdLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $threatPID" -ErrorAction SilentlyContinue).CommandLine
-                                $ownScriptPath = if ($PSCommandPath) { $PSCommandPath } else { $Script:SelfPath }
+                                $ownScriptPath = $Script:ScriptPath
                                 if ($cmdLine -and $ownScriptPath -and $cmdLine -like "*$ownScriptPath*") {
                                     Write-EDRLog -Module "ResponseEngine" -Message "BLOCKED: Attempted to kill own script instance (PID: $threatPID) - whitelisted" -Level "Warning"
                                     return
@@ -10133,7 +9370,7 @@ function Invoke-ResponseAction {
                                     # Check if this process is running our script
                                     try {
                                         $cmdLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $($p.Id)" -ErrorAction SilentlyContinue).CommandLine
-                                        $ownScriptPath = if ($PSCommandPath) { $PSCommandPath } else { $Script:SelfPath }
+                                        $ownScriptPath = $Script:ScriptPath
                                         if ($cmdLine -and $ownScriptPath -and $cmdLine -like "*$ownScriptPath*") {
                                             Write-EDRLog -Module "ResponseEngine" -Message "BLOCKED: Attempted to kill own script instance (PID: $($p.Id)) - whitelisted" -Level "Warning"
                                             continue
@@ -12132,72 +11369,18 @@ function Invoke-CrudePayloadGuard {
 # ===================== Main =====================
 
 try {
-    if ($Uninstall) {
-        Uninstall-Antivirus
-    }
-
     # Check for administrator privileges
-    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $isAdmin = Test-IsAdmin
     
     if (-not $isAdmin) {
-        Write-Host "`n[!] WARNING: Script is not running as Administrator!" -ForegroundColor Red
-        Write-Host "[!] Some features require administrator privileges:" -ForegroundColor Yellow
-        Write-Host "    - WebcamGuardian (device control)" -ForegroundColor Yellow
-        Write-Host "    - Password Management (registry access)" -ForegroundColor Yellow
-        Write-Host "    - Some detection modules" -ForegroundColor Yellow
-        Write-Host "`n[i] To run with full functionality, right-click PowerShell and select 'Run as Administrator'" -ForegroundColor Cyan
-        Write-Host "`n[i] Continuing with limited functionality...`n" -ForegroundColor Gray
-        Write-StabilityLog "Script running without administrator privileges - limited functionality" "WARN"
-    } else {
-        Write-StabilityLog "Script running with administrator privileges" "INFO"
+        Write-Host "`n[!] WARNING: Not running as Administrator - some features limited" -ForegroundColor Yellow
     }
 
-    Write-Host "`nAntivirus Protection (Single File)`n" -ForegroundColor Cyan
-    Write-StabilityLog "=== Antivirus Starting ==="
+    Write-Host "`nAntivirus Protection`n" -ForegroundColor Cyan
 
-    Write-StabilityLog "Executing script path: $PSCommandPath" "INFO"
+    # Initialize directories and state
+    Initialize-Directories
 
-    # <CHANGE> Clean up elevation flag on exit
-$flagFile = "$env:ProgramData\AntivirusProtection\.elevated"
-Register-EngineEvent PowerShell.Exiting -Action { Remove-Item $flagFile -Force -ErrorAction SilentlyContinue } | Out-Null
-    Register-ExitCleanup
-    
-    Request-Elevation -Reason "Antivirus protection requires administrator privileges for full functionality."
-    
-    Install-Antivirus
-    
-    # Only initialize mutex if not already initialized during installation
-    if (-not $Global:AntivirusState.Running) {
-        Initialize-Mutex
-    }
-
-    Register-TerminationProtection
-
-Write-Host "`n[PROTECTION] Initializing anti-termination safeguards..." -ForegroundColor Cyan
-
-if ($host.Name -eq "Windows PowerShell ISE Host") {
-    # In ISE, use trap handler which is already defined at the top
-    Write-Host "[PROTECTION] ISE detected - using trap-based Ctrl+C protection" -ForegroundColor Cyan
-    Write-Host "[PROTECTION] Ctrl+C protection enabled (requires $Script:MaxTerminationAttempts attempts to stop)" -ForegroundColor Green
-} else {
-    # In regular console, use the Console.CancelKeyPress handler
-    Enable-CtrlCProtection
-}
-
-# Enable auto-restart if running as admin
-try {
-    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    if ($isAdmin) {
-        Enable-AutoRestart
-        Start-ProcessWatchdog
-    } else {
-        Write-Host "[INFO] Auto-restart requires administrator privileges (optional)" -ForegroundColor Gray
-    }
-} catch {
-    Write-Host "[WARNING] Some protection features failed to initialize: $($_.Exception.Message)" -ForegroundColor Yellow
-}
-
-Write-Host "[PROTECTION] Anti-termination safeguards active" -ForegroundColor Green
     Write-Host "[*] Starting detection jobs...`n" -ForegroundColor Cyan
 
     $loaded = 0
@@ -12217,7 +11400,6 @@ Write-Host "[PROTECTION] Anti-termination safeguards active" -ForegroundColor Gr
         "DLLHijackingDetection",
         "TokenManipulationDetection",
         "ProcessHollowingDetection",
-        "KeyloggerDetection",
         "KeyScramblerManagement",
         "RansomwareDetection",
         "NetworkAnomalyDetection",
@@ -12332,15 +11514,6 @@ Write-Host "[PROTECTION] Anti-termination safeguards active" -ForegroundColor Gr
 catch {
     $err = $_.Exception.Message
     Write-Host "`n[!] Critical error: $err`n" -ForegroundColor Red
-    Write-StabilityLog "Critical startup error: $err" "ERROR"
     Write-AVLog "Startup error: $err" "ERROR"
-
-    if ($err -like "*already running*") {
-        Write-Host "[i] Another instance is running. Exiting.`n" -ForegroundColor Yellow
-        Write-StabilityLog "Blocked duplicate instance - exiting" "INFO"
-        exit 1
-    }
-
-    Write-StabilityLog "Exiting due to startup failure" "ERROR"
     exit 1
 }
