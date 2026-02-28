@@ -6,19 +6,19 @@
 
 <p align="center">
   <strong>A comprehensive Windows security hardening and protection suite</strong><br>
-  <em>Enterprise-grade security tools • Privacy protection • Automated threat response</em>
+  <em>Enterprise-grade EDR • 70+ Security Modules • Automated Threat Response</em>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?style=flat-square&logo=windows&logoColor=white" alt="Windows"/>
   <img src="https://img.shields.io/badge/PowerShell-5.1+-5391FE?style=flat-square&logo=powershell&logoColor=white" alt="PowerShell"/>
-  <img src="https://img.shields.io/badge/Security-Hardened-red?style=flat-square" alt="Security"/>
+  <img src="https://img.shields.io/badge/Modules-70+-red?style=flat-square" alt="Modules"/>
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License"/>
 </p>
 
 <p align="center">
   <a href="#-features">Features</a> •
-  <a href="#-components">Components</a> •
+  <a href="#-security-modules">Security Modules</a> •
   <a href="#-installation">Installation</a> •
   <a href="#-usage">Usage</a> •
   <a href="#-windows-iso-integration">ISO Integration</a>
@@ -28,7 +28,7 @@
 
 ## 🎯 Overview
 
-**GSecurity** is a complete security and privacy solution for Windows systems. It combines multiple protection layers including real-time antivirus, network monitoring, behavioral threat detection, privacy spoofing, vulnerability patching, and system hardening into a unified suite.
+**GSecurity** is a complete endpoint detection and response (EDR) solution for Windows systems. It combines 70+ security modules into a single unified PowerShell engine, providing real-time antivirus protection, network monitoring, behavioral threat detection, privacy spoofing, vulnerability patching, and comprehensive system hardening.
 
 ### ✨ Key Benefits
 
@@ -39,77 +39,157 @@
 | 🕵️ **Privacy Shield** | Identity spoofing and fingerprint randomization to defeat tracking |
 | 🩹 **Auto-Patching** | Automatic CISA KEV vulnerability detection and mitigation |
 | 🌐 **Network Security** | DNS-over-HTTPS/TLS, browser traffic monitoring, and smart blocking |
-| 🔐 **Credential Protection** | Password rotation and security policy hardening |
+| 🔐 **Credential Protection** | Password management and security policy hardening |
+| 🎯 **MITRE ATT&CK** | Detection mapped to MITRE ATT&CK framework |
 | 📦 **Easy Deployment** | Can be integrated directly into Windows installation media |
 
 ---
 
-## 🧩 Components
+## 🧩 Architecture
 
-GSecurity consists of specialized security modules:
+GSecurity uses a modular architecture where all security features are integrated into a single powerful PowerShell engine:
 
-| Component | Description | Type |
-|-----------|-------------|------|
-| 🦠 **[Antivirus.ps1](#-antivirusps1)** | Comprehensive EDR with real-time protection | Active Protection |
-| 🧠 **[NeuroBehaviorMonitor.ps1](#-neurobehaviormonitoryps1)** | Neuro-behavioral threat detection & response | Active Protection |
-| 🌐 **[GFocus.ps1](#-gfocusps1)** | Network traffic monitor & firewall manager | Network Security |
-| 🕵️ **[PrivacyForgeSpoofing.ps1](#-privacyforgespoofingps1)** | Identity & fingerprint spoofing | Privacy |
-| 🩹 **[CVE-MitigationPatcher.ps1](#-cve-mitigationpatcherps1)** | CISA KEV vulnerability auto-patcher | Vulnerability Management |
-| 🔑 **[Install-PasswordRotator.ps1](#-install-passwordrotatorps1)** | Automatic password rotation system | Credential Security |
-| 🔧 **[Secpol.ps1](#-secpolps1)** | Security policy & privilege hardening | System Hardening |
-| 🌍 **[configure-dns-doh-dot.ps1](#-configure-dns-doh-dotps1)** | DNS-over-HTTPS/TLS configuration | Network Security |
-| 🛡️ **[GSecurity.bat](#-gsecuritybat)** | Main orchestrator & service hardening | System Hardening |
+| Component | Description |
+|-----------|-------------|
+| 🦠 **Antivirus.ps1** | The main EDR engine with 70+ integrated security modules |
+| 🛡️ **GSecurity.bat** | Orchestrator that applies registry hardening and triggers setup |
+| 📝 **GSecurity.reg** | Comprehensive registry security tweaks |
+| ⚙️ **Antivirus.cmd** | Installer that deploys files and creates scheduled tasks |
+| 📋 **Antivirus.xml** | Scheduled task configuration for persistence |
 
 ---
 
-## 🚀 Features
+## 🚀 Security Modules
 
-### 🦠 Real-Time Antivirus Protection
+GSecurity includes 70+ integrated security modules organized by category:
 
-- **Hash-Based Detection** — MalwareBazaar, CIRCL, and Cymru threat intelligence
-- **YARA Memory Scanning** — Advanced pattern matching in process memory
-- **Signature Verification** — Trusts Microsoft-signed binaries automatically
-- **Quarantine System** — Isolates threats with backup restoration capability
-- **WMI Monitoring** — Real-time process and DLL load interception
-- **Behavior Analysis** — Process hollowing, credential access, lateral movement detection
-- **C2 Detection** — Identifies and blocks command & control communications
+### 🦠 Threat Detection & Response
 
-### 🧠 Neuro-Behavioral Protection
+| Module | Description | Interval |
+|--------|-------------|----------|
+| Hash Detection | MalwareBazaar, CIRCL, Cymru threat intelligence | 15s |
+| YARA Detection | Advanced pattern matching in process memory | 120s |
+| Tiny Threat Scan | Quick scan for suspicious unsigned DLLs | 20s |
+| Advanced Threat Detection | Deep analysis of process behavior | 20s |
+| File Entropy Detection | Detects packed/encrypted malware | 120s |
+| Attack Tools Detection | Identifies known hacking tools | 30s |
+| Ransomware Detection | Monitors for encryption behavior | 15s |
 
-- **Focus Abuse Detection** — Stops apps that repeatedly steal window focus
-- **Flash Stimulus Protection** — Prevents rapid brightness changes (seizure protection)
-- **Topmost Abuse Prevention** — Removes unauthorized always-on-top windows
-- **Cursor Jitter Detection** — Identifies and stops cursor manipulation attacks
-- **Color Distortion Defense** — Detects screen color inversion/manipulation
+### 🧠 Behavioral Analysis
 
-### 🕵️ Privacy & Anti-Tracking
+| Module | Description | Interval |
+|--------|-------------|----------|
+| Neuro Behavior Monitor | Focus abuse, flash attacks, cursor manipulation | 15s |
+| Process Anomaly Detection | Unusual process behavior patterns | 15s |
+| Process Hollowing Detection | Detects code injection via hollowing | 30s |
+| Suspicious Parent-Child Detection | Abnormal process relationships | 45s |
+| LOLBin Detection | Living-off-the-land binary abuse | 15s |
+| AMSI Bypass Detection | PowerShell/script evasion attempts | 15s |
 
-- **Identity Rotation** — Generates and rotates fake identity profiles
-- **Fingerprint Spoofing** — Randomizes browser fingerprint data
-- **Sensor Data Noise** — Spoofs accelerometer, gyroscope, and other sensors
-- **Telemetry Confusion** — Generates fake game and software telemetry
-- **User Agent Rotation** — Cycles through realistic browser signatures
+### 🔐 Credential & Access Security
 
-### 🩹 Vulnerability Management
-
-- **CISA KEV Integration** — Fetches known exploited vulnerabilities catalog
-- **Auto-Mitigation** — Applies scriptable fixes for critical CVEs
-- **Scheduled Scanning** — Hourly checks for new vulnerabilities
-- **Built-in Mitigations** — SMBv1, PrintNightmare, Follina, BlueKeep, and more
+| Module | Description | Interval |
+|--------|-------------|----------|
+| Credential Dump Detection | Mimikatz, LSASS access monitoring | 15s |
+| Credential Protection | Protects stored credentials | 300s |
+| Password Management | Secure password handling | 120s |
+| Token Manipulation Detection | Privilege escalation attempts | 60s |
 
 ### 🌐 Network Security
 
-- **DNS Encryption** — Cloudflare & Google DoH/DoT with automatic upgrade
-- **Browser Traffic Monitor** — Tracks and controls browser connections only
-- **Smart Blocking** — Blocks suspicious IPs while allowing dependencies
-- **Gaming Unaffected** — Never monitors or blocks gaming applications
+| Module | Description | Interval |
+|--------|-------------|----------|
+| GFocus | Browser traffic monitor & smart firewall | 2s |
+| Secure DNS Monitoring | DoH/DoT configuration enforcement | 300s |
+| Network Anomaly Detection | Unusual network patterns | 30s |
+| Network Traffic Monitoring | Connection analysis | 45s |
+| DNS Exfiltration Detection | Data exfil via DNS queries | 30s |
+| Beacon Detection | C2 beacon pattern recognition | 60s |
+| C2 Block (GRules) | Command & control blocking | 3600s |
+| App Phone Home Blocker | Blocks unwanted telemetry | 5s |
 
-### 🔐 System Hardening
+### 🕵️ Privacy Protection
 
-- **Service Lockdown** — Disables VNC, TeamViewer, AnyDesk, SSH, FTP, etc.
-- **Privilege Restriction** — Denies network logon and remote access rights
+| Module | Description | Interval |
+|--------|-------------|----------|
+| Privacy Forge Spoofing | Identity & fingerprint rotation | 60s |
+| Clipboard Monitoring | Sensitive data protection | 30s |
+| Webcam Guardian | Camera access monitoring | 5s |
+| Microphone Guardian | Mic access monitoring | 5s |
+| Screen Recording Protection | Prevents unauthorized capture | 10s |
+
+### 💾 Persistence & Evasion Detection
+
+| Module | Description | Interval |
+|--------|-------------|----------|
+| WMI Persistence Detection | WMI subscription abuse | 120s |
+| Scheduled Task Detection | Malicious task creation | 120s |
+| Registry Persistence Detection | Run key monitoring | 120s |
+| Startup Persistence Detection | Autorun locations | 120s |
+| COM Monitoring | COM object hijacking | 120s |
+| Service Monitoring | Malicious service detection | 60s |
+
+### 🔧 Code Injection Detection
+
+| Module | Description | Interval |
+|--------|-------------|----------|
+| Code Injection Detection | General injection techniques | 30s |
+| DLL Hijacking Detection | DLL search order abuse | 90s |
+| Reflective DLL Injection Detection | Memory-only DLL loading | 30s |
+| Fileless Detection | Memory-resident malware | 20s |
+| Unsigned DLL Remover | Removes suspicious DLLs | 300s |
+| ELF DLL Unloader | Foreign binary detection | 10s |
+
+### 🛡️ System Protection
+
+| Module | Description | Interval |
+|--------|-------------|----------|
+| Rootkit Detection | Hidden process/driver detection | 180s |
+| Driver Watcher | Malicious driver monitoring | 60s |
+| BCD Security | Boot configuration protection | 300s |
+| File Integrity Monitor | Critical file changes | 300s |
+| Shadow Copy Monitoring | VSS manipulation detection | 30s |
+| Firewall Rule Monitoring | Unauthorized rule changes | 120s |
+| ASR Rules | Attack Surface Reduction | 86400s |
+
+### 🩹 Vulnerability Management
+
+| Module | Description | Interval |
+|--------|-------------|----------|
+| CVE Mitigation Patcher | CISA KEV auto-patching | 3600s |
+| Local Proxy Detection | Malicious proxy detection | 60s |
+| HID Macro Guard | USB attack prevention | 60s |
+
+### 🎮 Device & Media Protection
+
+| Module | Description | Interval |
+|--------|-------------|----------|
+| USB Monitoring | Removable media threats | 20s |
+| Mobile Device Monitoring | Phone/tablet connections | 15s |
+| Audio Output Monitor | Sound device protection | 10s |
+| Wallpaper Protection | Desktop tampering | 30s |
+| System Sound Protection | Sound scheme changes | 60s |
+| Sleep Disruption Protection | Power state manipulation | 60s |
+
+### 📊 Monitoring & Intelligence
+
+| Module | Description | Interval |
+|--------|-------------|----------|
+| Event Log Monitoring | Security event analysis | 60s |
+| Named Pipe Monitoring | IPC attack detection | 45s |
+| Browser Extension Monitoring | Malicious extensions | 300s |
+| MITRE Mapping | ATT&CK framework correlation | 300s |
+| Script Content Scan | Malicious script detection | 120s |
+| Script Host Detection | Suspicious script execution | 60s |
+| Process Auditing | Comprehensive process logging | 86400s |
+
+### 🔒 System Hardening (via GSecurity.bat)
+
+- **Service Lockdown** — Disables VNC, TeamViewer, AnyDesk, SSH, FTP, Telnet, WinRM, etc.
+- **File Permission Hardening** — Restricts access to critical system files
 - **UAC Configuration** — Proper consent prompt behavior
 - **DEP Enforcement** — Always-on Data Execution Prevention
+- **Account Cleanup** — Removes default/unused accounts
 
 ---
 
@@ -138,257 +218,213 @@ cd GSecurity
 # Navigate to scripts directory
 cd Iso\sources\$OEM$\$$\Setup\Scripts\Bin
 
-# Run individual components as Administrator
-.\Antivirus.ps1                    # 🦠 EDR Protection
-.\NeuroBehaviorMonitor.ps1         # 🧠 Behavioral Protection
-.\GFocus.ps1                       # 🌐 Network Monitor
-.\PrivacyForgeSpoofing.ps1         # 🕵️ Privacy Protection
-.\CVE-MitigationPatcher.ps1        # 🩹 Vulnerability Patching
-.\Install-PasswordRotator.ps1      # 🔑 Password Rotation
-.\configure-dns-doh-dot.ps1        # 🌍 Secure DNS
-.\Secpol.ps1                       # 🔧 Policy Hardening
+# Run the EDR engine directly (all 70+ modules included)
+powershell -ExecutionPolicy Bypass -File .\Antivirus.ps1
 ```
 
-### Method 2: Full Suite Installation
+### Method 2: Full Suite Installation (Recommended)
 
 ```cmd
-# Run as Administrator
-GSecurity.bat
+# Navigate to the Scripts folder and run as Administrator
+cd Iso\sources\$OEM$\$$\Setup\Scripts\Bin
+Antivirus.cmd
 ```
 
-> ⚠️ **Note:** GSecurity.bat will restart your system after applying changes.
+This will:
+1. Copy all files to `C:\ProgramData\Antivirus\`
+2. Create a scheduled task for persistence
+3. Apply file permission hardening
+4. Disable dangerous services
+5. Enable DEP (Data Execution Prevention)
+6. Restart the system
+
+> ⚠️ **Note:** The installer will restart your system after applying changes.
 
 ### Method 3: Windows ISO Integration
 
-See [Windows ISO Integration](#-windows-iso-integration) for automated deployment.
+See [Windows ISO Integration](#-windows-iso-integration) for automated deployment during Windows installation.
 
 ---
 
 ## 💻 Usage
 
-### 🦠 Antivirus.ps1
+### 🦠 Antivirus.ps1 — The Main EDR Engine
 
-**Comprehensive Endpoint Detection & Response**
+**Comprehensive Endpoint Detection & Response with 70+ Integrated Modules**
 
 ```powershell
-# Install and run (auto-installs as scheduled task)
-.\Antivirus.ps1
+# Run the EDR engine (starts all security modules)
+powershell -ExecutionPolicy Bypass -File .\Antivirus.ps1
 
-# View logs
-Get-Content "C:\ProgramData\Antivirus\av.log"
+# View main logs
+Get-Content "C:\ProgramData\Antivirus\Logs\av.log" -Tail 100
 
-# Check quarantine
+# Check quarantine folder
 Get-ChildItem "C:\ProgramData\Antivirus\Quarantine"
+
+# View stability logs
+Get-Content "C:\ProgramData\Antivirus\Logs\stability_log.txt"
 ```
 
-**Features:**
-- 🔍 Real-time file system monitoring
-- 🧬 Memory scanning with YARA rules
-- 🌐 Threat intelligence from MalwareBazaar, CIRCL, Cymru
-- ⚡ WMI-based process/DLL interception
-- 🚫 Automatic quarantine and process termination
-- 📊 Persistence and fileless malware detection
+**Key Configuration Options** (in script header):
+
+```powershell
+$Config = @{
+    AutoKillThreats = $true       # Automatically terminate malicious processes
+    AutoQuarantine = $true        # Automatically quarantine threats
+    MaxMemoryUsageMB = 500        # Memory usage limit
+    EnableUnsignedDLLScanner = $true  # Scan for suspicious unsigned DLLs
+}
+```
+
+**Module Timing Configuration:**
+
+All 70+ modules run on configurable intervals. Key intervals include:
+
+| Module Category | Default Interval |
+|-----------------|------------------|
+| Real-time protection (GFocus, Subliminal) | 2-5 seconds |
+| Threat detection (Hash, YARA, Ransomware) | 15-30 seconds |
+| Behavioral analysis (Process, Network) | 15-60 seconds |
+| System monitoring (Services, Firewall) | 60-120 seconds |
+| Heavy scans (Rootkit, File Integrity) | 180-300 seconds |
+| Scheduled tasks (CVE Patcher, Auditing) | 3600-86400 seconds |
 
 ---
 
-### 🧠 NeuroBehaviorMonitor.ps1
+### 🛡️ GSecurity.bat — Registry Hardening
 
-**Neuro-Behavioral Threat Detection & Active Response**
+**Applies comprehensive registry security tweaks**
 
-```powershell
-# Full response mode (default) - minimize, remove flags, kill threats
-.\NeuroBehaviorMonitor.ps1
+```cmd
+# Navigate to Scripts folder
+cd Iso\sources\$OEM$\$$\Setup\Scripts
 
-# Moderate mode - no process killing
-.\NeuroBehaviorMonitor.ps1 -ResponseLevel Moderate
-
-# Alert only - logging without action
-.\NeuroBehaviorMonitor.ps1 -ResponseLevel AlertOnly
-
-# Custom tick interval
-.\NeuroBehaviorMonitor.ps1 -TickIntervalSeconds 2
+# Run registry hardening (requires Admin)
+GSecurity.bat
 ```
 
-**Response Levels:**
-| Level | Actions |
-|-------|---------|
-| 🔴 **Full** | Minimize + Remove flags + Kill process |
-| 🟡 **Moderate** | Minimize + Remove flags (no kills) |
-| ⚪ **AlertOnly** | Log only, no action taken |
+This imports all `.reg` files from the `Bin` folder to apply security tweaks.
 
 ---
 
-### 🌐 GFocus.ps1
+### ⚙️ Antivirus.cmd — Full Installation
 
-**Network Traffic Monitor & Smart Firewall**
+**Complete deployment with scheduled task and system hardening**
 
-```powershell
-# Start monitoring (browsers only)
-.\GFocus.ps1
-
-# Allow specific domains
-.\GFocus.ps1 -AllowedDomains "example.com","trusted.org"
-
-# Remove all block rules
-.\GFocus.ps1 -RemoveRules
+```cmd
+# Run as Administrator
+Antivirus.cmd
 ```
 
-**Key Features:**
-- 🎮 **Gaming Safe** — Never monitors or blocks games
-- 🌐 **Browser Only** — Targets browser processes exclusively
-- 🔗 **Smart Dependencies** — Auto-allows related connections
-- ♻️ **Dynamic Rules** — Removes blocks when user navigates to site
+**What it does:**
+
+1. **Deploys Files** — Copies all components to `C:\ProgramData\Antivirus\`
+2. **Creates Scheduled Task** — Registers persistent task via `Antivirus.xml`
+3. **Hardens File Permissions:**
+   - `useroobe.dll` — Reset and restrict inheritance
+   - `consent.exe` — Console logon only
+   - `winmm.dll` — Console logon only
+   - User desktops — Owner-only access
+4. **Disables Dangerous Services:**
+
+| Service | Description |
+|---------|-------------|
+| VNC, TeamViewer, AnyDesk, Radmin, LogMeIn | Remote access |
+| OpenSSH, sshd | SSH servers |
+| FileZilla Server, vsftpd, ftpsvc | FTP servers |
+| TelnetServer | Telnet |
+| WinRM | Windows Remote Management |
+| RemoteRegistry | Remote registry access |
+| SNMP | Network management |
+| SsdpSrv, upnphost | UPnP services |
+| seclogon | Secondary logon |
+| LanmanWorkstation, LanmanServer | SMB services |
+
+5. **Configures UAC** — Sets proper consent behavior
+6. **Enables DEP** — `bcdedit /set nx AlwaysOn`
+7. **Cleanup** — Removes `defaultuser0` account
+8. **Restarts** — Applies changes with system restart
 
 ---
 
-### 🕵️ PrivacyForgeSpoofing.ps1
+### 📊 Log Locations
 
-**Identity & Fingerprint Spoofing**
-
-```powershell
-# Start privacy protection (runs continuously)
-.\PrivacyForgeSpoofing.ps1
-```
-
-**Spoofing Capabilities:**
-- 👤 Fake identity generation (name, email, location)
-- 🖥️ User agent and screen resolution rotation
-- 🎮 Game telemetry spoofing
-- 📱 Sensor data randomization
-- 🔄 Automatic identity rotation (hourly or threshold-based)
+| Log | Path | Description |
+|-----|------|-------------|
+| Main Log | `C:\ProgramData\Antivirus\Logs\av.log` | All detections and actions |
+| Stability | `C:\ProgramData\Antivirus\Logs\stability_log.txt` | Module health tracking |
+| Quarantine | `C:\ProgramData\Antivirus\Quarantine\` | Isolated threats |
+| Hash Database | `C:\ProgramData\Antivirus\Data\known_files.db` | Cached file verdicts |
+| Whitelist | `C:\ProgramData\Antivirus\Data\whitelist.json` | Allowed files/paths |
 
 ---
 
-### 🩹 CVE-MitigationPatcher.ps1
+### 🔧 CVE Mitigations (Built-in)
 
-**CISA KEV Vulnerability Auto-Patcher**
+The CVE Mitigation Patcher module includes protections for:
 
-```powershell
-# Apply mitigations (default)
-.\CVE-MitigationPatcher.ps1
-
-# Preview only (dry run)
-.\CVE-MitigationPatcher.ps1 -DryRun
-
-# Report only (list CVEs without action)
-.\CVE-MitigationPatcher.ps1 -ReportOnly
-
-# Filter by vendor
-.\CVE-MitigationPatcher.ps1 -FilterVendor "Microsoft"
-
-# Install as scheduled task (hourly)
-.\CVE-MitigationPatcher.ps1 -RegisterSchedule
-
-# Uninstall scheduled task
-.\CVE-MitigationPatcher.ps1 -UnregisterSchedule
-```
-
-**Built-in Mitigations:**
 | CVE | Vulnerability | Mitigation |
 |-----|---------------|------------|
-| CVE-2017-0144 | EternalBlue | Disable SMBv1 |
+| CVE-2017-0144 | EternalBlue (SMBv1) | Disable SMBv1 |
 | CVE-2020-0796 | SMBGhost | Disable SMBv3 Compression |
-| CVE-2019-0708 | BlueKeep | Enable RDP NLA |
+| CVE-2019-0708 | BlueKeep (RDP) | Enable NLA |
 | CVE-2021-34527 | PrintNightmare | Disable Print Spooler |
-| CVE-2022-30190 | Follina | Block MSDT Protocol |
+| CVE-2022-30190 | Follina (MSDT) | Block Protocol Handler |
 | CVE-2024-38063 | IPv6 RCE | Disable IPv6 |
 
 ---
 
-### 🔑 Install-PasswordRotator.ps1
+### 🌐 Secure DNS Configuration
 
-**Automatic Password Rotation System**
+The Secure DNS module configures:
 
-```powershell
-# Install (one-shot, run as Administrator)
-.\Install-PasswordRotator.ps1
-
-# Uninstall
-.\Install-PasswordRotator.ps1 Uninstall
-```
-
-**How it Works:**
-1. 🔓 Sets current user password to blank on install
-2. ⏰ After logon, waits 60 seconds then sets random 24-char password
-3. 🔄 Rotates to new random password every 10 minutes
-4. 🔓 Resets password to blank on logoff
-5. 🛡️ Protects against password-based attacks while logged in
-
----
-
-### 🌍 configure-dns-doh-dot.ps1
-
-**Secure DNS Configuration**
-
-```powershell
-# Configure DoH/DoT (run as Administrator)
-.\configure-dns-doh-dot.ps1
-```
-
-**Configuration:**
-| Type | Primary (Cloudflare) | Secondary (Google) |
-|------|---------------------|-------------------|
-| IPv4 | 1.1.1.1 | 8.8.8.8 |
-| IPv6 | 2606:4700:4700::1111 | 2001:4860:4860::8888 |
-| DoH | ✅ Enabled | ✅ Enabled |
-| DoT | ✅ Enabled | ✅ Enabled |
-
----
-
-### 🔧 Secpol.ps1
-
-**Security Policy Hardening**
-
-```powershell
-# Apply privilege restrictions
-.\Secpol.ps1
-```
-
-**Restrictions Applied:**
-- 🚫 Deny network logon for authenticated users
-- 🚫 Deny remote interactive logon
-- 🚫 Clear remote shutdown privileges
-- 🚫 Clear remote logon rights
-
----
-
-### 🛡️ GSecurity.bat
-
-**Main Security Orchestrator**
-
-```cmd
-# Run full system hardening (requires restart)
-GSecurity.bat
-```
-
-**Actions Performed:**
-- 📝 Applies registry security tweaks
-- 🛑 Disables dangerous services (VNC, TeamViewer, AnyDesk, SSH, FTP, etc.)
-- 🔐 Sets file permissions on critical system files
-- 👤 Removes default user accounts
-- ⚙️ Configures UAC behavior
-- 💻 Enables DEP (Data Execution Prevention)
-- 🔄 Restarts system to apply changes
+| Provider | IPv4 | IPv6 | DoH/DoT |
+|----------|------|------|---------|
+| Cloudflare (Primary) | 1.1.1.1 | 2606:4700:4700::1111 | ✅ |
+| Google (Secondary) | 8.8.8.8 | 2001:4860:4860::8888 | ✅ |
 
 ---
 
 ## 💿 Windows ISO Integration
 
-GSecurity can be integrated into Windows installation media for automated deployment:
+GSecurity can be integrated into Windows installation media for fully automated deployment:
+
+### How It Works
+
+The `autounattend.xml` configures:
+- Unattended Windows installation (no user prompts)
+- Automatic local admin account creation
+- First logon command that triggers GSecurity setup
+- Regional settings (customizable)
 
 ### Step 1: Prepare Windows ISO
 
 ```cmd
-# Mount or extract Windows ISO to a folder (e.g., C:\WindowsISO)
+# Mount or extract Windows ISO to a folder
+# Example: C:\WindowsISO
 ```
 
 ### Step 2: Copy GSecurity Files
 
 ```cmd
-xcopy /E /I "GSecurity\Iso\sources" "C:\WindowsISO\sources"
+# Copy the entire Iso folder contents
+xcopy /E /I "GSecurity\Iso\*" "C:\WindowsISO\"
 ```
 
-### Step 3: Rebuild ISO
+This copies:
+- `autounattend.xml` → Root of ISO (triggers unattended install)
+- `sources\$OEM$\` → OEM preinstallation folder (runs on first logon)
+
+### Step 3: Customize (Optional)
+
+Edit `autounattend.xml` to change:
+- `InputLocale` / `UserLocale` — Regional settings
+- `TimeZone` — System timezone
+- `ComputerName` — Default PC name
+- `Username` — Admin account name
+
+### Step 4: Rebuild ISO
 
 ```cmd
 # Using oscdimg from Windows ADK
@@ -397,11 +433,19 @@ oscdimg -m -o -u2 -udfver102 ^
   "C:\WindowsISO" "C:\GSecurity-Windows.iso"
 ```
 
-### Step 4: Test
+### Step 5: Test in VM
 
-1. Create a VM
-2. Install Windows from the modified ISO
-3. GSecurity runs automatically on first logon
+1. Create a new VM (Hyper-V, VMware, VirtualBox)
+2. Boot from the modified ISO
+3. Windows installs automatically
+4. On first logon, GSecurity deploys and hardens the system
+5. System restarts with full protection active
+
+### Deployment Flow
+
+```
+Windows Install → First Logon → GSecurity.bat → Antivirus.cmd → Restart → Protected
+```
 
 ---
 
@@ -411,30 +455,45 @@ oscdimg -m -o -u2 -udfver102 ^
 GSecurity/
 ├── 📄 README.md
 └── 📁 Iso/
-    ├── 📄 autounattend.xml          # Unattended Windows installation
-    ├── 📄 Autorun.inf
+    ├── 📄 autounattend.xml          # Unattended Windows installation config
+    ├── 📄 Autorun.inf               # ISO autorun configuration
     └── 📁 sources/
         └── 📁 $OEM$/
             ├── 📁 $$/Setup/Scripts/
             │   ├── 📄 SetupComplete.cmd    # Post-install trigger
             │   └── 📁 Bin/
-            │       ├── 🦠 Antivirus.ps1
-            │       ├── 🧠 NeuroBehaviorMonitor.ps1
-            │       ├── 🌐 GFocus.ps1
-            │       ├── 🕵️ PrivacyForgeSpoofing.ps1
-            │       ├── 🩹 CVE-MitigationPatcher.ps1
-            │       ├── 🔑 Install-PasswordRotator.ps1
-            │       ├── 🔧 Secpol.ps1
-            │       ├── 🌍 configure-dns-doh-dot.ps1
-            │       ├── 🛡️ GSecurity.bat
-            │       ├── 📄 GSecurity.reg
-            │       ├── 📄 Antivirus.xml
-            │       ├── 📄 Antivirus.cmd
-            │       └── 📄 GFocusRulesRemover.ps1
+            │       ├── 🦠 Antivirus.ps1    # Main EDR engine (70+ modules)
+            │       ├── 🛡️ GSecurity.bat    # Registry hardening orchestrator
+            │       ├── ⚙️ Antivirus.cmd    # Installer & system hardening
+            │       ├── 📝 GSecurity.reg    # Security registry tweaks
+            │       └── 📋 Antivirus.xml    # Scheduled task definition
             └── 📁 $1/
                 ├── 📄 autoexec.bat
                 ├── 📄 config.sys
                 └── 📁 users/Default/Desktop/Extras/
+                    └── 📁 Bookmarks/
+                        └── 📄 bookmarks.html
+```
+
+### Installed File Locations
+
+After installation, files are deployed to:
+
+```
+C:\ProgramData\Antivirus/
+├── 📁 Logs/
+│   ├── 📄 av.log                    # Main detection log
+│   └── 📄 stability_log.txt         # Module health log
+├── 📁 Quarantine/                   # Isolated threats
+├── 📁 Data/
+│   ├── 📄 known_files.db            # Hash verdict cache
+│   ├── 📄 whitelist.json            # Allowed files/paths
+│   └── 📄 db_integrity.hmac         # Database integrity
+├── 📁 Reports/                      # Generated reports
+├── 🦠 Antivirus.ps1                 # Main EDR engine
+├── ⚙️ Antivirus.cmd                 # Installer script
+├── 📋 Antivirus.xml                 # Scheduled task
+└── 📝 GSecurity.reg                 # Registry tweaks
 ```
 
 ---
@@ -445,80 +504,110 @@ GSecurity/
 
 | Warning | Description |
 |---------|-------------|
-| 🔄 **Restart Required** | GSecurity.bat and some mitigations require system restart |
-| 🛑 **Service Changes** | Some services are permanently disabled |
-| 📦 **File Quarantine** | Antivirus may quarantine legitimate files — review logs |
-| 🌐 **Network Blocking** | GFocus may block connections — use `-RemoveRules` if needed |
-| 🔐 **Policy Changes** | Secpol makes permanent security policy changes |
-| 🔑 **Password Rotation** | PasswordRotator changes user passwords automatically |
+| 🔄 **Restart Required** | Installation requires system restart to apply all changes |
+| 🛑 **Service Changes** | Remote access services (VNC, TeamViewer, SSH, etc.) are permanently disabled |
+| 📦 **File Quarantine** | EDR may quarantine legitimate files — review logs regularly |
+| 🌐 **Network Blocking** | GFocus module may block browser connections |
+| 🔐 **Permission Changes** | Critical system files have permissions hardened |
+| 🛡️ **SMB Disabled** | LanmanWorkstation/Server disabled (may affect network shares) |
 
 ### ✅ Best Practices
 
 1. 💾 **Backup First** — Create a system restore point before installation
 2. 🖥️ **Test in VM** — Test GSecurity in a virtual machine first
-3. 📋 **Review Logs** — Regularly check component logs for issues
-4. 🔄 **Update Regularly** — Keep components updated for latest security
+3. 📋 **Review Logs** — Regularly check `C:\ProgramData\Antivirus\Logs\`
+4. 📝 **Whitelist Legitimate Files** — Add false positives to `whitelist.json`
 5. ⚡ **Monitor Performance** — Watch for performance impacts
+6. 🔄 **Update Threat Intel** — Hash database updates automatically via API calls
 
 ### 🔒 Privacy
 
-- **Hash Lookups** — File hashes are sent to external threat intelligence services
-- **No Data Collection** — GSecurity does not collect or transmit personal data
-- **Local Processing** — All monitoring and blocking happens locally
+| Aspect | Details |
+|--------|---------|
+| **Hash Lookups** | SHA256 hashes sent to MalwareBazaar, CIRCL, Cymru for threat intel |
+| **No PII Transmission** | Only file hashes are sent, never file contents or personal data |
+| **Local Processing** | All behavioral analysis, monitoring, and blocking happens locally |
+| **Privacy Spoofing** | PrivacyForge module generates fake identities to protect real data |
+| **DNS Encryption** | All DNS queries encrypted via DoH/DoT |
 
 ---
 
 ## 📊 Performance Impact
 
-| Component | CPU | RAM | Disk I/O |
-|-----------|-----|-----|----------|
-| 🦠 Antivirus | < 5% | ~50-100 MB | Medium |
-| 🧠 NeuroBehaviorMonitor | < 2% | ~20-30 MB | Low |
-| 🌐 GFocus | < 2% | ~15-25 MB | Minimal |
-| 🕵️ PrivacyForgeSpoofing | < 1% | ~10-20 MB | Minimal |
-| 🩹 CVE-MitigationPatcher | < 1%* | ~10 MB | Low |
+Since all modules are integrated into a single engine, resources are shared efficiently:
 
-*\*Runs hourly when scheduled*
+| Metric | Idle | Active Scan | Peak |
+|--------|------|-------------|------|
+| **CPU** | < 2% | 5-10% | < 15% |
+| **RAM** | ~100 MB | ~200 MB | < 500 MB* |
+| **Disk I/O** | Minimal | Medium | Medium |
 
-**Total Impact:** Typically < 10% CPU, < 200 MB RAM
+*\*Configurable via `MaxMemoryUsageMB` setting*
+
+**Module Scheduling:**
+
+- High-frequency modules (2-5s): GFocus, device guardians, subliminal detection
+- Medium-frequency (15-60s): Threat detection, behavioral analysis
+- Low-frequency (120-300s): Deep scans, integrity checks
+- Scheduled (3600s+): CVE patching, auditing
+
+The staggered intervals ensure consistent performance without CPU spikes.
 
 ---
 
 ## 🛠️ Troubleshooting
 
-### Component Not Starting
+### EDR Not Starting
 
 ```powershell
-# Check scheduled tasks
-Get-ScheduledTask | Where-Object { $_.TaskName -like "*Antivirus*" -or $_.TaskName -like "*CVE*" }
+# Check if scheduled task exists
+Get-ScheduledTask | Where-Object { $_.TaskName -like "*Antivirus*" }
+
+# View task status
+Get-ScheduledTask -TaskName "Antivirus" | Get-ScheduledTaskInfo
 
 # View task history
 Get-WinEvent -LogName Microsoft-Windows-TaskScheduler/Operational | 
     Where-Object { $_.Message -like "*Antivirus*" } | 
     Select-Object -First 10
+
+# Manually start the task
+Start-ScheduledTask -TaskName "Antivirus"
 ```
 
-### Antivirus Issues
+### Checking Logs
 
 ```powershell
-# Check logs
-Get-Content "C:\ProgramData\Antivirus\av.log" -Tail 50
+# View recent detections
+Get-Content "C:\ProgramData\Antivirus\Logs\av.log" -Tail 100
 
-# View blocked files
-Get-Content "C:\ProgramData\Antivirus\blocked.log"
+# View module stability
+Get-Content "C:\ProgramData\Antivirus\Logs\stability_log.txt" -Tail 50
 
 # Check quarantine
-Get-ChildItem "C:\ProgramData\Antivirus\Quarantine"
+Get-ChildItem "C:\ProgramData\Antivirus\Quarantine" -Recurse
+
+# View hash database stats
+(Get-Content "C:\ProgramData\Antivirus\Data\known_files.db").Count
 ```
 
-### GFocus Blocking Legitimate Sites
+### False Positives
 
 ```powershell
-# Remove all block rules
-.\GFocus.ps1 -RemoveRules
+# Add file to whitelist
+$whitelist = Get-Content "C:\ProgramData\Antivirus\Data\whitelist.json" | ConvertFrom-Json
+$whitelist += @{ Path = "C:\Path\To\File.exe"; Reason = "False positive" }
+$whitelist | ConvertTo-Json | Set-Content "C:\ProgramData\Antivirus\Data\whitelist.json"
+```
 
-# Or allow specific domains
-.\GFocus.ps1 -AllowedDomains "example.com"
+### Network Issues (GFocus Module)
+
+```powershell
+# Remove firewall rules created by GFocus
+Get-NetFirewallRule -DisplayName "*GFocus*" | Remove-NetFirewallRule
+
+# Or disable the GFocus module by editing interval to very high value
+# In Antivirus.ps1: GFocusIntervalSeconds = 999999
 ```
 
 ### DNS Configuration Issues
@@ -528,8 +617,30 @@ Get-ChildItem "C:\ProgramData\Antivirus\Quarantine"
 netsh interface ipv4 set dnsservers name="Ethernet" dhcp
 netsh interface ipv6 set dnsservers name="Ethernet" dhcp
 
+# Flush DNS cache
+ipconfig /flushdns
+
 # Verify configuration
 ipconfig /all | findstr "DNS"
+```
+
+### Uninstalling GSecurity
+
+```powershell
+# Remove scheduled task
+Unregister-ScheduledTask -TaskName "Antivirus" -Confirm:$false
+
+# Stop any running instances
+Get-Process -Name "powershell" | Where-Object { 
+    $_.CommandLine -like "*Antivirus.ps1*" 
+} | Stop-Process -Force
+
+# Remove installation folder
+Remove-Item -Path "C:\ProgramData\Antivirus" -Recurse -Force
+
+# Remove firewall rules
+Get-NetFirewallRule -DisplayName "*GFocus*" | Remove-NetFirewallRule
+Get-NetFirewallRule -DisplayName "*GSecurity*" | Remove-NetFirewallRule
 ```
 
 ---
@@ -562,11 +673,13 @@ This project is licensed under the **MIT License** — see the [LICENSE](LICENSE
 
 ## 🙏 Acknowledgments
 
-- 🦠 [MalwareBazaar](https://bazaar.abuse.ch/) — Threat intelligence
+- 🦠 [MalwareBazaar](https://bazaar.abuse.ch/) — Malware sample threat intelligence
 - 🔍 [CIRCL](https://www.circl.lu/) — Hash lookup services
-- 🇺🇸 [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) — Vulnerability catalog
-- 🌐 [Cloudflare](https://cloudflare.com/) & [Google](https://google.com/) — DNS services
+- 🔎 [Team Cymru](https://www.team-cymru.com/) — Malware hash reputation
+- 🇺🇸 [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) — Known exploited vulnerabilities catalog
+- 🌐 [Cloudflare](https://cloudflare.com/) & [Google](https://google.com/) — Secure DNS services
 - 🎯 [YARA](https://virustotal.github.io/yara/) — Pattern matching engine
+- 🛡️ [MITRE ATT&CK](https://attack.mitre.org/) — Threat framework mapping
 - ❤️ All contributors and users of this project
 
 ---
