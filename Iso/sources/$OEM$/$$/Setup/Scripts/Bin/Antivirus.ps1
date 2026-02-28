@@ -47,6 +47,16 @@ $Script:ManagedJobConfig = @{
     DNSExfiltrationDetectionIntervalSeconds = 30
     PasswordManagementIntervalSeconds = 120
     WebcamGuardianIntervalSeconds = 5
+    MicrophoneGuardianIntervalSeconds = 5
+    AudioOutputMonitorIntervalSeconds = 10
+    WallpaperProtectionIntervalSeconds = 30
+    SystemSoundProtectionIntervalSeconds = 60
+    NotificationAbuseDetectionIntervalSeconds = 5
+    FileIntegrityMonitorIntervalSeconds = 300
+    ScreenRecordingProtectionIntervalSeconds = 10
+    SleepDisruptionProtectionIntervalSeconds = 60
+    SubliminalContentDetectorIntervalSeconds = 2
+    InputInjectionProtectionIntervalSeconds = 5
     BeaconDetectionIntervalSeconds = 60
     CodeInjectionDetectionIntervalSeconds = 30
     DataExfiltrationDetectionIntervalSeconds = 30
@@ -83,6 +93,7 @@ $Script:ManagedJobConfig = @{
     RealTimeFileMonitorIntervalSeconds = 60
     DriverWatcherIntervalSeconds = 60
     CrudePayloadGuardIntervalSeconds = 60
+    AppPhoneHomeBlockerIntervalSeconds = 5
 }
 
 $Config = @{
@@ -2135,32 +2146,187 @@ function Invoke-CredentialDumpDetection {
 }
 
 function Invoke-WMIPersistenceDetection {
-    $Filters = Get-CimInstance -Namespace root\subscription -ClassName __EventFilter -ErrorAction SilentlyContinue
-    $Consumers = Get-CimInstance -Namespace root\subscription -ClassName CommandLineEventConsumer -ErrorAction SilentlyContinue
-
-    foreach ($Filter in $Filters) {
-        Write-Output "[WMI] Event filter found: $($Filter.Name) | Query: $($Filter.Query)"
+    $detections = @()
+    
+    try {
+        $Filters = Get-CimInstance -Namespace root\subscription -ClassName __EventFilter -ErrorAction SilentlyContinue
+        $Consumers = Get-CimInstance -Namespace root\subscription -ClassName CommandLineEventConsumer -ErrorAction SilentlyContinue
+        $Bindings = Get-CimInstance -Namespace root\subscription -ClassName __FilterToConsumerBinding -ErrorAction SilentlyContinue
+        
+        # Known legitimate WMI subscriptions to whitelist
+        $LegitFilters = @("SCM Event Log Filter", "BVTFilter", "TSLogonFilter")
+        
+        foreach ($Filter in $Filters) {
+            if ($Filter.Name -in $LegitFilters) { continue }
+            
+            $isSuspicious = $false
+            $reasons = @()
+            
+            # Check for suspicious query patterns
+            if ($Filter.Query -match "Win32_ProcessStartTrace|Win32_ProcessStopTrace|__InstanceCreationEvent|powershell|cmd|wscript|cscript") {
+                $isSuspicious = $true
+                $reasons += "Suspicious event query pattern"
+            }
+            
+            if ($isSuspicious) {
+                Write-AVLog "[WMIPersistence] THREAT: Malicious WMI filter - $($Filter.Name) | Query: $($Filter.Query)" "THREAT" "wmi_persistence.log"
+                $detections += @{ Type = "Filter"; Name = $Filter.Name; Query = $Filter.Query }
+                $Global:AntivirusState.ThreatCount++
+                
+                # CONCRETE ACTION: Remove the malicious WMI filter
+                if ($Config.AutoKillThreats) {
+                    try {
+                        # First remove any bindings
+                        $relatedBindings = $Bindings | Where-Object { $_.Filter -like "*$($Filter.Name)*" }
+                        foreach ($binding in $relatedBindings) {
+                            Remove-CimInstance -InputObject $binding -ErrorAction SilentlyContinue
+                            Write-AVLog "[WMIPersistence] REMOVED binding for filter: $($Filter.Name)" "INFO" "wmi_persistence.log"
+                        }
+                        # Then remove the filter
+                        Remove-CimInstance -InputObject $Filter -ErrorAction SilentlyContinue
+                        Write-AVLog "[WMIPersistence] REMOVED malicious filter: $($Filter.Name)" "INFO" "wmi_persistence.log"
+                    } catch {
+                        Write-AVLog "[WMIPersistence] Failed to remove filter $($Filter.Name): $_" "ERROR" "wmi_persistence.log"
+                    }
+                }
+            }
+        }
+        
+        foreach ($Consumer in $Consumers) {
+            $isSuspicious = $false
+            
+            # Check for suspicious command patterns
+            if ($Consumer.CommandLineTemplate -match "powershell|cmd|wscript|cscript|mshta|certutil|bitsadmin|rundll32|-enc|-encoded|http://|https://|\\\\") {
+                $isSuspicious = $true
+            }
+            
+            if ($isSuspicious) {
+                Write-AVLog "[WMIPersistence] THREAT: Malicious WMI consumer - $($Consumer.Name) | Command: $($Consumer.CommandLineTemplate)" "THREAT" "wmi_persistence.log"
+                $detections += @{ Type = "Consumer"; Name = $Consumer.Name; Command = $Consumer.CommandLineTemplate }
+                $Global:AntivirusState.ThreatCount++
+                
+                # CONCRETE ACTION: Remove the malicious WMI consumer
+                if ($Config.AutoKillThreats) {
+                    try {
+                        # First remove any bindings
+                        $relatedBindings = $Bindings | Where-Object { $_.Consumer -like "*$($Consumer.Name)*" }
+                        foreach ($binding in $relatedBindings) {
+                            Remove-CimInstance -InputObject $binding -ErrorAction SilentlyContinue
+                            Write-AVLog "[WMIPersistence] REMOVED binding for consumer: $($Consumer.Name)" "INFO" "wmi_persistence.log"
+                        }
+                        # Then remove the consumer
+                        Remove-CimInstance -InputObject $Consumer -ErrorAction SilentlyContinue
+                        Write-AVLog "[WMIPersistence] REMOVED malicious consumer: $($Consumer.Name)" "INFO" "wmi_persistence.log"
+                    } catch {
+                        Write-AVLog "[WMIPersistence] Failed to remove consumer $($Consumer.Name): $_" "ERROR" "wmi_persistence.log"
+                    }
+                }
+            }
+        }
+        
+    } catch {
+        Write-AVLog "[WMIPersistence] Detection error: $_" "ERROR" "wmi_persistence.log"
     }
-
-    foreach ($Consumer in $Consumers) {
-        Write-Output "[WMI] Command consumer found: $($Consumer.Name) | Command: $($Consumer.CommandLineTemplate)"
-    }
+    
+    return $detections.Count
 }
 
 function Invoke-ScheduledTaskDetection {
-    $Tasks = Get-ScheduledTask | Where-Object { $_.State -eq "Ready" -and $_.Principal.UserId -notmatch "SYSTEM|Administrator" }
-
-    foreach ($Task in $Tasks) {
-        # Whitelist our own scheduled tasks
-        if ($Task.TaskName -like "AntivirusAutoRestart_*" -or $Task.TaskName -eq "AntivirusProtection") {
-            continue
+    $detections = @()
+    
+    try {
+        $Tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { 
+            $_.State -eq "Ready" -and $_.TaskPath -notmatch "\\Microsoft\\" 
         }
         
-        $Action = $Task.Actions[0].Execute
-        if ($Action -match "powershell|cmd|wscript|cscript|mshta") {
-            Write-Output "[ScheduledTask] SUSPICIOUS: $($Task.TaskName) | Action: $Action | User: $($Task.Principal.UserId)"
+        # Whitelist legitimate tasks
+        $WhitelistedTasks = @(
+            "AntivirusAutoRestart_*", "AntivirusProtection", "Antivirus",
+            "GoogleUpdate*", "MicrosoftEdgeUpdate*", "OneDrive*", "Adobe*",
+            "CCleaner*", "Dropbox*", "Slack*", "Zoom*", "Teams*"
+        )
+        
+        foreach ($Task in $Tasks) {
+            # Skip whitelisted tasks
+            $isWhitelisted = $false
+            foreach ($pattern in $WhitelistedTasks) {
+                if ($Task.TaskName -like $pattern) { $isWhitelisted = $true; break }
+            }
+            if ($isWhitelisted) { continue }
+            
+            $Action = $Task.Actions[0].Execute
+            $Arguments = $Task.Actions[0].Arguments
+            $FullCommand = "$Action $Arguments"
+            
+            $isSuspicious = $false
+            $severity = "Medium"
+            $reasons = @()
+            
+            # Check for suspicious executables
+            if ($Action -match "powershell|pwsh|cmd|wscript|cscript|mshta|certutil|bitsadmin|rundll32|regsvr32|msbuild") {
+                $isSuspicious = $true
+                $reasons += "Executes script interpreter or LOLBin"
+                $severity = "High"
+            }
+            
+            # Check for suspicious arguments
+            if ($Arguments -match "-enc|-encoded|http://|https://|bypass|hidden|-w\s*h|downloadstring|iex|invoke-expression") {
+                $isSuspicious = $true
+                $reasons += "Suspicious command arguments"
+                $severity = "Critical"
+            }
+            
+            # Check for execution from temp/downloads
+            if ($Action -match "\\Temp\\|\\Downloads\\|\\AppData\\Local\\Temp\\|\\Users\\Public\\") {
+                $isSuspicious = $true
+                $reasons += "Executes from suspicious path"
+                $severity = "Critical"
+            }
+            
+            # Check for tasks created recently (last 24 hours) with suspicious patterns
+            if ($Task.Date) {
+                $created = [DateTime]::Parse($Task.Date)
+                if ($created -gt (Get-Date).AddHours(-24) -and ($Action -match "powershell|cmd|wscript")) {
+                    $isSuspicious = $true
+                    $reasons += "Recently created with script execution"
+                }
+            }
+            
+            if ($isSuspicious) {
+                Write-AVLog "[ScheduledTask] THREAT ($severity): $($Task.TaskName) | Action: $FullCommand | Reasons: $($reasons -join '; ')" "THREAT" "scheduled_task_detections.log"
+                $detections += @{
+                    TaskName = $Task.TaskName
+                    TaskPath = $Task.TaskPath
+                    Action = $FullCommand
+                    Severity = $severity
+                    Reasons = $reasons
+                }
+                $Global:AntivirusState.ThreatCount++
+                
+                # CONCRETE ACTION: Disable and optionally unregister malicious tasks
+                if ($Config.AutoKillThreats) {
+                    try {
+                        # First disable the task
+                        Disable-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath -ErrorAction SilentlyContinue
+                        Write-AVLog "[ScheduledTask] DISABLED: $($Task.TaskName)" "INFO" "scheduled_task_detections.log"
+                        
+                        # For critical severity, also unregister (delete) the task
+                        if ($severity -eq "Critical") {
+                            Unregister-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath -Confirm:$false -ErrorAction SilentlyContinue
+                            Write-AVLog "[ScheduledTask] REMOVED: $($Task.TaskName)" "INFO" "scheduled_task_detections.log"
+                        }
+                    } catch {
+                        Write-AVLog "[ScheduledTask] Failed to disable/remove $($Task.TaskName): $_" "ERROR" "scheduled_task_detections.log"
+                    }
+                }
+            }
         }
+        
+    } catch {
+        Write-AVLog "[ScheduledTask] Detection error: $_" "ERROR" "scheduled_task_detections.log"
     }
+    
+    return $detections.Count
 }
 
 function Invoke-RegistryPersistenceDetection {
@@ -2277,6 +2443,40 @@ function Invoke-RegistryPersistenceDetection {
             foreach ($detection in $detections) {
                 Write-AVLog "REGISTRY PERSISTENCE: $($detection.Type) - $($detection.RegistryKey) - $($detection.ValueName)" "THREAT" "registry_persistence_detections.log"
                 $Global:AntivirusState.ThreatCount++
+                
+                # CONCRETE ACTION: Remove malicious registry persistence
+                if ($Config.AutoKillThreats -and $detection.Risk -in @("High", "Critical")) {
+                    try {
+                        # Don't remove entries from HKLM unless absolutely sure (could break system)
+                        # Focus on HKCU entries which are user-specific
+                        if ($detection.RegistryKey -like "HKCU:*") {
+                            Remove-ItemProperty -Path $detection.RegistryKey -Name $detection.ValueName -ErrorAction SilentlyContinue
+                            Write-AVLog "[RegistryPersistence] REMOVED: $($detection.RegistryKey)\$($detection.ValueName)" "INFO" "registry_persistence_detections.log"
+                        }
+                        elseif ($detection.RegistryKey -like "HKLM:*" -and $detection.Type -eq "Suspicious Registry Persistence") {
+                            # For HKLM, be more cautious - only remove if clearly malicious (script-based)
+                            if ($detection.Value -match "powershell.*-enc|cmd.*/c.*powershell|wscript|cscript|mshta") {
+                                Remove-ItemProperty -Path $detection.RegistryKey -Name $detection.ValueName -ErrorAction SilentlyContinue
+                                Write-AVLog "[RegistryPersistence] REMOVED (HKLM): $($detection.RegistryKey)\$($detection.ValueName)" "INFO" "registry_persistence_detections.log"
+                            }
+                        }
+                        
+                        # CONCRETE ACTION: If there's an executable, quarantine it
+                        if ($detection.ExecutablePath -and (Test-Path $detection.ExecutablePath)) {
+                            if ($detection.ExecutablePath -notlike "$env:SystemRoot\*" -and $detection.ExecutablePath -notlike "$env:ProgramFiles\*") {
+                                try {
+                                    $quarantinePath = "$Script:InstallPath\Quarantine"
+                                    $fileName = Split-Path -Leaf $detection.ExecutablePath
+                                    $destPath = Join-Path $quarantinePath "${fileName}_$(Get-Date -Format 'yyyyMMddHHmmss')"
+                                    Move-Item -Path $detection.ExecutablePath -Destination $destPath -Force -ErrorAction SilentlyContinue
+                                    Write-AVLog "[RegistryPersistence] QUARANTINED: $($detection.ExecutablePath)" "INFO" "registry_persistence_detections.log"
+                                } catch {}
+                            }
+                        }
+                    } catch {
+                        Write-AVLog "[RegistryPersistence] Failed to remove $($detection.ValueName): $_" "ERROR" "registry_persistence_detections.log"
+                    }
+                }
             }
             
             $logPath = "$Script:InstallPath\Logs\RegistryPersistence_$(Get-Date -Format 'yyyy-MM-dd').log"
@@ -7236,6 +7436,1120 @@ function Invoke-WebcamGuardian {
     }
     }
 
+# ============================================================================
+# USER-TARGETED ATTACK PROTECTION MODULES
+# Protects against psychological/harassment attacks aimed at the user
+# ============================================================================
+
+function Invoke-MicrophoneGuardian {
+    <#
+    .SYNOPSIS
+    Monitors and controls microphone access with explicit user permission.
+    
+    .DESCRIPTION
+    Keeps microphone disabled by default. When any application tries to access it,
+    shows a permission popup. Only enables microphone after explicit user approval.
+    Prevents unauthorized audio recording/eavesdropping.
+    #>
+    param([string]$LogPath)
+    
+    if (-not $script:MicrophoneGuardianState) {
+        $script:MicrophoneGuardianState = @{
+            Initialized = $false
+            MicrophoneDevices = @()
+            CurrentlyAllowedProcesses = @{}
+            LastCheck = [DateTime]::MinValue
+            AccessLog = if ($LogPath) { Join-Path $LogPath "microphone_access.log" } else { "$Script:InstallPath\Logs\microphone_access.log" }
+        }
+    }
+    
+    if (-not $script:MicrophoneGuardianState.Initialized) {
+        try {
+            $micDevices = @()
+            
+            try {
+                $audioInputs = Get-PnpDevice -Class "AudioEndpoint" -ErrorAction SilentlyContinue | 
+                    Where-Object { $_.Status -eq "OK" -and ($_.FriendlyName -match "Microphone|Mic|Input|Recording" -or $_.Description -match "Microphone|Mic|Input") }
+                if ($audioInputs) { $micDevices += $audioInputs }
+            } catch {}
+            
+            try {
+                $mediaDevices = Get-PnpDevice -Class "MEDIA" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Status -eq "OK" -and ($_.FriendlyName -match "Microphone|Mic|Audio.*Input|Recording" -and $_.FriendlyName -notmatch "Camera|Webcam") }
+                if ($mediaDevices) { $micDevices += $mediaDevices }
+            } catch {}
+            
+            $script:MicrophoneGuardianState.MicrophoneDevices = $micDevices | Sort-Object InstanceId -Unique
+            
+            if ($script:MicrophoneGuardianState.MicrophoneDevices -and $script:MicrophoneGuardianState.MicrophoneDevices.Count -gt 0) {
+                $deviceList = ($script:MicrophoneGuardianState.MicrophoneDevices | ForEach-Object { $_.FriendlyName }) -join "; "
+                Write-AVLog "[MicrophoneGuardian] Found $($script:MicrophoneGuardianState.MicrophoneDevices.Count) microphone(s): $deviceList" "INFO"
+                
+                foreach ($device in $script:MicrophoneGuardianState.MicrophoneDevices) {
+                    try {
+                        Disable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+                        Write-AVLog "[MicrophoneGuardian] Disabled microphone: $($device.FriendlyName)" "INFO"
+                    } catch {}
+                }
+                Write-Host "[MicrophoneGuardian] Protection initialized - microphone disabled by default" -ForegroundColor Green
+            } else {
+                Write-AVLog "[MicrophoneGuardian] No microphone devices found" "INFO"
+            }
+            $script:MicrophoneGuardianState.Initialized = $true
+        } catch {
+            Write-AVLog "[MicrophoneGuardian] Initialization error: $_" "ERROR"
+        }
+    }
+    
+    if (-not $script:MicrophoneGuardianState.MicrophoneDevices -or $script:MicrophoneGuardianState.MicrophoneDevices.Count -eq 0) { return }
+    
+    try {
+        $audioProcesses = Get-Process | Where-Object {
+            $_.ProcessName -match "chrome|firefox|edge|msedge|teams|zoom|skype|discord|slack|obs|audacity|voicemeeter|recording|audiorelay" -or
+            ($_.MainWindowTitle -ne "" -and $_.MainWindowTitle -match "call|chat|meeting|record|voice|audio")
+        } | Select-Object Id, ProcessName, Path, MainWindowTitle
+        
+        foreach ($proc in $audioProcesses) {
+            if ($script:MicrophoneGuardianState.CurrentlyAllowedProcesses.ContainsKey($proc.Id)) {
+                if (-not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) {
+                    $script:MicrophoneGuardianState.CurrentlyAllowedProcesses.Remove($proc.Id)
+                    if ($script:MicrophoneGuardianState.CurrentlyAllowedProcesses.Count -eq 0) {
+                        foreach ($device in $script:MicrophoneGuardianState.MicrophoneDevices) {
+                            Disable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+                        }
+                        Write-AVLog "[MicrophoneGuardian] All processes closed - microphone disabled" "INFO"
+                    }
+                }
+                continue
+            }
+            
+            $isAccessingMic = $false
+            try {
+                $handles = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue | 
+                    Select-Object -ExpandProperty Modules -ErrorAction SilentlyContinue |
+                    Where-Object { $_.ModuleName -match "audio|mf|wasapi|portaudio|dsound|winmm" }
+                if ($handles) { $isAccessingMic = $true }
+            } catch {}
+            
+            if ($isAccessingMic) {
+                $procName = if ($proc.Path) { Split-Path -Leaf $proc.Path } else { $proc.ProcessName }
+                
+                Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+                $result = [System.Windows.Forms.MessageBox]::Show(
+                    "Application '$procName' is trying to access your MICROPHONE.`n`nPID: $($proc.Id)`n`nAllow microphone access?",
+                    "Microphone Permission Request",
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning,
+                    [System.Windows.Forms.MessageBoxDefaultButton]::Button2
+                )
+                
+                $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+                
+                if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+                    foreach ($device in $script:MicrophoneGuardianState.MicrophoneDevices) {
+                        Enable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+                    }
+                    $script:MicrophoneGuardianState.CurrentlyAllowedProcesses[$proc.Id] = @{ ProcessName = $procName; AllowedAt = Get-Date }
+                    $logEntry = "[$timestamp] [ALLOWED] $procName (PID: $($proc.Id))"
+                    Add-Content -Path $script:MicrophoneGuardianState.AccessLog -Value $logEntry -ErrorAction SilentlyContinue
+                    Write-AVLog "[MicrophoneGuardian] Access ALLOWED: $procName" "INFO"
+                } else {
+                    $logEntry = "[$timestamp] [DENIED] $procName (PID: $($proc.Id))"
+                    Add-Content -Path $script:MicrophoneGuardianState.AccessLog -Value $logEntry -ErrorAction SilentlyContinue
+                    Write-AVLog "[MicrophoneGuardian] Access DENIED: $procName" "WARN"
+                }
+            }
+        }
+        
+        $deadProcesses = @()
+        foreach ($procPid in $script:MicrophoneGuardianState.CurrentlyAllowedProcesses.Keys) {
+            if (-not (Get-Process -Id $procPid -ErrorAction SilentlyContinue)) { $deadProcesses += $procPid }
+        }
+        foreach ($procPid in $deadProcesses) { $script:MicrophoneGuardianState.CurrentlyAllowedProcesses.Remove($procPid) }
+        
+        if ($script:MicrophoneGuardianState.CurrentlyAllowedProcesses.Count -eq 0) {
+            $now = Get-Date
+            if (($now - $script:MicrophoneGuardianState.LastCheck).TotalSeconds -ge 30) {
+                foreach ($device in $script:MicrophoneGuardianState.MicrophoneDevices) {
+                    $status = Get-PnpDevice -InstanceId $device.InstanceId -ErrorAction SilentlyContinue
+                    if ($status -and $status.Status -eq "OK") {
+                        Disable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+                    }
+                }
+                $script:MicrophoneGuardianState.LastCheck = $now
+            }
+        }
+    } catch {
+        Write-AVLog "[MicrophoneGuardian] Monitoring error: $_" "ERROR"
+    }
+}
+
+function Invoke-AudioOutputMonitor {
+    <#
+    .SYNOPSIS
+    Monitors audio output for suspicious patterns that could harm the user.
+    
+    .DESCRIPTION
+    Detects sudden volume changes, audio playing during sleep hours,
+    and monitors for processes that might be playing disturbing audio.
+    #>
+    
+    if (-not $script:AudioOutputMonitorState) {
+        $script:AudioOutputMonitorState = @{
+            Initialized = $false
+            LastVolumeLevel = -1
+            VolumeChangeCount = 0
+            VolumeChangeWindow = [DateTime]::MinValue
+            SuspiciousAudioProcesses = @{}
+            ReportedItems = @{}
+        }
+    }
+    
+    try {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class AudioMonitorHelper {
+    [DllImport("winmm.dll")] public static extern int waveOutGetVolume(IntPtr hwo, out uint dwVolume);
+    [DllImport("winmm.dll")] public static extern int waveOutSetVolume(IntPtr hwo, uint dwVolume);
+}
+"@ -ErrorAction SilentlyContinue
+        
+        $vol = 0
+        [AudioMonitorHelper]::waveOutGetVolume([IntPtr]::Zero, [ref]$vol) | Out-Null
+        $currentVolume = [math]::Round(($vol -band 0xFFFF) / 65535 * 100)
+        
+        if ($script:AudioOutputMonitorState.LastVolumeLevel -ge 0) {
+            $volumeDelta = [Math]::Abs($currentVolume - $script:AudioOutputMonitorState.LastVolumeLevel)
+            
+            if ($volumeDelta -gt 50) {
+                $now = [DateTime]::UtcNow
+                if (($now - $script:AudioOutputMonitorState.VolumeChangeWindow).TotalSeconds -lt 10) {
+                    $script:AudioOutputMonitorState.VolumeChangeCount++
+                } else {
+                    $script:AudioOutputMonitorState.VolumeChangeCount = 1
+                    $script:AudioOutputMonitorState.VolumeChangeWindow = $now
+                }
+                
+                if ($script:AudioOutputMonitorState.VolumeChangeCount -ge 3) {
+                    $key = "AudioVolumeAbuse_$(Get-Date -Format 'yyyyMMddHH')"
+                    if (-not $script:AudioOutputMonitorState.ReportedItems.ContainsKey($key)) {
+                        Write-AVLog "[AudioOutputMonitor] THREAT: Rapid volume manipulation detected - possible audio attack" "THREAT"
+                        $script:AudioOutputMonitorState.ReportedItems[$key] = $true
+                    }
+                    $script:AudioOutputMonitorState.VolumeChangeCount = 0
+                }
+            }
+        }
+        $script:AudioOutputMonitorState.LastVolumeLevel = $currentVolume
+        
+        $hour = (Get-Date).Hour
+        $isSleepHours = ($hour -ge 23 -or $hour -lt 6)
+        
+        if ($isSleepHours) {
+            $audioProcesses = Get-Process | Where-Object {
+                $_.ProcessName -match "wmplayer|vlc|spotify|groove|chrome|firefox|edge" -and
+                $_.MainWindowHandle -ne 0
+            }
+            
+            foreach ($proc in $audioProcesses) {
+                try {
+                    $cpuUsage = ($proc | Get-Process -ErrorAction SilentlyContinue).CPU
+                    if ($cpuUsage -gt 5) {
+                        $key = "SleepAudio_$($proc.ProcessName)_$(Get-Date -Format 'yyyyMMddHH')"
+                        if (-not $script:AudioOutputMonitorState.ReportedItems.ContainsKey($key)) {
+                            Write-AVLog "[AudioOutputMonitor] WARNING: Audio activity during sleep hours - $($proc.ProcessName) (PID: $($proc.Id))" "WARN"
+                            $script:AudioOutputMonitorState.ReportedItems[$key] = $true
+                        }
+                    }
+                } catch {}
+            }
+        }
+        
+        $suspiciousAudioApps = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.ProcessName -match "^[a-z0-9]{8,}$" -and
+            $_.Path -and ($_.Path -match "\\Temp\\|\\AppData\\Local\\Temp\\|\\Downloads\\")
+        }
+        
+        foreach ($proc in $suspiciousAudioApps) {
+            try {
+                $modules = $proc.Modules | Where-Object { $_.ModuleName -match "audio|sound|wave|dsound|xaudio|bass|fmod" }
+                if ($modules) {
+                    $key = "SuspiciousAudioApp_$($proc.Id)"
+                    if (-not $script:AudioOutputMonitorState.ReportedItems.ContainsKey($key)) {
+                        Write-AVLog "[AudioOutputMonitor] THREAT: Suspicious audio-capable process from temp location - $($proc.ProcessName) ($($proc.Path))" "THREAT"
+                        $script:AudioOutputMonitorState.ReportedItems[$key] = $true
+                        
+                        # CONCRETE ACTION: Kill suspicious audio process
+                        try {
+                            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                            Write-AVLog "[AudioOutputMonitor] KILLED suspicious audio process: $($proc.ProcessName) (PID: $($proc.Id))" "INFO"
+                        } catch {}
+                        
+                        # CONCRETE ACTION: Quarantine the executable
+                        if ($proc.Path -and (Test-Path $proc.Path)) {
+                            try {
+                                $quarantinePath = "$Script:InstallPath\Quarantine"
+                                $fileName = Split-Path -Leaf $proc.Path
+                                $destPath = Join-Path $quarantinePath "${fileName}_$(Get-Date -Format 'yyyyMMddHHmmss')"
+                                Move-Item -Path $proc.Path -Destination $destPath -Force -ErrorAction SilentlyContinue
+                                Write-AVLog "[AudioOutputMonitor] QUARANTINED: $($proc.Path) -> $destPath" "INFO"
+                            } catch {}
+                        }
+                    }
+                }
+            } catch {}
+        }
+        
+        # CONCRETE ACTION: If volume spike detected during sleep hours, mute system
+        $hour = (Get-Date).Hour
+        if (($hour -ge 23 -or $hour -lt 6) -and $script:AudioOutputMonitorState.VolumeChangeCount -ge 2) {
+            try {
+                [AudioMonitorHelper]::waveOutSetVolume([IntPtr]::Zero, 0) | Out-Null
+                Write-AVLog "[AudioOutputMonitor] AUTO-MUTED system during sleep hours due to volume manipulation" "INFO"
+            } catch {}
+        }
+        
+    } catch {
+        Write-AVLog "[AudioOutputMonitor] Error: $_" "ERROR"
+    }
+}
+
+function Invoke-WallpaperProtection {
+    <#
+    .SYNOPSIS
+    Protects against unauthorized wallpaper changes (gaslighting/disturbing imagery).
+    
+    .DESCRIPTION
+    Monitors wallpaper registry keys and filesystem for changes.
+    Alerts and optionally reverts unauthorized wallpaper modifications.
+    #>
+    
+    if (-not $script:WallpaperProtectionState) {
+        $script:WallpaperProtectionState = @{
+            Initialized = $false
+            OriginalWallpaper = $null
+            LastKnownWallpaper = $null
+            ReportedChanges = @{}
+            AllowedWallpapers = @()
+        }
+    }
+    
+    try {
+        $currentWallpaper = (Get-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name Wallpaper -ErrorAction SilentlyContinue).Wallpaper
+        
+        if (-not $script:WallpaperProtectionState.Initialized) {
+            $script:WallpaperProtectionState.OriginalWallpaper = $currentWallpaper
+            $script:WallpaperProtectionState.LastKnownWallpaper = $currentWallpaper
+            $script:WallpaperProtectionState.AllowedWallpapers += $currentWallpaper
+            $script:WallpaperProtectionState.Initialized = $true
+            Write-AVLog "[WallpaperProtection] Initialized - tracking wallpaper: $currentWallpaper" "INFO"
+            return
+        }
+        
+        if ($currentWallpaper -ne $script:WallpaperProtectionState.LastKnownWallpaper) {
+            $isAllowed = $script:WallpaperProtectionState.AllowedWallpapers -contains $currentWallpaper
+            
+            if (-not $isAllowed) {
+                $key = "WallpaperChange_$(Get-Date -Format 'yyyyMMddHHmm')"
+                if (-not $script:WallpaperProtectionState.ReportedChanges.ContainsKey($key)) {
+                    Write-AVLog "[WallpaperProtection] ALERT: Wallpaper changed from '$($script:WallpaperProtectionState.LastKnownWallpaper)' to '$currentWallpaper'" "WARN"
+                    $script:WallpaperProtectionState.ReportedChanges[$key] = $true
+                    
+                    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+                    $result = [System.Windows.Forms.MessageBox]::Show(
+                        "Your desktop wallpaper was changed.`n`nNew wallpaper: $currentWallpaper`n`nDid you make this change?`n`nClick 'No' to revert to your original wallpaper.",
+                        "Wallpaper Change Detected",
+                        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                        [System.Windows.Forms.MessageBoxIcon]::Warning
+                    )
+                    
+                    if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+                        $script:WallpaperProtectionState.AllowedWallpapers += $currentWallpaper
+                        $script:WallpaperProtectionState.LastKnownWallpaper = $currentWallpaper
+                        Write-AVLog "[WallpaperProtection] User approved wallpaper change" "INFO"
+                    } else {
+                        try {
+                            Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name Wallpaper -Value $script:WallpaperProtectionState.OriginalWallpaper
+                            rundll32.exe user32.dll, UpdatePerUserSystemParameters 1, True
+                            Write-AVLog "[WallpaperProtection] Reverted wallpaper to original" "INFO"
+                        } catch {
+                            Write-AVLog "[WallpaperProtection] Failed to revert wallpaper: $_" "ERROR"
+                        }
+                    }
+                }
+            } else {
+                $script:WallpaperProtectionState.LastKnownWallpaper = $currentWallpaper
+            }
+        }
+    } catch {
+        Write-AVLog "[WallpaperProtection] Error: $_" "ERROR"
+    }
+}
+
+function Invoke-SystemSoundProtection {
+    <#
+    .SYNOPSIS
+    Monitors system sound scheme for unauthorized changes.
+    
+    .DESCRIPTION
+    Detects modifications to Windows system sounds that could be used
+    to play disturbing audio or cause distress.
+    #>
+    
+    if (-not $script:SystemSoundProtectionState) {
+        $script:SystemSoundProtectionState = @{
+            Initialized = $false
+            OriginalSounds = @{}
+            ReportedChanges = @{}
+        }
+    }
+    
+    try {
+        $soundEvents = @(
+            "SystemStart", "SystemExit", "SystemNotification", "SystemHand", "SystemQuestion",
+            "SystemExclamation", "SystemAsterisk", "WindowsLogon", "WindowsLogoff", "WindowsUAC"
+        )
+        
+        $basePath = "HKCU:\AppEvents\Schemes\Apps\.Default"
+        
+        if (-not $script:SystemSoundProtectionState.Initialized) {
+            foreach ($event in $soundEvents) {
+                try {
+                    $soundPath = Join-Path $basePath "$event\.Current"
+                    if (Test-Path $soundPath) {
+                        $soundFile = (Get-ItemProperty -Path $soundPath -Name "(Default)" -ErrorAction SilentlyContinue)."(Default)"
+                        $script:SystemSoundProtectionState.OriginalSounds[$event] = $soundFile
+                    }
+                } catch {}
+            }
+            $script:SystemSoundProtectionState.Initialized = $true
+            Write-AVLog "[SystemSoundProtection] Initialized - tracking $($script:SystemSoundProtectionState.OriginalSounds.Count) system sounds" "INFO"
+            return
+        }
+        
+        foreach ($event in $soundEvents) {
+            try {
+                $soundPath = Join-Path $basePath "$event\.Current"
+                if (Test-Path $soundPath) {
+                    $currentSound = (Get-ItemProperty -Path $soundPath -Name "(Default)" -ErrorAction SilentlyContinue)."(Default)"
+                    $originalSound = $script:SystemSoundProtectionState.OriginalSounds[$event]
+                    
+                    if ($currentSound -ne $originalSound) {
+                        $key = "SoundChange_${event}_$(Get-Date -Format 'yyyyMMddHH')"
+                        if (-not $script:SystemSoundProtectionState.ReportedChanges.ContainsKey($key)) {
+                            Write-AVLog "[SystemSoundProtection] ALERT: System sound '$event' changed from '$originalSound' to '$currentSound'" "WARN"
+                            $script:SystemSoundProtectionState.ReportedChanges[$key] = $true
+                            
+                            if ($currentSound -and (Test-Path $currentSound)) {
+                                $fileInfo = Get-Item $currentSound -ErrorAction SilentlyContinue
+                                if ($fileInfo.DirectoryName -match "\\Temp\\|\\Downloads\\|\\AppData\\Local\\Temp") {
+                                    Write-AVLog "[SystemSoundProtection] THREAT: System sound changed to file in suspicious location: $currentSound" "THREAT"
+                                    try {
+                                        Set-ItemProperty -Path $soundPath -Name "(Default)" -Value $originalSound
+                                        Write-AVLog "[SystemSoundProtection] Reverted sound '$event' to original" "INFO"
+                                    } catch {}
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch {}
+        }
+    } catch {
+        Write-AVLog "[SystemSoundProtection] Error: $_" "ERROR"
+    }
+}
+
+function Invoke-NotificationAbuseDetection {
+    <#
+    .SYNOPSIS
+    Detects notification/toast spam attacks.
+    
+    .DESCRIPTION
+    Monitors for excessive notifications that could be used for harassment,
+    disturbing content delivery, or psychological manipulation.
+    #>
+    
+    if (-not $script:NotificationAbuseState) {
+        $script:NotificationAbuseState = @{
+            NotificationCounts = @{}
+            LastCleanup = [DateTime]::UtcNow
+            ReportedAbusers = @{}
+            ToastProcesses = @{}
+        }
+    }
+    
+    try {
+        $now = [DateTime]::UtcNow
+        if (($now - $script:NotificationAbuseState.LastCleanup).TotalMinutes -ge 5) {
+            $script:NotificationAbuseState.NotificationCounts.Clear()
+            $script:NotificationAbuseState.LastCleanup = $now
+        }
+        
+        $toastProcesses = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            try {
+                $_.Modules | Where-Object { $_.ModuleName -match "toast|notification|windows\.ui\.notifications" }
+            } catch { $false }
+        }
+        
+        foreach ($proc in $toastProcesses) {
+            $procKey = "$($proc.ProcessName)_$($proc.Id)"
+            
+            if (-not $script:NotificationAbuseState.NotificationCounts.ContainsKey($procKey)) {
+                $script:NotificationAbuseState.NotificationCounts[$procKey] = @{ Count = 0; FirstSeen = $now }
+            }
+            
+            $entry = $script:NotificationAbuseState.NotificationCounts[$procKey]
+            $entry.Count++
+            $elapsed = ($now - $entry.FirstSeen).TotalSeconds
+            
+            if ($elapsed -lt 60 -and $entry.Count -gt 10) {
+                $abuserKey = "$($proc.ProcessName)_$(Get-Date -Format 'yyyyMMddHH')"
+                if (-not $script:NotificationAbuseState.ReportedAbusers.ContainsKey($abuserKey)) {
+                    Write-AVLog "[NotificationAbuseDetection] THREAT: Notification spam detected from $($proc.ProcessName) (PID: $($proc.Id)) - $($entry.Count) notifications in $([int]$elapsed) seconds" "THREAT"
+                    $script:NotificationAbuseState.ReportedAbusers[$abuserKey] = $true
+                    
+                    $protected = @('explorer', 'svchost', 'System', 'wininit', 'csrss', 'services', 'lsass')
+                    if ($protected -notcontains $proc.ProcessName) {
+                        try {
+                            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                            Write-AVLog "[NotificationAbuseDetection] Terminated notification spam process: $($proc.ProcessName)" "INFO"
+                        } catch {}
+                    }
+                }
+                $entry.Count = 0
+                $entry.FirstSeen = $now
+            }
+        }
+        
+        $suspiciousNotifiers = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.Path -and 
+            ($_.Path -match "\\Temp\\|\\Downloads\\|\\AppData\\Local\\Temp") -and
+            $_.ProcessName -match "^[a-z0-9]{6,}$"
+        }
+        
+        foreach ($proc in $suspiciousNotifiers) {
+            try {
+                $hasToastCapability = $proc.Modules | Where-Object { $_.ModuleName -match "toast|notification|shell32|user32" }
+                if ($hasToastCapability) {
+                    $key = "SuspiciousNotifier_$($proc.Id)"
+                    if (-not $script:NotificationAbuseState.ReportedAbusers.ContainsKey($key)) {
+                        Write-AVLog "[NotificationAbuseDetection] WARNING: Suspicious notification-capable process from temp location: $($proc.ProcessName) ($($proc.Path))" "WARN"
+                        $script:NotificationAbuseState.ReportedAbusers[$key] = $true
+                    }
+                }
+            } catch {}
+        }
+    } catch {
+        Write-AVLog "[NotificationAbuseDetection] Error: $_" "ERROR"
+    }
+}
+
+function Invoke-FileIntegrityMonitor {
+    <#
+    .SYNOPSIS
+    Protects personal files from gaslighting attacks.
+    
+    .DESCRIPTION
+    Monitors important personal files for unauthorized modifications that could
+    be used in gaslighting attacks (subtle file changes, timestamp manipulation,
+    content modifications).
+    #>
+    
+    if (-not $script:FileIntegrityMonitorState) {
+        $script:FileIntegrityMonitorState = @{
+            Initialized = $false
+            TrackedFiles = @{}
+            ReportedChanges = @{}
+            BackupPath = "$Script:InstallPath\FileBackups"
+            MonitoredFolders = @(
+                "$env:USERPROFILE\Documents",
+                "$env:USERPROFILE\Pictures",
+                "$env:USERPROFILE\Desktop"
+            )
+        }
+        
+        # Create backup directory
+        if (-not (Test-Path $script:FileIntegrityMonitorState.BackupPath)) {
+            New-Item -ItemType Directory -Path $script:FileIntegrityMonitorState.BackupPath -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+    }
+    
+    try {
+        if (-not $script:FileIntegrityMonitorState.Initialized) {
+            foreach ($folder in $script:FileIntegrityMonitorState.MonitoredFolders) {
+                if (Test-Path $folder) {
+                    $files = Get-ChildItem -Path $folder -File -ErrorAction SilentlyContinue | 
+                        Where-Object { $_.Extension -match "\.(txt|doc|docx|pdf|jpg|jpeg|png|gif|mp3|mp4)$" } |
+                        Select-Object -First 100
+                    
+                    foreach ($file in $files) {
+                        try {
+                            $hash = (Get-FileHash -Path $file.FullName -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
+                            if ($hash) {
+                                # Create initial backup of important files
+                                $backupDir = Join-Path $script:FileIntegrityMonitorState.BackupPath ($file.DirectoryName -replace ':', '_' -replace '\\', '_')
+                                if (-not (Test-Path $backupDir)) {
+                                    New-Item -ItemType Directory -Path $backupDir -Force -ErrorAction SilentlyContinue | Out-Null
+                                }
+                                $backupFile = Join-Path $backupDir $file.Name
+                                Copy-Item -Path $file.FullName -Destination $backupFile -Force -ErrorAction SilentlyContinue
+                                
+                                $script:FileIntegrityMonitorState.TrackedFiles[$file.FullName] = @{
+                                    Hash = $hash
+                                    Size = $file.Length
+                                    LastWriteTime = $file.LastWriteTime
+                                    CreationTime = $file.CreationTime
+                                    BackupPath = $backupFile
+                                }
+                            }
+                        } catch {}
+                    }
+                }
+            }
+            $script:FileIntegrityMonitorState.Initialized = $true
+            Write-AVLog "[FileIntegrityMonitor] Initialized - tracking $($script:FileIntegrityMonitorState.TrackedFiles.Count) personal files" "INFO"
+            return
+        }
+        
+        foreach ($filePath in $script:FileIntegrityMonitorState.TrackedFiles.Keys) {
+            if (Test-Path $filePath) {
+                try {
+                    $file = Get-Item $filePath -ErrorAction SilentlyContinue
+                    $tracked = $script:FileIntegrityMonitorState.TrackedFiles[$filePath]
+                    $changes = @()
+                    
+                    if ($file.LastWriteTime -ne $tracked.LastWriteTime) {
+                        $currentHash = (Get-FileHash -Path $filePath -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
+                        if ($currentHash -ne $tracked.Hash) {
+                            $changes += "Content modified"
+                        } else {
+                            $changes += "Timestamp manipulated (content unchanged)"
+                        }
+                    }
+                    
+                    if ($file.Length -ne $tracked.Size -and $changes.Count -eq 0) {
+                        $changes += "Size changed"
+                    }
+                    
+                    if ($file.CreationTime -ne $tracked.CreationTime) {
+                        $changes += "Creation time altered"
+                    }
+                    
+                    if ($changes.Count -gt 0) {
+                        $key = "FileChange_$($filePath.GetHashCode())_$(Get-Date -Format 'yyyyMMddHH')"
+                        if (-not $script:FileIntegrityMonitorState.ReportedChanges.ContainsKey($key)) {
+                            $changeDesc = $changes -join ", "
+                            Write-AVLog "[FileIntegrityMonitor] ALERT: Personal file modified - $filePath ($changeDesc)" "WARN"
+                            $script:FileIntegrityMonitorState.ReportedChanges[$key] = $true
+                            
+                            $isGaslighting = $changes -contains "Timestamp manipulated (content unchanged)" -or $changes -contains "Creation time altered"
+                            
+                            if ($isGaslighting) {
+                                Write-AVLog "[FileIntegrityMonitor] THREAT: Possible gaslighting attack - timestamp manipulation on $filePath" "THREAT"
+                                
+                                # CONCRETE ACTION: Restore original timestamps for gaslighting attempts
+                                try {
+                                    $file.LastWriteTime = $tracked.LastWriteTime
+                                    $file.CreationTime = $tracked.CreationTime
+                                    Write-AVLog "[FileIntegrityMonitor] RESTORED original timestamps for $filePath" "INFO"
+                                } catch {}
+                            }
+                            
+                            # CONCRETE ACTION: Offer to restore from backup for content changes
+                            if ($changes -contains "Content modified" -and $tracked.BackupPath -and (Test-Path $tracked.BackupPath)) {
+                                Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+                                $result = [System.Windows.Forms.MessageBox]::Show(
+                                    "Your file was modified without your knowledge:`n`n$filePath`n`nChanges: $changeDesc`n`nDo you want to RESTORE the original file from backup?`n`n(Original backed up at: $($tracked.BackupPath))",
+                                    "File Integrity Alert - Possible Gaslighting",
+                                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                                    [System.Windows.Forms.MessageBoxIcon]::Warning
+                                )
+                                
+                                if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+                                    try {
+                                        Copy-Item -Path $tracked.BackupPath -Destination $filePath -Force -ErrorAction Stop
+                                        Write-AVLog "[FileIntegrityMonitor] RESTORED file from backup: $filePath" "INFO"
+                                    } catch {
+                                        Write-AVLog "[FileIntegrityMonitor] Failed to restore file: $_" "ERROR"
+                                    }
+                                } else {
+                                    # User accepted the change - update tracking
+                                    $newHash = (Get-FileHash -Path $filePath -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
+                                    $tracked.Hash = $newHash
+                                    $tracked.Size = $file.Length
+                                    $tracked.LastWriteTime = $file.LastWriteTime
+                                    Copy-Item -Path $filePath -Destination $tracked.BackupPath -Force -ErrorAction SilentlyContinue
+                                    Write-AVLog "[FileIntegrityMonitor] User accepted change - updated tracking for $filePath" "INFO"
+                                }
+                            }
+                        }
+                    }
+                } catch {}
+            }
+        }
+    } catch {
+        Write-AVLog "[FileIntegrityMonitor] Error: $_" "ERROR"
+    }
+}
+
+function Invoke-ScreenRecordingProtection {
+    <#
+    .SYNOPSIS
+    Detects unauthorized screen recording/capture.
+    
+    .DESCRIPTION
+    Monitors for processes that may be capturing screen content without
+    user knowledge, which could be used for surveillance/harassment.
+    #>
+    
+    if (-not $script:ScreenRecordingProtectionState) {
+        $script:ScreenRecordingProtectionState = @{
+            AllowedRecorders = @("obs64", "obs32", "ShareX", "Snagit", "SnippingTool", "ScreenClippingHost", "GameBar", "msteams", "zoom", "discord")
+            DetectedRecorders = @{}
+            ReportedItems = @{}
+        }
+    }
+    
+    try {
+        $screenCaptureProcesses = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            try {
+                $_.Modules | Where-Object { 
+                    $_.ModuleName -match "d3d|dxgi|gdi32|user32|dwmapi|magnification|bitblt" -and
+                    $_.ModuleName -match "capture|record|screenshot|screen"
+                }
+            } catch { $false }
+        }
+        
+        $suspiciousCapture = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.ProcessName -notmatch "($($script:ScreenRecordingProtectionState.AllowedRecorders -join '|'))" -and
+            $_.Path -and ($_.Path -match "\\Temp\\|\\Downloads\\|\\AppData\\Local\\Temp")
+        }
+        
+        foreach ($proc in $suspiciousCapture) {
+            try {
+                $hasCapture = $proc.Modules | Where-Object { $_.ModuleName -match "gdi32|dwmapi|d3d11|dxgi" }
+                $highCPU = ($proc.CPU -gt 10)
+                
+                if ($hasCapture -and $highCPU) {
+                    $key = "ScreenCapture_$($proc.Id)"
+                    if (-not $script:ScreenRecordingProtectionState.ReportedItems.ContainsKey($key)) {
+                        Write-AVLog "[ScreenRecordingProtection] THREAT: Unauthorized screen capture detected - $($proc.ProcessName) (PID: $($proc.Id)) from $($proc.Path)" "THREAT"
+                        $script:ScreenRecordingProtectionState.ReportedItems[$key] = $true
+                        
+                        # CONCRETE ACTION: Kill the unauthorized screen capture process
+                        try {
+                            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                            Write-AVLog "[ScreenRecordingProtection] KILLED screen capture process: $($proc.ProcessName) (PID: $($proc.Id))" "INFO"
+                        } catch {}
+                        
+                        # CONCRETE ACTION: Quarantine the executable
+                        if ($proc.Path -and (Test-Path $proc.Path)) {
+                            try {
+                                $quarantinePath = "$Script:InstallPath\Quarantine"
+                                $fileName = Split-Path -Leaf $proc.Path
+                                $destPath = Join-Path $quarantinePath "${fileName}_$(Get-Date -Format 'yyyyMMddHHmmss')"
+                                Move-Item -Path $proc.Path -Destination $destPath -Force -ErrorAction SilentlyContinue
+                                Write-AVLog "[ScreenRecordingProtection] QUARANTINED: $($proc.Path) -> $destPath" "INFO"
+                            } catch {}
+                        }
+                    }
+                }
+            } catch {}
+        }
+        
+        try {
+            if (-not ([System.Management.Automation.PSTypeName]'ScreenCapWin32').Type) {
+                Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class ScreenCapWin32 {
+    [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+    public const int CAPTUREBLT = 0x40000000;
+}
+"@ -ErrorAction SilentlyContinue
+            }
+        } catch {}
+        
+    } catch {
+        Write-AVLog "[ScreenRecordingProtection] Error: $_" "ERROR"
+    }
+}
+
+function Invoke-SleepDisruptionProtection {
+    <#
+    .SYNOPSIS
+    Protects against attacks during sleep hours.
+    
+    .DESCRIPTION
+    Monitors for suspicious activity during configurable quiet hours
+    that could be designed to disrupt sleep (sounds, screen activation, etc.)
+    #>
+    
+    if (-not $script:SleepDisruptionProtectionState) {
+        $script:SleepDisruptionProtectionState = @{
+            QuietHoursStart = 23
+            QuietHoursEnd = 6
+            ReportedItems = @{}
+            LastAuditTime = [DateTime]::MinValue
+        }
+    }
+    
+    try {
+        $hour = (Get-Date).Hour
+        $isQuietHours = ($hour -ge $script:SleepDisruptionProtectionState.QuietHoursStart -or $hour -lt $script:SleepDisruptionProtectionState.QuietHoursEnd)
+        
+        if (-not $isQuietHours) { return }
+        
+        $now = Get-Date
+        if (($now - $script:SleepDisruptionProtectionState.LastAuditTime).TotalMinutes -lt 1) { return }
+        $script:SleepDisruptionProtectionState.LastAuditTime = $now
+        
+        $mediaPlayers = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.ProcessName -match "wmplayer|vlc|spotify|groove|itunes|musicbee|foobar|aimp|winamp" -and
+            $_.MainWindowHandle -ne 0
+        }
+        
+        foreach ($player in $mediaPlayers) {
+            try {
+                if ($player.CPU -gt 2) {
+                    $key = "SleepAudio_$($player.ProcessName)_$(Get-Date -Format 'yyyyMMddHH')"
+                    if (-not $script:SleepDisruptionProtectionState.ReportedItems.ContainsKey($key)) {
+                        Write-AVLog "[SleepDisruptionProtection] THREAT: Media player active during quiet hours - $($player.ProcessName) (PID: $($player.Id))" "THREAT"
+                        $script:SleepDisruptionProtectionState.ReportedItems[$key] = $true
+                        
+                        # CONCRETE ACTION: Mute system audio during quiet hours
+                        try {
+                            Add-Type -TypeDefinition @"
+using System; using System.Runtime.InteropServices;
+public class SleepAudioMuter { [DllImport("winmm.dll")] public static extern int waveOutSetVolume(IntPtr hwo, uint dwVolume); }
+"@ -ErrorAction SilentlyContinue
+                            [SleepAudioMuter]::waveOutSetVolume([IntPtr]::Zero, 0) | Out-Null
+                            Write-AVLog "[SleepDisruptionProtection] AUTO-MUTED system audio during quiet hours" "INFO"
+                        } catch {}
+                    }
+                }
+            } catch {}
+        }
+        
+        $suspiciousNightProcesses = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.StartTime -and
+            ($_.StartTime.Hour -ge $script:SleepDisruptionProtectionState.QuietHoursStart -or
+            $_.StartTime.Hour -lt $script:SleepDisruptionProtectionState.QuietHoursEnd)
+        } | Where-Object {
+            $_.Path -and ($_.Path -match "\\Temp\\|\\Downloads\\")
+        }
+        
+        foreach ($proc in $suspiciousNightProcesses) {
+            $key = "NightProcess_$($proc.Id)"
+            if (-not $script:SleepDisruptionProtectionState.ReportedItems.ContainsKey($key)) {
+                Write-AVLog "[SleepDisruptionProtection] THREAT: Suspicious process started during quiet hours - $($proc.ProcessName) from $($proc.Path)" "THREAT"
+                $script:SleepDisruptionProtectionState.ReportedItems[$key] = $true
+                
+                # CONCRETE ACTION: Kill suspicious processes that start during quiet hours from temp locations
+                try {
+                    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                    Write-AVLog "[SleepDisruptionProtection] KILLED suspicious night process: $($proc.ProcessName) (PID: $($proc.Id))" "INFO"
+                } catch {}
+                
+                # CONCRETE ACTION: Quarantine the executable
+                if ($proc.Path -and (Test-Path $proc.Path)) {
+                    try {
+                        $quarantinePath = "$Script:InstallPath\Quarantine"
+                        $fileName = Split-Path -Leaf $proc.Path
+                        $destPath = Join-Path $quarantinePath "${fileName}_$(Get-Date -Format 'yyyyMMddHHmmss')"
+                        Move-Item -Path $proc.Path -Destination $destPath -Force -ErrorAction SilentlyContinue
+                        Write-AVLog "[SleepDisruptionProtection] QUARANTINED: $($proc.Path) -> $destPath" "INFO"
+                    } catch {}
+                }
+            }
+        }
+        
+        try {
+            $scheduledTasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.State -eq "Ready" }
+            foreach ($task in $scheduledTasks) {
+                $triggers = $task.Triggers | Where-Object {
+                    $_.StartBoundary -and
+                    ([DateTime]::Parse($_.StartBoundary)).Hour -ge $script:SleepDisruptionProtectionState.QuietHoursStart -or
+                    ([DateTime]::Parse($_.StartBoundary)).Hour -lt $script:SleepDisruptionProtectionState.QuietHoursEnd
+                }
+                
+                if ($triggers -and $task.TaskPath -notmatch "\\Microsoft\\") {
+                    $key = "NightTask_$($task.TaskName)"
+                    if (-not $script:SleepDisruptionProtectionState.ReportedItems.ContainsKey($key)) {
+                        Write-AVLog "[SleepDisruptionProtection] INFO: Scheduled task runs during quiet hours - $($task.TaskName)" "INFO"
+                        $script:SleepDisruptionProtectionState.ReportedItems[$key] = $true
+                    }
+                }
+            }
+        } catch {}
+        
+    } catch {
+        Write-AVLog "[SleepDisruptionProtection] Error: $_" "ERROR"
+    }
+}
+
+function Invoke-SubliminalContentDetector {
+    <#
+    .SYNOPSIS
+    Enhanced detection for subliminal/rapid content designed to harm users.
+    
+    .DESCRIPTION
+    Detects rapid image flashing, hidden overlays with disturbing content,
+    and other subliminal manipulation techniques beyond what NeuroBehaviorMonitor covers.
+    #>
+    
+    if (-not $script:SubliminalContentDetectorState) {
+        $script:SubliminalContentDetectorState = @{
+            WindowHistory = @{}
+            RapidWindowChanges = 0
+            LastCheck = [DateTime]::MinValue
+            ReportedItems = @{}
+            HiddenWindowCount = 0
+        }
+    }
+    
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+        
+        if (-not ([System.Management.Automation.PSTypeName]'SubliminalWin32').Type) {
+            Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public class SubliminalWin32 {
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+    [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    public const int GWL_EXSTYLE = -20;
+    public const int WS_EX_LAYERED = 0x80000;
+    public const int WS_EX_TRANSPARENT = 0x20;
+    public const int WS_EX_TOOLWINDOW = 0x80;
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+}
+"@ -ErrorAction SilentlyContinue
+        }
+        
+        $now = [DateTime]::UtcNow
+        $script:VisibleWindows = @{}
+        $script:HiddenOverlays = @()
+        $script:TinyWindows = @()
+        
+        $enumCallback = {
+            param([IntPtr]$hWnd, [IntPtr]$lParam)
+            
+            try {
+                $pid = 0
+                [SubliminalWin32]::GetWindowThreadProcessId($hWnd, [ref]$pid) | Out-Null
+                
+                $rect = New-Object SubliminalWin32+RECT
+                [SubliminalWin32]::GetWindowRect($hWnd, [ref]$rect) | Out-Null
+                $width = $rect.Right - $rect.Left
+                $height = $rect.Bottom - $rect.Top
+                
+                $exStyle = [SubliminalWin32]::GetWindowLong($hWnd, [SubliminalWin32]::GWL_EXSTYLE)
+                $isLayered = ($exStyle -band [SubliminalWin32]::WS_EX_LAYERED) -ne 0
+                $isTransparent = ($exStyle -band [SubliminalWin32]::WS_EX_TRANSPARENT) -ne 0
+                $isVisible = [SubliminalWin32]::IsWindowVisible($hWnd)
+                
+                if ($isVisible -and $width -gt 0 -and $height -gt 0) {
+                    $script:VisibleWindows[$hWnd.ToString()] = @{
+                        PID = $pid
+                        Width = $width
+                        Height = $height
+                        IsLayered = $isLayered
+                        IsTransparent = $isTransparent
+                    }
+                    
+                    if (($isLayered -or $isTransparent) -and $width -ge 100 -and $height -ge 100) {
+                        $script:HiddenOverlays += @{ Handle = $hWnd; PID = $pid; Size = "${width}x${height}" }
+                    }
+                    
+                    if ($width -lt 10 -and $height -lt 10 -and $width -gt 0 -and $height -gt 0) {
+                        $script:TinyWindows += @{ Handle = $hWnd; PID = $pid; Size = "${width}x${height}" }
+                    }
+                }
+            } catch {}
+            
+            return $true
+        }
+        
+        [SubliminalWin32]::EnumWindows($enumCallback, [IntPtr]::Zero) | Out-Null
+        
+        $windowDelta = [Math]::Abs($script:VisibleWindows.Count - $script:SubliminalContentDetectorState.WindowHistory.Count)
+        if ($windowDelta -gt 5) {
+            $script:SubliminalContentDetectorState.RapidWindowChanges++
+        } else {
+            $script:SubliminalContentDetectorState.RapidWindowChanges = [Math]::Max(0, $script:SubliminalContentDetectorState.RapidWindowChanges - 1)
+        }
+        
+        if ($script:SubliminalContentDetectorState.RapidWindowChanges -ge 10) {
+            $key = "RapidWindows_$(Get-Date -Format 'yyyyMMddHHmm')"
+            if (-not $script:SubliminalContentDetectorState.ReportedItems.ContainsKey($key)) {
+                Write-AVLog "[SubliminalContentDetector] THREAT: Rapid window creation/destruction detected - possible subliminal attack" "THREAT"
+                $script:SubliminalContentDetectorState.ReportedItems[$key] = $true
+            }
+            $script:SubliminalContentDetectorState.RapidWindowChanges = 0
+        }
+        
+        foreach ($overlay in $script:HiddenOverlays) {
+            try {
+                $proc = Get-Process -Id $overlay.PID -ErrorAction SilentlyContinue
+                if ($proc -and $proc.Path -match "\\Temp\\|\\Downloads\\|\\AppData\\Local\\Temp") {
+                    $key = "HiddenOverlay_$($overlay.PID)"
+                    if (-not $script:SubliminalContentDetectorState.ReportedItems.ContainsKey($key)) {
+                        Write-AVLog "[SubliminalContentDetector] THREAT: Hidden overlay window from suspicious process - $($proc.ProcessName) ($($overlay.Size))" "THREAT"
+                        $script:SubliminalContentDetectorState.ReportedItems[$key] = $true
+                        
+                        # CONCRETE ACTION: Kill process creating hidden overlays
+                        try {
+                            Stop-Process -Id $overlay.PID -Force -ErrorAction SilentlyContinue
+                            Write-AVLog "[SubliminalContentDetector] KILLED hidden overlay process: $($proc.ProcessName) (PID: $($overlay.PID))" "INFO"
+                        } catch {}
+                        
+                        # CONCRETE ACTION: Quarantine the executable
+                        if ($proc.Path -and (Test-Path $proc.Path)) {
+                            try {
+                                $quarantinePath = "$Script:InstallPath\Quarantine"
+                                $fileName = Split-Path -Leaf $proc.Path
+                                $destPath = Join-Path $quarantinePath "${fileName}_$(Get-Date -Format 'yyyyMMddHHmmss')"
+                                Move-Item -Path $proc.Path -Destination $destPath -Force -ErrorAction SilentlyContinue
+                                Write-AVLog "[SubliminalContentDetector] QUARANTINED: $($proc.Path) -> $destPath" "INFO"
+                            } catch {}
+                        }
+                    }
+                }
+            } catch {}
+        }
+        
+        if ($script:TinyWindows.Count -gt 20) {
+            $key = "TinyWindows_$(Get-Date -Format 'yyyyMMddHHmm')"
+            if (-not $script:SubliminalContentDetectorState.ReportedItems.ContainsKey($key)) {
+                Write-AVLog "[SubliminalContentDetector] WARNING: Excessive tiny windows detected ($($script:TinyWindows.Count)) - possible pixel-level attack" "WARN"
+                $script:SubliminalContentDetectorState.ReportedItems[$key] = $true
+            }
+        }
+        
+        $script:SubliminalContentDetectorState.WindowHistory = $script:VisibleWindows.Clone()
+        $script:SubliminalContentDetectorState.LastCheck = $now
+        
+    } catch {
+        Write-AVLog "[SubliminalContentDetector] Error: $_" "ERROR"
+    }
+}
+
+function Invoke-InputInjectionProtection {
+    <#
+    .SYNOPSIS
+    Detects fake keyboard/mouse input injection.
+    
+    .DESCRIPTION
+    Monitors for programmatic input injection that could be used for
+    ghost typing, cursor manipulation, or other harassment techniques.
+    #>
+    
+    if (-not $script:InputInjectionProtectionState) {
+        $script:InputInjectionProtectionState = @{
+            ReportedItems = @{}
+            LastMousePos = $null
+            MouseJitterCount = 0
+            LastCheck = [DateTime]::MinValue
+        }
+    }
+    
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+        
+        $inputInjectors = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            try {
+                $_.Modules | Where-Object { 
+                    $_.ModuleName -match "hook|inject|input|key|mouse|autohotkey|autoit|pyautogui" 
+                }
+            } catch { $false }
+        }
+        
+        foreach ($proc in $inputInjectors) {
+            if ($proc.ProcessName -match "autohotkey|autoit|python|powershell") {
+                if ($proc.Path -match "\\Temp\\|\\Downloads\\|\\AppData\\Local\\Temp") {
+                    $key = "InputInjector_$($proc.Id)"
+                    if (-not $script:InputInjectionProtectionState.ReportedItems.ContainsKey($key)) {
+                        Write-AVLog "[InputInjectionProtection] THREAT: Input automation tool from suspicious location - $($proc.ProcessName) ($($proc.Path))" "THREAT"
+                        $script:InputInjectionProtectionState.ReportedItems[$key] = $true
+                        
+                        # CONCRETE ACTION: Kill suspicious input injection process
+                        try {
+                            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                            Write-AVLog "[InputInjectionProtection] KILLED input injector: $($proc.ProcessName) (PID: $($proc.Id))" "INFO"
+                        } catch {}
+                        
+                        # CONCRETE ACTION: Quarantine the executable/script
+                        if ($proc.Path -and (Test-Path $proc.Path)) {
+                            try {
+                                $quarantinePath = "$Script:InstallPath\Quarantine"
+                                $fileName = Split-Path -Leaf $proc.Path
+                                $destPath = Join-Path $quarantinePath "${fileName}_$(Get-Date -Format 'yyyyMMddHHmmss')"
+                                Move-Item -Path $proc.Path -Destination $destPath -Force -ErrorAction SilentlyContinue
+                                Write-AVLog "[InputInjectionProtection] QUARANTINED: $($proc.Path) -> $destPath" "INFO"
+                            } catch {}
+                        }
+                    }
+                }
+            }
+        }
+        
+        $currentPos = [System.Windows.Forms.Cursor]::Position
+        if ($script:InputInjectionProtectionState.LastMousePos) {
+            $dx = [Math]::Abs($currentPos.X - $script:InputInjectionProtectionState.LastMousePos.X)
+            $dy = [Math]::Abs($currentPos.Y - $script:InputInjectionProtectionState.LastMousePos.Y)
+            
+            if ($dx -eq 1 -or $dy -eq 1 -or ($dx -eq $dy -and $dx -gt 0)) {
+                $script:InputInjectionProtectionState.MouseJitterCount++
+            } else {
+                $script:InputInjectionProtectionState.MouseJitterCount = 0
+            }
+            
+            if ($script:InputInjectionProtectionState.MouseJitterCount -ge 20) {
+                $key = "SyntheticMouse_$(Get-Date -Format 'yyyyMMddHHmm')"
+                if (-not $script:InputInjectionProtectionState.ReportedItems.ContainsKey($key)) {
+                    Write-AVLog "[InputInjectionProtection] THREAT: Synthetic mouse movement pattern detected - possible input injection" "THREAT"
+                    $script:InputInjectionProtectionState.ReportedItems[$key] = $true
+                }
+                $script:InputInjectionProtectionState.MouseJitterCount = 0
+            }
+        }
+        $script:InputInjectionProtectionState.LastMousePos = $currentPos
+        
+        $hookProcesses = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            try {
+                $cmdLine = (Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)" -ErrorAction SilentlyContinue).CommandLine
+                $cmdLine -match "SetWindowsHookEx|keyboard.*hook|mouse.*hook|global.*hook"
+            } catch { $false }
+        }
+        
+        foreach ($proc in $hookProcesses) {
+            $key = "GlobalHook_$($proc.Id)"
+            if (-not $script:InputInjectionProtectionState.ReportedItems.ContainsKey($key)) {
+                Write-AVLog "[InputInjectionProtection] WARNING: Process using global input hooks - $($proc.ProcessName) (PID: $($proc.Id))" "WARN"
+                $script:InputInjectionProtectionState.ReportedItems[$key] = $true
+            }
+        }
+        
+    } catch {
+        Write-AVLog "[InputInjectionProtection] Error: $_" "ERROR"
+    }
+}
+
+# ============================================================================
+# END OF USER-TARGETED ATTACK PROTECTION MODULES
+# ============================================================================
+
 function Invoke-KeyScramblerManagement {
     param(
         [bool]$AutoStart = $true
@@ -7724,8 +9038,49 @@ function Invoke-BeaconDetection {
                 Write-AVLog "BEACON DETECTED: $($detection.Type) - $($detection.ProcessName) (PID: $($detection.ProcessId)) - $($detection.RemoteAddress -or $detection.RemoteHost)" "THREAT" "beacon_detections.log"
                 $Global:AntivirusState.ThreatCount++
                 
+                # CONCRETE ACTION 1: Kill the beaconing process
                 if ($detection.ProcessId -and $Config.AutoKillThreats) {
                     Stop-ThreatProcess -ProcessId $detection.ProcessId -ProcessName $detection.ProcessName
+                }
+                
+                # CONCRETE ACTION 2: Block the C2 IP with firewall rule
+                if ($detection.RemoteAddress -and $Config.AutoKillThreats) {
+                    try {
+                        $ip = $detection.RemoteAddress
+                        # Don't block private IPs
+                        if ($ip -notmatch '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.)') {
+                            $ruleName = "Beacon_Block_$($ip -replace '\.', '_')"
+                            $existingRule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+                            if (-not $existingRule) {
+                                New-NetFirewallRule -DisplayName $ruleName `
+                                    -Direction Outbound `
+                                    -Action Block `
+                                    -RemoteAddress $ip `
+                                    -Protocol TCP `
+                                    -Profile Any `
+                                    -Description "BeaconDetection: Blocked C2 server $ip (detected from $($detection.ProcessName))" `
+                                    -ErrorAction SilentlyContinue | Out-Null
+                                Write-AVLog "[BeaconDetection] FIREWALL RULE: Blocked C2 IP $ip" "INFO" "beacon_detections.log"
+                            }
+                        }
+                    } catch {}
+                }
+                
+                # CONCRETE ACTION 3: Quarantine the beaconing executable
+                if ($detection.ProcessId -and $Config.AutoKillThreats) {
+                    try {
+                        $proc = Get-Process -Id $detection.ProcessId -ErrorAction SilentlyContinue
+                        if ($proc -and $proc.Path) {
+                            # Only quarantine if not from system directories
+                            if ($proc.Path -notlike "$env:SystemRoot\*" -and $proc.Path -notlike "$env:ProgramFiles\*") {
+                                $quarantinePath = "$Script:InstallPath\Quarantine"
+                                $fileName = Split-Path -Leaf $proc.Path
+                                $destPath = Join-Path $quarantinePath "${fileName}_beacon_$(Get-Date -Format 'yyyyMMddHHmmss')"
+                                Move-Item -Path $proc.Path -Destination $destPath -Force -ErrorAction SilentlyContinue
+                                Write-AVLog "[BeaconDetection] QUARANTINED: $($proc.Path)" "INFO" "beacon_detections.log"
+                            }
+                        }
+                    } catch {}
                 }
             }
             
@@ -11187,47 +12542,464 @@ function Invoke-ProcessAuditing {
 }
 
 # --- GFocus ---
-$Script:GFocus_AllowedDomains = @()
-$Script:GFocus_AllowedIPs = @()
-$Script:GFocus_BlockedConnections = @{}
-$Script:GFocus_CurrentBrowserConnections = @{}
-$Script:GFocus_SeenConnections = @{}
+# User-Intent Based Browser Firewall
+# Concept: Allow user-initiated navigation + 30s of dependencies, block background "phone home" traffic
+
+$Script:GFocus_State = @{
+    Initialized = $false
+    NavigationWindowOpen = $false
+    NavigationWindowStart = [DateTime]::MinValue
+    NavigationWindowDuration = 30  # seconds to allow dependencies after navigation
+    
+    # IPs allowed during current navigation window
+    SessionAllowedIPs = @{}
+    
+    # Permanent allowlist (survives sessions) - populated from successful navigations
+    PermanentAllowedIPs = @{}
+    
+    # Blocked IPs with firewall rules created
+    BlockedIPs = @{}
+    
+    # Track last browser window titles to detect navigation
+    LastBrowserTitles = @{}
+    
+    # Connection tracking
+    SeenConnections = @{}
+    
+    # Stats
+    TotalBlocked = 0
+    TotalAllowed = 0
+}
 
 $Script:GFocus_BrowserProcesses = @(
     'chrome', 'firefox', 'msedge', 'iexplore', 'opera', 'brave', 'vivaldi', 'waterfox', 'palemoon',
     'seamonkey', 'librewolf', 'tor', 'dragon', 'iridium', 'chromium', 'maxthon', 'slimjet',
     'floorp', 'whale', 'yandex', 'avastbrowser', 'avgbrowser'
 )
-$Script:GFocus_NeverBlockIPs = @('8.8.8.8', '8.8.4.4', '1.1.1.1', '1.0.0.1')
+
+# Never block these (DNS, Microsoft, CDNs, etc.)
+$Script:GFocus_NeverBlockIPs = @(
+    '8.8.8.8', '8.8.4.4', '1.1.1.1', '1.0.0.1',  # DNS
+    '9.9.9.9', '149.112.112.112',                  # Quad9
+    '208.67.222.222', '208.67.220.220'             # OpenDNS
+)
+
+# Common CDN/infrastructure IP ranges (first octet check for speed)
+$Script:GFocus_TrustedFirstOctets = @(
+    '13', '20', '23', '40', '52', '54', '104',     # Microsoft/Azure, Amazon
+    '142', '172', '192', '199', '216'               # Google, Cloudflare, etc.
+)
+
+function Test-GFocusNavigationEvent {
+    # Detect if user just navigated (browser title changed significantly)
+    $navigationDetected = $false
+    
+    try {
+        $browsers = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.ProcessName.ToLower() -in $Script:GFocus_BrowserProcesses -and
+            $_.MainWindowHandle -ne 0
+        }
+        
+        foreach ($browser in $browsers) {
+            $currentTitle = $browser.MainWindowTitle
+            $procKey = "$($browser.ProcessName)_$($browser.Id)"
+            
+            if ($Script:GFocus_State.LastBrowserTitles.ContainsKey($procKey)) {
+                $lastTitle = $Script:GFocus_State.LastBrowserTitles[$procKey]
+                
+                # Title changed significantly = likely navigation
+                if ($currentTitle -ne $lastTitle -and $currentTitle.Length -gt 5) {
+                    # Exclude minor changes (loading indicators, etc.)
+                    $similarity = 0
+                    $minLen = [Math]::Min($currentTitle.Length, $lastTitle.Length)
+                    for ($i = 0; $i -lt $minLen; $i++) {
+                        if ($currentTitle[$i] -eq $lastTitle[$i]) { $similarity++ }
+                    }
+                    $similarityRatio = if ($minLen -gt 0) { $similarity / $minLen } else { 0 }
+                    
+                    # If less than 70% similar, consider it a navigation
+                    if ($similarityRatio -lt 0.7) {
+                        $navigationDetected = $true
+                        Write-AVLog "[GFocus] Navigation detected: '$lastTitle' -> '$currentTitle'" "INFO" "gfocus.log"
+                    }
+                }
+            }
+            
+            $Script:GFocus_State.LastBrowserTitles[$procKey] = $currentTitle
+        }
+    } catch {}
+    
+    return $navigationDetected
+}
 
 function Invoke-GFocus {
     try {
-        $conns = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
-            Where-Object { $_.RemoteAddress -ne '0.0.0.0' -and $_.RemoteAddress -ne '::' }
-        foreach ($conn in $conns) {
-            $key = "$($conn.RemoteAddress):$($conn.RemotePort):$($conn.OwningProcess)"
-            if ($Script:GFocus_SeenConnections.ContainsKey($key)) { continue }
-            $Script:GFocus_SeenConnections[$key] = $true
-            try {
-                $proc = Get-Process -Id $conn.OwningProcess -ErrorAction Stop
-                $procName = ($proc.ProcessName -replace '\.exe$','').Trim().ToLower()
-            } catch { continue }
-            if ($procName -notin $Script:GFocus_BrowserProcesses) { continue }
-            # Allow browser navigation connections
-            if ($conn.RemotePort -eq 443 -or $conn.RemotePort -eq 80) {
-                if ($Script:GFocus_AllowedIPs -notcontains $conn.RemoteAddress) {
-                    $Script:GFocus_AllowedIPs += $conn.RemoteAddress
+        $now = Get-Date
+        
+        # Initialize on first run
+        if (-not $Script:GFocus_State.Initialized) {
+            Write-AVLog "[GFocus] Initializing user-intent browser firewall" "INFO" "gfocus.log"
+            $Script:GFocus_State.Initialized = $true
+            # Start with navigation window open to learn initial connections
+            $Script:GFocus_State.NavigationWindowOpen = $true
+            $Script:GFocus_State.NavigationWindowStart = $now
+            return 0
+        }
+        
+        # Check for navigation events (user typed in address bar)
+        if (Test-GFocusNavigationEvent) {
+            # Open navigation window - allow connections for next 30 seconds
+            $Script:GFocus_State.NavigationWindowOpen = $true
+            $Script:GFocus_State.NavigationWindowStart = $now
+            Write-AVLog "[GFocus] Navigation window OPENED - allowing dependencies for $($Script:GFocus_State.NavigationWindowDuration)s" "INFO" "gfocus.log"
+        }
+        
+        # Check if navigation window should close
+        if ($Script:GFocus_State.NavigationWindowOpen) {
+            $elapsed = ($now - $Script:GFocus_State.NavigationWindowStart).TotalSeconds
+            if ($elapsed -gt $Script:GFocus_State.NavigationWindowDuration) {
+                $Script:GFocus_State.NavigationWindowOpen = $false
+                # Move session allowed IPs to permanent list
+                foreach ($ip in $Script:GFocus_State.SessionAllowedIPs.Keys) {
+                    if (-not $Script:GFocus_State.PermanentAllowedIPs.ContainsKey($ip)) {
+                        $Script:GFocus_State.PermanentAllowedIPs[$ip] = $now
+                    }
                 }
-                $Script:GFocus_CurrentBrowserConnections[$conn.RemoteAddress] = Get-Date
+                $Script:GFocus_State.SessionAllowedIPs.Clear()
+                Write-AVLog "[GFocus] Navigation window CLOSED - blocking unauthorized connections" "INFO" "gfocus.log"
             }
         }
-        # Cleanup old browser connections
-        $now = Get-Date
-        $toRemove = @($Script:GFocus_CurrentBrowserConnections.Keys | Where-Object { ($now - $Script:GFocus_CurrentBrowserConnections[$_]).TotalSeconds -gt 60 })
-        foreach ($ip in $toRemove) { $Script:GFocus_CurrentBrowserConnections.Remove($ip) }
-        return $Script:GFocus_BlockedConnections.Count
+        
+        # Get all browser connections
+        $browserConns = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
+            Where-Object { 
+                $_.RemoteAddress -ne '0.0.0.0' -and 
+                $_.RemoteAddress -ne '::' -and
+                $_.RemoteAddress -ne '127.0.0.1' -and
+                $_.RemoteAddress -notmatch '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)'  # Exclude local network
+            }
+        
+        foreach ($conn in $browserConns) {
+            # Check if this is a browser process
+            try {
+                $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
+                if (-not $proc) { continue }
+                $procName = $proc.ProcessName.ToLower()
+                if ($procName -notin $Script:GFocus_BrowserProcesses) { continue }
+            } catch { continue }
+            
+            $ip = $conn.RemoteAddress
+            $connKey = "$ip`:$($conn.RemotePort):$($conn.OwningProcess)"
+            
+            # Skip if already processed
+            if ($Script:GFocus_State.SeenConnections.ContainsKey($connKey)) { continue }
+            $Script:GFocus_State.SeenConnections[$connKey] = $now
+            
+            # Check if IP should never be blocked
+            if ($ip -in $Script:GFocus_NeverBlockIPs) { continue }
+            
+            # Check trusted first octets (CDNs, major providers)
+            $firstOctet = ($ip -split '\.')[0]
+            if ($firstOctet -in $Script:GFocus_TrustedFirstOctets) { continue }
+            
+            # Check if already in permanent allowlist
+            if ($Script:GFocus_State.PermanentAllowedIPs.ContainsKey($ip)) {
+                $Script:GFocus_State.TotalAllowed++
+                continue
+            }
+            
+            # Check if already blocked
+            if ($Script:GFocus_State.BlockedIPs.ContainsKey($ip)) { continue }
+            
+            # NAVIGATION WINDOW OPEN = ALLOW & LEARN
+            if ($Script:GFocus_State.NavigationWindowOpen) {
+                $Script:GFocus_State.SessionAllowedIPs[$ip] = $now
+                $Script:GFocus_State.TotalAllowed++
+                Write-AVLog "[GFocus] ALLOWED (navigation window): $ip from $procName" "INFO" "gfocus.log"
+            }
+            # NAVIGATION WINDOW CLOSED = BLOCK (phone home attempt)
+            else {
+                Write-AVLog "[GFocus] BLOCKED (no navigation): $ip from $procName - possible phone-home" "THREAT" "gfocus.log"
+                $Script:GFocus_State.BlockedIPs[$ip] = @{
+                    BlockedAt = $now
+                    Process = $procName
+                    Port = $conn.RemotePort
+                }
+                $Script:GFocus_State.TotalBlocked++
+                
+                # CONCRETE ACTION: Create firewall rule to block this IP
+                try {
+                    $ruleName = "GFocus_Block_$($ip -replace '\.', '_')"
+                    $existingRule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+                    if (-not $existingRule) {
+                        New-NetFirewallRule -DisplayName $ruleName `
+                            -Direction Outbound `
+                            -Action Block `
+                            -RemoteAddress $ip `
+                            -Protocol TCP `
+                            -Profile Any `
+                            -Description "GFocus: Blocked browser phone-home to $ip from $procName at $now" `
+                            -ErrorAction SilentlyContinue | Out-Null
+                        Write-AVLog "[GFocus] FIREWALL RULE CREATED: Blocking $ip" "INFO" "gfocus.log"
+                    }
+                } catch {
+                    Write-AVLog "[GFocus] Failed to create firewall rule for $ip`: $_" "WARN" "gfocus.log"
+                }
+            }
+        }
+        
+        # Cleanup old seen connections (keep memory bounded)
+        if ($Script:GFocus_State.SeenConnections.Count -gt 10000) {
+            $cutoff = $now.AddMinutes(-10)
+            $toRemove = @($Script:GFocus_State.SeenConnections.Keys | Where-Object { 
+                $Script:GFocus_State.SeenConnections[$_] -lt $cutoff 
+            })
+            foreach ($key in $toRemove) { $Script:GFocus_State.SeenConnections.Remove($key) }
+        }
+        
+        return $Script:GFocus_State.TotalBlocked
+        
     } catch {
-        Write-AVLog "GFocus error: $_" "ERROR"
+        Write-AVLog "[GFocus] Error: $_" "ERROR" "gfocus.log"
+        return 0
+    }
+}
+
+# --- AppPhoneHomeBlocker ---
+# Blocks outbound connections from high-risk apps that should never phone home
+# PowerShell, cmd, wscript, mshta, etc. are commonly abused for C2 communication
+
+$Script:AppPhoneHome_State = @{
+    Initialized = $false
+    BlockedConnections = @{}
+    AllowedConnections = @{}
+    SeenConnections = @{}
+    TotalBlocked = 0
+    WhitelistedDestinations = @{}
+}
+
+# Processes that should NEVER make outbound connections (or very rarely with explicit approval)
+$Script:AppPhoneHome_HighRiskProcesses = @(
+    'powershell', 'pwsh', 'powershell_ise',           # PowerShell variants
+    'cmd', 'conhost',                                   # Command prompt
+    'wscript', 'cscript',                               # Windows Script Host
+    'mshta',                                            # HTML Application Host
+    'rundll32', 'regsvr32',                             # DLL loaders (LOLBins)
+    'msbuild', 'installutil',                           # .NET tools (LOLBins)
+    'regasm', 'regsvcs',                                # .NET registration (LOLBins)
+    'cmstp', 'certutil',                                # Certificate/profile tools (LOLBins)
+    'bitsadmin',                                        # BITS (often abused for downloads)
+    'wmic',                                             # WMI command line
+    'msiexec',                                          # Installer (can download)
+    'forfiles', 'pcalua',                               # Execution proxies
+    'bash', 'wsl',                                      # WSL (can be abused)
+    'python', 'pythonw', 'python3',                     # Python (if from suspicious location)
+    'ruby', 'perl', 'php',                              # Scripting languages
+    'java', 'javaw',                                    # Java (if not explicitly allowed)
+    'node', 'npm',                                      # Node.js
+    'curl', 'wget',                                     # Download utilities
+    'ftp', 'tftp',                                      # File transfer
+    'netsh', 'netcat', 'nc', 'ncat',                   # Network tools
+    'ssh', 'scp', 'sftp',                              # SSH tools (if unexpected)
+    'telnet',                                           # Telnet
+    'nslookup', 'dig',                                  # DNS tools (can be used for exfil)
+    'finger', 'whois'                                   # Information gathering
+)
+
+# Medium-risk processes - monitor but don't auto-block (alert only)
+$Script:AppPhoneHome_MediumRiskProcesses = @(
+    'notepad', 'wordpad',                               # Text editors (shouldn't connect)
+    'calc', 'mspaint',                                  # Basic apps (shouldn't connect)
+    'explorer',                                         # Explorer (limited connections expected)
+    'taskmgr', 'perfmon', 'resmon'                     # System tools
+)
+
+# Trusted destinations that high-risk apps CAN connect to
+$Script:AppPhoneHome_TrustedDestinations = @(
+    # Microsoft update/telemetry (necessary evil for some)
+    '*.microsoft.com', '*.windows.com', '*.windowsupdate.com',
+    # Package managers
+    '*.powershellgallery.com', '*.nuget.org', '*.npmjs.org', '*.pypi.org',
+    # Local network
+    '127.0.0.1', '::1', 'localhost'
+)
+
+# Trusted destination IPs (populated dynamically from DNS resolution of trusted domains)
+$Script:AppPhoneHome_TrustedIPs = @(
+    '127.0.0.1', '::1'
+)
+
+function Test-AppPhoneHomeTrustedDestination {
+    param([string]$IP)
+    
+    # Check explicit trusted IPs
+    if ($IP -in $Script:AppPhoneHome_TrustedIPs) { return $true }
+    
+    # Check local network
+    if ($IP -match '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.|::1|fe80:)') { return $true }
+    
+    # Check if user has whitelisted this destination
+    if ($Script:AppPhoneHome_State.WhitelistedDestinations.ContainsKey($IP)) { return $true }
+    
+    return $false
+}
+
+function Invoke-AppPhoneHomeBlocker {
+    try {
+        $now = Get-Date
+        
+        if (-not $Script:AppPhoneHome_State.Initialized) {
+            Write-AVLog "[AppPhoneHomeBlocker] Initializing - blocking outbound from high-risk apps" "INFO" "app_phonehome.log"
+            $Script:AppPhoneHome_State.Initialized = $true
+        }
+        
+        # Get all established outbound connections
+        $connections = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
+            Where-Object { 
+                $_.RemoteAddress -ne '0.0.0.0' -and 
+                $_.RemoteAddress -ne '::' -and
+                $_.RemoteAddress -ne '127.0.0.1' -and
+                $_.RemoteAddress -ne '::1' -and
+                $_.Direction -ne 'Inbound'
+            }
+        
+        foreach ($conn in $connections) {
+            try {
+                $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
+                if (-not $proc) { continue }
+                
+                $procName = $proc.ProcessName.ToLower()
+                $procPath = $proc.Path
+                $ip = $conn.RemoteAddress
+                $port = $conn.RemotePort
+                $connKey = "$ip`:$port`:$($conn.OwningProcess)"
+                
+                # Skip if already processed
+                if ($Script:AppPhoneHome_State.SeenConnections.ContainsKey($connKey)) { continue }
+                $Script:AppPhoneHome_State.SeenConnections[$connKey] = $now
+                
+                # Check if this is a high-risk process
+                $isHighRisk = $procName -in $Script:AppPhoneHome_HighRiskProcesses
+                $isMediumRisk = $procName -in $Script:AppPhoneHome_MediumRiskProcesses
+                
+                if (-not $isHighRisk -and -not $isMediumRisk) { continue }
+                
+                # Check if destination is trusted
+                if (Test-AppPhoneHomeTrustedDestination -IP $ip) { continue }
+                
+                # Additional check: is the process running from a suspicious location?
+                $isSuspiciousPath = $procPath -and ($procPath -match '\\Temp\\|\\Downloads\\|\\AppData\\Local\\Temp\\|\\Users\\Public\\')
+                
+                # HIGH RISK PROCESS = BLOCK IMMEDIATELY
+                if ($isHighRisk) {
+                    $blockKey = "$procName`:$ip"
+                    
+                    if (-not $Script:AppPhoneHome_State.BlockedConnections.ContainsKey($blockKey)) {
+                        Write-AVLog "[AppPhoneHomeBlocker] BLOCKED: $procName (PID: $($proc.Id)) -> $ip`:$port" "THREAT" "app_phonehome.log"
+                        
+                        $Script:AppPhoneHome_State.BlockedConnections[$blockKey] = @{
+                            Process = $procName
+                            Path = $procPath
+                            IP = $ip
+                            Port = $port
+                            BlockedAt = $now
+                            PID = $proc.Id
+                        }
+                        $Script:AppPhoneHome_State.TotalBlocked++
+                        
+                        # CONCRETE ACTION 1: Create firewall rule to block this IP for this app
+                        try {
+                            $ruleName = "AppBlock_$($procName)_$($ip -replace '\.', '_')"
+                            $existingRule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+                            if (-not $existingRule) {
+                                New-NetFirewallRule -DisplayName $ruleName `
+                                    -Direction Outbound `
+                                    -Action Block `
+                                    -RemoteAddress $ip `
+                                    -Program $procPath `
+                                    -Protocol TCP `
+                                    -Profile Any `
+                                    -Description "AppPhoneHomeBlocker: Blocked $procName from connecting to $ip at $now" `
+                                    -ErrorAction SilentlyContinue | Out-Null
+                                Write-AVLog "[AppPhoneHomeBlocker] FIREWALL RULE: Blocked $procName -> $ip" "INFO" "app_phonehome.log"
+                            }
+                        } catch {}
+                        
+                        # CONCRETE ACTION 2: Kill the connection by terminating the process if from suspicious path
+                        if ($isSuspiciousPath) {
+                            try {
+                                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                                Write-AVLog "[AppPhoneHomeBlocker] KILLED: $procName (PID: $($proc.Id)) from suspicious path" "INFO" "app_phonehome.log"
+                            } catch {}
+                        }
+                        
+                        # CONCRETE ACTION 3: Also create a generic block rule for this IP (any app)
+                        try {
+                            $genericRuleName = "AppPhoneHome_Block_$($ip -replace '\.', '_')"
+                            $existingGeneric = Get-NetFirewallRule -DisplayName $genericRuleName -ErrorAction SilentlyContinue
+                            if (-not $existingGeneric) {
+                                New-NetFirewallRule -DisplayName $genericRuleName `
+                                    -Direction Outbound `
+                                    -Action Block `
+                                    -RemoteAddress $ip `
+                                    -Protocol TCP `
+                                    -Profile Any `
+                                    -Description "AppPhoneHomeBlocker: Suspicious destination contacted by $procName" `
+                                    -ErrorAction SilentlyContinue | Out-Null
+                            }
+                        } catch {}
+                    }
+                }
+                # MEDIUM RISK PROCESS = ALERT ONLY (but block if from suspicious path)
+                elseif ($isMediumRisk) {
+                    $alertKey = "$procName`:$ip"
+                    
+                    if (-not $Script:AppPhoneHome_State.AllowedConnections.ContainsKey($alertKey)) {
+                        if ($isSuspiciousPath) {
+                            # Block if from suspicious path
+                            Write-AVLog "[AppPhoneHomeBlocker] BLOCKED (suspicious path): $procName -> $ip`:$port" "THREAT" "app_phonehome.log"
+                            
+                            try {
+                                $ruleName = "AppBlock_$($procName)_$($ip -replace '\.', '_')"
+                                New-NetFirewallRule -DisplayName $ruleName `
+                                    -Direction Outbound `
+                                    -Action Block `
+                                    -RemoteAddress $ip `
+                                    -Protocol TCP `
+                                    -Profile Any `
+                                    -ErrorAction SilentlyContinue | Out-Null
+                            } catch {}
+                            
+                            try {
+                                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                            } catch {}
+                            
+                            $Script:AppPhoneHome_State.TotalBlocked++
+                        } else {
+                            # Alert only
+                            Write-AVLog "[AppPhoneHomeBlocker] WARNING: $procName -> $ip`:$port (unexpected connection)" "WARN" "app_phonehome.log"
+                        }
+                        
+                        $Script:AppPhoneHome_State.AllowedConnections[$alertKey] = $now
+                    }
+                }
+                
+            } catch { continue }
+        }
+        
+        # Cleanup old seen connections (memory management)
+        if ($Script:AppPhoneHome_State.SeenConnections.Count -gt 5000) {
+            $cutoff = $now.AddMinutes(-5)
+            $toRemove = @($Script:AppPhoneHome_State.SeenConnections.Keys | Where-Object { 
+                $Script:AppPhoneHome_State.SeenConnections[$_] -lt $cutoff 
+            })
+            foreach ($key in $toRemove) { $Script:AppPhoneHome_State.SeenConnections.Remove($key) }
+        }
+        
+        return $Script:AppPhoneHome_State.TotalBlocked
+        
+    } catch {
+        Write-AVLog "[AppPhoneHomeBlocker] Error: $_" "ERROR" "app_phonehome.log"
         return 0
     }
 }
@@ -11422,6 +13194,16 @@ try {
         "DNSExfiltrationDetection",
         "PasswordManagement",
         "WebcamGuardian",
+        "MicrophoneGuardian",
+        "AudioOutputMonitor",
+        "WallpaperProtection",
+        "SystemSoundProtection",
+        "NotificationAbuseDetection",
+        "FileIntegrityMonitor",
+        "ScreenRecordingProtection",
+        "SleepDisruptionProtection",
+        "SubliminalContentDetector",
+        "InputInjectionProtection",
         "BeaconDetection",
         "CodeInjectionDetection",
         "DataExfiltrationDetection",
@@ -11454,6 +13236,7 @@ try {
         "GRulesC2Block",
         "ProcessAuditing",
         "GFocus",
+        "AppPhoneHomeBlocker",
         "MitreMapping",
         "RealTimeFileMonitor",
         "DriverWatcher",
