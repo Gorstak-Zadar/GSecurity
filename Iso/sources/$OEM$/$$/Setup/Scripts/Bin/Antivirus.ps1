@@ -47,8 +47,8 @@ $AllowedSIDs = @('S-1-2-0', 'S-1-5-20')
 
 $RiskyPaths = @('\temp\', '\downloads\', '\appdata\local\temp\', '\public\', '\windows\temp\', '\appdata\roaming\', '\desktop\')
 
-# Monitor ALL extensions - no limitations
-$MonitoredExtensions = @('.*')  # Wildcard - all extensions
+# Monitor only specific extensions
+$MonitoredExtensions = @('.com', '.exe', '.exif', '.dll', '.winmd')
 
 # Executable extensions for special handling
 $ExecutableExtensions = @(
@@ -549,7 +549,7 @@ function Invoke-ThreatAnalysis {
     if (Test-ShouldExclude -FilePath $FilePath) { return }
     
     $extension = [IO.Path]::GetExtension($FilePath).ToLower()
-    # No extension filtering - analyze ALL files
+    if ($MonitoredExtensions -notcontains $extension) { return }
     
     $fileHash = Get-FileHashSafe -FilePath $FilePath
     if (-not $fileHash) { return }
@@ -2018,10 +2018,10 @@ function Invoke-DriverWatcher {
     }
 }
 
-Write-Log "Performing full system scan - all drives, all folders, all files"
+Write-Log "Performing full system scan - all drives, all folders, monitored extensions only"
 
-# Suspicious extensions
-$suspiciousExtensions = @('.exe', '.dll', '.winmd', '.scr', '.bat', '.vbs', '.js', '.ps1', '.cmd', '.com', '.pif', '.msi', '.msp', '.hta', '.cpl', '.jar', '.wsf', '.wsh', '.reg', '.inf', '.lnk')
+# Suspicious extensions (subset for double-extension detection)
+$suspiciousExtensions = @('.com', '.exe', '.exif', '.dll', '.winmd')
 
 # Function to detect multiple/suspicious extensions (e.g., file.pdf.exe, file.dll.exe.dll)
 function Test-SuspiciousExtension {
@@ -2058,8 +2058,9 @@ foreach ($drive in $allDrives) {
     Write-Log "Scanning drive: $drive"
     
     try {
-        # Scan ALL files on the drive
-        Get-ChildItem -Path "$drive\" -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+        # Scan only files with monitored extensions
+        Get-ChildItem -Path "$drive\" -Recurse -File -ErrorAction SilentlyContinue | 
+            Where-Object { $MonitoredExtensions -contains $_.Extension.ToLower() } | ForEach-Object {
             $file = $_
             $fileName = $file.Name
             $filePath = $file.FullName
@@ -2124,8 +2125,11 @@ if ($Config.EnableRealtimeMonitor) {
             
             Register-ObjectEvent $watcher Created -Action {
                 $filePath = $Event.SourceEventArgs.FullPath
-                Start-Sleep -Milliseconds 800
-                Invoke-ThreatAnalysis -FilePath $filePath
+                $ext = [IO.Path]::GetExtension($filePath).ToLower()
+                if ($using:MonitoredExtensions -contains $ext) {
+                    Start-Sleep -Milliseconds 800
+                    Invoke-ThreatAnalysis -FilePath $filePath
+                }
             } | Out-Null
             
             $watcher.EnableRaisingEvents = $true
