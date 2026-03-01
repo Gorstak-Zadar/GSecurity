@@ -94,6 +94,21 @@ $Script:ManagedJobConfig = @{
     DriverWatcherIntervalSeconds = 60
     CrudePayloadGuardIntervalSeconds = 60
     AppPhoneHomeBlockerIntervalSeconds = 5
+    
+    # New enhancement modules
+    PUADetectionIntervalSeconds = 180
+    PhantomProcessKillerIntervalSeconds = 30
+    KeyloggerHookDetectionIntervalSeconds = 60
+    AkinatorHeuristicScanIntervalSeconds = 120
+    SFCDisinfectionScanIntervalSeconds = 300
+    ThreatResponseEngineIntervalSeconds = 10
+    PUPDetectionIntervalSeconds = 180
+    PUMDetectionIntervalSeconds = 180
+    WMIPhoneHomeDetectionIntervalSeconds = 30
+    SecurityReportIntervalSeconds = 3600
+    DatabaseIntegrityCheckIntervalSeconds = 300
+    CacheMaintenanceIntervalSeconds = 600
+    ParallelScanIntervalSeconds = 300
 }
 
 $Config = @{
@@ -127,6 +142,40 @@ $Config = @{
     MaxDatabaseEntries = 50000
     DatabaseCleanupDays = 30
     CymruDetectionThreshold = 60
+    
+    # Enhanced cache settings
+    MaxCacheSize = 10000
+    CacheEvictionPercent = 25
+    
+    # Parallel scan settings
+    MaxParallelThreads = 8
+    ParallelBatchSize = 100
+    
+    # API rate limiting
+    APIRateLimitMs = 100
+    APIMaxRetries = 3
+    
+    # Report settings
+    ReportRetentionDays = 30
+    
+    # PUA/PUP Auto-response
+    AutoKillPUA = $false
+    AutoKillCryptoMiners = $true
+    
+    # CPU Throttling
+    CPUThrottleThreshold = 85
+    CPUThrottleDelayMs = 2000
+    EnableCPUThrottling = $true
+    
+    # Akinator Heuristic Settings
+    AkinatorEnabled = $true
+    AkinatorMaliciousThreshold = 15
+    AkinatorQuarantineThreshold = 25
+    
+    # Threat Response Levels
+    ThreatResponseEnabled = $true
+    SuspendOnMediumThreat = $true
+    KillOnHighThreat = $true
 }
 
 # Check if running as admin
@@ -145,12 +194,288 @@ $Global:AntivirusState = @{
     ProcessesTerminated = 0
 }
 
+# Whitelist Threat Intelligence API endpoints in firewall
+$Script:ThreatIntelAPIs = @(
+    @{ Name = "MalwareBazaar"; Host = "mb-api.abuse.ch" },
+    @{ Name = "CIRCL_HashLookup"; Host = "hashlookup.circl.lu" },
+    @{ Name = "Cymru_MHR"; Host = "hash.cymru.com" }
+)
+
+foreach ($api in $Script:ThreatIntelAPIs) {
+    $ruleName = "GSecurity_Allow_$($api.Name)"
+    $existing = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+    if (-not $existing) {
+        try {
+            # Resolve hostname to IPs
+            $ips = [System.Net.Dns]::GetHostAddresses($api.Host) | ForEach-Object { $_.IPAddressToString }
+            if ($ips) {
+                New-NetFirewallRule -DisplayName $ruleName -Direction Outbound -Protocol TCP -RemoteAddress $ips -RemotePort 443,80 -Action Allow -Enabled True -ErrorAction SilentlyContinue | Out-Null
+                Write-Host "[+] Firewall: Whitelisted $($api.Name) ($($ips -join ', '))" -ForegroundColor Green
+            }
+        } catch {
+            Write-Host "[!] Firewall: Could not whitelist $($api.Name): $_" -ForegroundColor Yellow
+        }
+    }
+}
+
 $Script:LoopCounter = 0
 $script:ManagedJobs = @{}
 $Script:SelfPID = $PID
+$Script:SelfPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
+$Script:SelfDirectory = Split-Path $Script:SelfPath -Parent
 
 # Hash caching system - prevents redundant API calls for known files
 $Script:KnownFilesCache = @{}
+$Script:CacheHits = 0
+$Script:CacheMisses = 0
+$Script:LastAPICall = [DateTime]::MinValue
+
+# HMAC key for database integrity
+$Script:HMACKey = $null
+
+# Whitelist database
+$Script:Whitelist = @{
+    Processes = @{}
+    Files = @{}
+    Certificates = @{}
+    LastUpdated = $null
+}
+
+# PUA/PUP Detection reported items (deduplication)
+$Script:ReportedPUAItems = @{}
+
+# ============================================
+# PUA DETECTION LISTS
+# ============================================
+$Script:RemoteAccessTools = @(
+    "ammyy", "ammyadmin", "anydesk", "atera", "connectwise", "dameware",
+    "logmein", "netop", "radmin", "remcos", "rustdesk", "screenconnect",
+    "showmypc", "splashtop", "supremo", "teamviewer", "tightvnc",
+    "ultravnc", "vnc", "vncserver", "realvnc"
+)
+
+$Script:RogueSecurity = @(
+    "antivirus360", "antivirus2009", "antivirus2010", "antispyware",
+    "defensewall", "errorsafe", "fakealert", "pcdefender", "personalantivirus",
+    "privacycenter", "registrybooster", "registryfix", "registrymechanic",
+    "securityshield", "securitysuite", "spyhunter", "spywarestop",
+    "systemdefender", "virusremover", "winantivirus", "winfixer",
+    "winspyware", "xpantivirus"
+)
+
+$Script:SystemOptimizers = @(
+    "advancedsystemcare", "auslogics", "ccleaner", "cleaner", "driverbooster",
+    "drivereasy", "driverfixer", "drivermax", "driverreviver", "driverupdate",
+    "glaryutilities", "iobit", "pcboost", "pccleaner", "pcfaster", "pckeeper",
+    "pcmechanic", "pcoptimizer", "pcspeedup", "pctotal", "reginout", "regclean",
+    "registrycleaner", "registryreviver", "slimcleaner", "slimware",
+    "speedupmypc", "systweak", "tuneup", "uniblue", "wisecare", "wisecleaner",
+    "wiseregistry"
+)
+
+$Script:CryptoMiners = @(
+    "bfgminer", "ccminer", "cgminer", "claymore", "cpuminer", "cryptonight",
+    "ethminer", "gminer", "lolminer", "minerd", "minergate", "nanominer",
+    "nbminer", "nicehash", "phoenixminer", "sgminer", "t-rex", "xmr-stak",
+    "xmrig", "z-enemy"
+)
+
+$Script:P2PClients = @(
+    "ares", "bittorrent", "deluge", "emule", "frostwire", "imesh",
+    "kazaa", "limewire", "qbittorrent", "transmission", "utorrent", "vuze"
+)
+
+$Script:WMIProcesses = @(
+    "wmiprvse", "wmiprvse.exe", "wmic", "wmic.exe", "scrcons", "scrcons.exe",
+    "wmiadap", "wmiadap.exe", "wmiapsrv", "wmiapsrv.exe", "unsecapp",
+    "unsecapp.exe", "mofcomp", "mofcomp.exe", "winmgmt", "winmgmt.exe"
+)
+
+$Script:SuspiciousPorts = @(4444, 5555, 6666, 1337, 31337, 8080, 8443, 9001, 9090, 1234, 4321)
+
+# ============================================
+# COMPREHENSIVE MONITORED EXTENSIONS (200+)
+# ============================================
+$Script:MonitoredExtensions = @(
+    # Executables
+    ".exe", ".dll", ".sys", ".drv", ".ocx", ".cpl", ".scr", ".msi", ".msp", ".mst",
+    ".com", ".pif", ".gadget", ".application", ".appx", ".msix", ".appxbundle", ".msixbundle",
+    # Scripts
+    ".ps1", ".psm1", ".psd1", ".ps1xml", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse",
+    ".wsf", ".wsh", ".ws", ".wsc", ".hta", ".htm", ".html", ".xhtml", ".chm",
+    # Office Macros
+    ".docm", ".dotm", ".xlsm", ".xltm", ".xlam", ".pptm", ".potm", ".ppam", ".ppsm",
+    ".sldm", ".accde", ".accdr", ".accda", ".mdb", ".mde", ".mdz", ".accdu",
+    # Archive (can contain malware)
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".cab", ".iso", ".img",
+    ".dmg", ".vhd", ".vhdx", ".arj", ".lzh", ".ace", ".uue",
+    # Shortcuts and Links
+    ".lnk", ".url", ".desktop", ".pnf",
+    # Certificates and Keys
+    ".cer", ".crt", ".der", ".p7b", ".p7c", ".p7m", ".p7s", ".pfx", ".p12", ".pem",
+    # Registry
+    ".reg", ".inf",
+    # Java
+    ".jar", ".jnlp", ".class",
+    # Python
+    ".py", ".pyc", ".pyo", ".pyw", ".pyz", ".pyzw",
+    # Ruby, Perl, PHP
+    ".rb", ".rbw", ".pl", ".pm", ".php", ".php3", ".php4", ".php5", ".phtml",
+    # Shell
+    ".sh", ".bash", ".zsh", ".fish", ".csh", ".ksh",
+    # Compiled/Binary
+    ".o", ".obj", ".so", ".a", ".lib", ".dylib",
+    # Windows Specific
+    ".winmd", ".xbap", ".xaml", ".rdp", ".theme", ".themepack", ".diagcab",
+    ".settingcontent-ms", ".search-ms", ".searchconnector-ms", ".library-ms",
+    # Macro Documents
+    ".docx", ".xlsx", ".pptx",
+    # Firmware/Driver
+    ".efi", ".rom", ".bin", ".fw",
+    # Database
+    ".sql", ".sqlite", ".db",
+    # Config (often targeted)
+    ".config", ".xml", ".json", ".yaml", ".yml", ".toml", ".ini",
+    # Certificate/Crypto
+    ".csr", ".key", ".jks", ".keystore",
+    # Font (can exploit)
+    ".ttf", ".otf", ".fon", ".fnt",
+    # Other
+    ".action", ".workflow", ".command", ".osx", ".ipa", ".apk", ".xap", ".xpi"
+)
+
+# ============================================
+# AKINATOR HEURISTIC SCORING FACTORS
+# ============================================
+$Script:AkinatorScores = @{
+    # Path-based scores
+    TempPath = 3
+    AppDataPath = 2
+    DownloadsPath = 2
+    ProgramDataHidden = 2
+    UserRoamingPath = 2
+    RecycleBinPath = 4
+    
+    # File property scores
+    ZoneIdentifier = 4
+    UnsignedExecutable = 3
+    HighEntropy = 3
+    RecentlyCreated = 1
+    MultipleExtensions = 4
+    HiddenFile = 2
+    VerySmallFile = 2
+    VeryLargeFile = 1
+    
+    # Parent process scores
+    BrowserSpawned = 3
+    OfficeSpawned = 4
+    PowerShellSpawned = 2
+    CmdSpawned = 2
+    WMISpawned = 3
+    
+    # Command line scores
+    EncodedCommand = 4
+    InvokeExpression = 3
+    DownloadString = 4
+    URLInCommand = 2
+    Base64Pattern = 3
+    HiddenWindow = 3
+    BypassPolicy = 4
+    
+    # Living Off The Land scores
+    LOLBinCertutil = 3
+    LOLBinBitsadmin = 3
+    LOLBinMshta = 4
+    LOLBinRegsvr32 = 3
+    LOLBinRundll32 = 2
+    LOLBinWmic = 3
+}
+
+# Threat response tracking
+$Script:ThreatResponseQueue = @{}
+$Script:ProcessSuspensionList = @{}
+
+# ============================================
+# COMPREHENSIVE SAFE PROCESS WHITELISTS
+# ============================================
+$Script:CriticalSystemProcesses = @(
+    "system", "idle", "registry", "memcompression", "csrss", "smss", 
+    "wininit", "services", "lsass", "svchost", "winlogon", "dwm", 
+    "taskmgr", "spoolsv", "conhost", "fontdrvhost", "dllhost", 
+    "runtimebroker", "sihost", "startmenuexperiencehost", 
+    "shellexperiencehost", "textinputhost", "taskhostw", "searchindexer",
+    "searchprotocolhost", "searchfilterhost", "wudfhost", "dashost", "mscorsvw"
+)
+
+$Script:MicrosoftStoreProcesses = @(
+    "windowsstore", "wsappx", "wwahost", "applicationframehost",
+    "runtimebroker", "microsoftedge", "microsoftedgecp", "msedge",
+    "winstore.app", "microsoft.windowsstore", "winstore.mobile.exe",
+    "microsoft.paint", "paintstudio.view", "mspaint", "microsoft.screensketch",
+    "clipchamp", "microsoft.photos", "microsoft.windowscalculator",
+    "microsoft.windowscamera"
+)
+
+$Script:GamingPlatformProcesses = @(
+    "steam", "steamservice", "steamwebhelper", "gameoverlayui", "steamerrorreporter",
+    "streaming_client", "steamclient", "steamcmd",
+    "epicgameslauncher", "epicwebhelper", "epiconlineservices", "easyanticheat",
+    "easyanticheat_eos", "battleye", "eac_launcher",
+    "galaxyclient", "galaxyclientservice", "gogalaxy",
+    "origin", "originwebhelperservice", "originclientservice", "eadesktop",
+    "eabackgroundservice", "eaapp", "link2ea",
+    "ubisoftgamelauncher", "upc", "ubisoftgamelauncher", "ubiorbitapi_r2_loader",
+    "uplayservice", "uplaywebcore",
+    "battle.net", "blizzard", "agent", "blizzardbrowser",
+    "gamebar", "gamebarftwizard", "gamebarpresencewriter", "xboxapp",
+    "gamingservices", "gamingservicesnet", "xboxgamingoverlay", "xboxpcapp",
+    "riotclientservices", "riotclientux", "valorant", "leagueclient",
+    "discord", "discordptb", "discordcanary", "discordoverlay",
+    "nvcontainer", "nvidia web helper", "nvstreamservice", "geforcenow", "gfexperience",
+    "vanguard", "faceit", "punkbuster", "nprotect", "xigncode", "gameguard"
+)
+
+$Script:HardwareDriverProcesses = @(
+    "nvdisplay.container", "nvcontainer", "nvstreamservice", "nvstreamsvc",
+    "nvwmi64", "nvspcaps64", "nvtray", "nvcplui", "nvbackend",
+    "amdow", "amddvr", "amdrsserv", "ccc", "mom", "atiesrxx", "atieclxx",
+    "igfxtray", "hkcmd", "persistence", "igfxem", "igfxhk", "igfxpers",
+    "rthdvcpl", "rtkngui64", "rthdbpl", "realtekservice", "nahimicsvc",
+    "lghub", "lghub_agent", "icue", "corsair", "lightingservice",
+    "rzchromasdk", "rzsynapse", "logibolt", "logioptions"
+)
+
+$Script:MicrosoftOfficeProcesses = @(
+    "winword", "excel", "powerpnt", "outlook", "msaccess", "mspub",
+    "onenote", "visio", "project", "teams", "lync", "skype",
+    "officeclick2run", "officeclicktorun", "officec2rclient",
+    "onedrive", "onedrivesync", "filecoauth"
+)
+
+$Script:AdobeProcesses = @(
+    "creative cloud", "adobegcclient", "ccxprocess", "cclibrary",
+    "adobenotificationclient", "adobeipcbroker", "adobegcctray",
+    "adobeupdateservice", "adobearmservice", "adobe desktop service",
+    "photoshop", "illustrator", "premiere pro", "afterfx",
+    "acrobat", "acrord32", "indesign", "audition", "animate",
+    "adobegenuineservice"
+)
+
+$Script:ProductivityProcesses = @(
+    "chrome", "firefox", "brave", "opera", "vivaldi", "edge",
+    "slack", "zoom", "zoomopener", "whatsapp", "telegram", "signal",
+    "dropbox", "googledrivesync", "googledrivefs", "box", "icloudservices",
+    "notion", "evernote", "obsidian", "notepad++",
+    "code", "devenv", "rider", "pycharm", "webstorm", "intellij",
+    "git", "sourcetree", "gitkraken", "7z", "7zfm", "winrar", "winzip",
+    "vlc", "spotify", "foobar2000", "musicbee", "aimp"
+)
+
+$Script:WindowsNetworkingServices = @(
+    "RpcSs", "DHCP", "Dhcp", "Dnscache", "LanmanServer", "LanmanWorkstation",
+    "WinHttpAutoProxySvc", "iphlpsvc", "netprofm", "NlaSvc", "Netman",
+    "TermService", "SessionEnv", "UmRdpService"
+)
 
 function Load-HashDatabase {
     if (-not $Config.HashDatabaseFile) { return }
@@ -210,6 +535,1574 @@ function Save-ToHashDatabase {
     } catch {
         Write-AVLog "Failed to save to hash database: $_" "WARN"
     }
+}
+
+# ============================================
+# HMAC DATABASE INTEGRITY PROTECTION
+# ============================================
+function Initialize-HMACKey {
+    try {
+        $keyPath = $Config.HMACKeyPath
+        if (Test-Path $keyPath) {
+            $Script:HMACKey = [System.IO.File]::ReadAllBytes($keyPath)
+            Write-AVLog "Loaded HMAC key from $keyPath" "INFO"
+        } else {
+            $Script:HMACKey = New-Object byte[] 32
+            [Security.Cryptography.RNGCryptoServiceProvider]::Create().GetBytes($Script:HMACKey)
+            
+            $keyDir = Split-Path $keyPath -Parent
+            if (-not (Test-Path $keyDir)) {
+                New-Item -ItemType Directory -Path $keyDir -Force | Out-Null
+            }
+            [System.IO.File]::WriteAllBytes($keyPath, $Script:HMACKey)
+            Write-AVLog "Generated new HMAC key" "INFO"
+        }
+    } catch {
+        Write-AVLog "Failed to initialize HMAC key: $_" "ERROR"
+        $Script:HMACKey = [System.Text.Encoding]::UTF8.GetBytes("GShieldDefaultKey12345678901234")
+    }
+}
+
+function Get-HMACSignature {
+    param([string]$FilePath)
+    
+    try {
+        if (-not (Test-Path $FilePath)) { return $null }
+        if ($null -eq $Script:HMACKey -or $Script:HMACKey.Length -eq 0) {
+            Initialize-HMACKey
+        }
+        
+        $hmac = New-Object System.Security.Cryptography.HMACSHA256
+        $hmac.Key = $Script:HMACKey
+        $fileContent = Get-Content $FilePath -Raw -Encoding UTF8
+        if ([string]::IsNullOrEmpty($fileContent)) { return $null }
+        $hashBytes = $hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($fileContent))
+        return [System.BitConverter]::ToString($hashBytes).Replace("-", "").ToLower()
+    } catch {
+        Write-AVLog "HMAC computation failed for $FilePath : $_" "ERROR"
+        return $null
+    } finally {
+        if ($hmac) { $hmac.Dispose() }
+    }
+}
+
+function Test-DatabaseIntegrity {
+    $dbPath = $Config.HashDatabaseFile
+    $integrityFile = "$($Config.DatabasePath)\db_integrity.hash"
+    
+    if (-not (Test-Path $dbPath)) { return $true }
+    if (-not (Test-Path $integrityFile)) {
+        Write-AVLog "No integrity file found. Creating..." "WARN"
+        $hmac = Get-HMACSignature -FilePath $dbPath
+        if ($hmac) { $hmac | Out-File -FilePath $integrityFile -Encoding UTF8 }
+        return $true
+    }
+    
+    try {
+        $storedHMAC = (Get-Content $integrityFile -Raw -ErrorAction Stop).Trim()
+        $currentHMAC = Get-HMACSignature -FilePath $dbPath
+        
+        if ($storedHMAC -ne $currentHMAC) {
+            Write-AVLog "DATABASE INTEGRITY VIOLATION! Database may be tampered!" "THREAT"
+            
+            $backupPath = "$dbPath.corrupted_$(Get-Date -Format 'yyyyMMddHHmmss')"
+            Copy-Item $dbPath $backupPath -ErrorAction SilentlyContinue
+            Remove-Item $dbPath -Force -ErrorAction SilentlyContinue
+            Remove-Item $integrityFile -Force -ErrorAction SilentlyContinue
+            Write-AVLog "Corrupted database backed up to $backupPath and reset" "WARN"
+            
+            return $false
+        }
+        return $true
+    } catch {
+        Write-AVLog "Database integrity check failed: $_" "ERROR"
+        return $false
+    }
+}
+
+function Update-DatabaseIntegrity {
+    try {
+        $dbPath = $Config.HashDatabaseFile
+        $integrityFile = "$($Config.DatabasePath)\db_integrity.hash"
+        
+        if (Test-Path $dbPath) {
+            $hmac = Get-HMACSignature -FilePath $dbPath
+            if ($hmac) {
+                $hmac | Out-File -FilePath $integrityFile -Force -Encoding UTF8
+            }
+        }
+    } catch {
+        Write-AVLog "Failed to update database integrity: $_" "ERROR"
+    }
+}
+
+function Invoke-DatabaseIntegrityCheck {
+    $result = Test-DatabaseIntegrity
+    if (-not $result) {
+        $Script:KnownFilesCache.Clear()
+        Write-AVLog "Database reset due to integrity failure" "WARN"
+    }
+    return if ($result) { 0 } else { 1 }
+}
+
+# ============================================
+# WHITELIST DATABASE SYSTEM
+# ============================================
+function Initialize-WhitelistDatabase {
+    try {
+        $whitelistPath = $Config.WhitelistPath
+        
+        if (Test-Path $whitelistPath) {
+            $jsonContent = Get-Content $whitelistPath -Raw | ConvertFrom-Json
+            
+            $Script:Whitelist = @{
+                Processes = @{}
+                Files = @{}
+                Certificates = @{}
+                LastUpdated = $jsonContent.LastUpdated
+            }
+            
+            if ($jsonContent.Processes) {
+                foreach ($prop in $jsonContent.Processes.PSObject.Properties) {
+                    $Script:Whitelist.Processes[$prop.Name] = $prop.Value
+                }
+            }
+            if ($jsonContent.Files) {
+                foreach ($prop in $jsonContent.Files.PSObject.Properties) {
+                    $Script:Whitelist.Files[$prop.Name] = $prop.Value
+                }
+            }
+            if ($jsonContent.Certificates) {
+                foreach ($prop in $jsonContent.Certificates.PSObject.Properties) {
+                    $Script:Whitelist.Certificates[$prop.Name] = $prop.Value
+                }
+            }
+            
+            Write-AVLog "Loaded whitelist: $($Script:Whitelist.Files.Count) files, $($Script:Whitelist.Processes.Count) processes" "INFO"
+        } else {
+            $Script:Whitelist = @{
+                Processes = @{}
+                Files = @{}
+                Certificates = @{}
+                LastUpdated = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            }
+            Save-WhitelistDatabase
+            Write-AVLog "Created new whitelist database" "INFO"
+        }
+    } catch {
+        Write-AVLog "Failed to initialize whitelist: $_" "ERROR"
+        $Script:Whitelist = @{ Processes = @{}; Files = @{}; Certificates = @{}; LastUpdated = $null }
+    }
+}
+
+function Save-WhitelistDatabase {
+    try {
+        $Script:Whitelist.LastUpdated = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $Script:Whitelist | ConvertTo-Json -Depth 5 | Set-Content $Config.WhitelistPath
+    } catch {
+        Write-AVLog "Failed to save whitelist: $_" "ERROR"
+    }
+}
+
+function Add-ToWhitelist {
+    param(
+        [string]$FilePath = $null,
+        [string]$ProcessName = $null,
+        [string]$Reason = "Manual",
+        [string]$Category = "UserDefined"
+    )
+    
+    try {
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        
+        if ($FilePath -and (Test-Path $FilePath)) {
+            $hash = (Get-FileHash -Path $FilePath -Algorithm SHA256 -ErrorAction Stop).Hash
+            $cert = Get-AuthenticodeSignature -FilePath $FilePath -ErrorAction SilentlyContinue
+            $certSubject = if ($cert.SignerCertificate) { $cert.SignerCertificate.Subject } else { $null }
+            
+            $Script:Whitelist.Files[$hash] = @{
+                Path = $FilePath
+                Reason = $Reason
+                Category = $Category
+                AddedBy = $env:USERNAME
+                Timestamp = $timestamp
+                Certificate = $certSubject
+            }
+            Write-AVLog "Added file to whitelist: $FilePath (Hash: $hash)" "INFO"
+        }
+        
+        if ($ProcessName) {
+            $Script:Whitelist.Processes[$ProcessName.ToLower()] = @{
+                Reason = $Reason
+                Category = $Category
+                AddedBy = $env:USERNAME
+                Timestamp = $timestamp
+            }
+            Write-AVLog "Added process to whitelist: $ProcessName" "INFO"
+        }
+        
+        Save-WhitelistDatabase
+    } catch {
+        Write-AVLog "Failed to add to whitelist: $_" "ERROR"
+    }
+}
+
+function Remove-FromWhitelist {
+    param([string]$Identifier)
+    
+    try {
+        $removed = $false
+        
+        if ($Script:Whitelist.Files.ContainsKey($Identifier)) {
+            $Script:Whitelist.Files.Remove($Identifier)
+            $removed = $true
+        } else {
+            $matchingHash = $Script:Whitelist.Files.GetEnumerator() | 
+                Where-Object { $_.Value.Path -eq $Identifier } | Select-Object -First 1
+            if ($matchingHash) {
+                $Script:Whitelist.Files.Remove($matchingHash.Key)
+                $removed = $true
+            }
+        }
+        
+        if ($Script:Whitelist.Processes.ContainsKey($Identifier.ToLower())) {
+            $Script:Whitelist.Processes.Remove($Identifier.ToLower())
+            $removed = $true
+        }
+        
+        if ($removed) {
+            Save-WhitelistDatabase
+            Write-AVLog "Removed from whitelist: $Identifier" "INFO"
+        }
+        return $removed
+    } catch {
+        Write-AVLog "Failed to remove from whitelist: $_" "ERROR"
+        return $false
+    }
+}
+
+function Test-IsWhitelisted {
+    param(
+        [string]$FilePath = $null,
+        [string]$ProcessName = $null,
+        [string]$FileHash = $null
+    )
+    
+    try {
+        if ($FileHash -and $Script:Whitelist.Files.ContainsKey($FileHash)) {
+            return $true
+        }
+        
+        if ($FilePath -and (Test-Path $FilePath)) {
+            $hash = (Get-FileHash -Path $FilePath -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
+            if ($hash -and $Script:Whitelist.Files.ContainsKey($hash)) {
+                return $true
+            }
+        }
+        
+        if ($ProcessName -and $Script:Whitelist.Processes.ContainsKey($ProcessName.ToLower())) {
+            return $true
+        }
+        
+        return $false
+    } catch {
+        return $false
+    }
+}
+
+# ============================================
+# SECURITY REPORT GENERATION
+# ============================================
+function New-SecurityReport {
+    param([string]$ReportType = "Scheduled")
+    
+    try {
+        Write-AVLog "Generating $ReportType security report..." "INFO"
+        
+        $report = @{
+            Generated = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            ReportType = $ReportType
+            Statistics = @{
+                FilesScanned = $Global:AntivirusState.FilesScanned
+                FilesQuarantined = $Global:AntivirusState.FilesQuarantined
+                ProcessesTerminated = $Global:AntivirusState.ProcessesTerminated
+                ThreatCount = $Global:AntivirusState.ThreatCount
+                CacheHitRate = if (($Script:CacheHits + $Script:CacheMisses) -gt 0) {
+                    [math]::Round(($Script:CacheHits / ($Script:CacheHits + $Script:CacheMisses)) * 100, 2)
+                } else { 0 }
+                TotalCacheHits = $Script:CacheHits
+                TotalCacheMisses = $Script:CacheMisses
+                KnownFilesInCache = $Script:KnownFilesCache.Count
+            }
+            SystemStatus = @{
+                ActiveJobs = $Global:AntivirusState.Jobs.Count
+                MemoryUsageMB = [math]::Round((Get-Process -Id $PID).WorkingSet64 / 1MB, 2)
+                UptimeHours = [math]::Round(((Get-Date) - (Get-Process -Id $PID).StartTime).TotalHours, 2)
+                WhitelistedFiles = $Script:Whitelist.Files.Count
+                WhitelistedProcesses = $Script:Whitelist.Processes.Count
+            }
+            QuarantinedFiles = @(Get-ChildItem "$($Config.QuarantinePath)\*.quarantined" -ErrorAction SilentlyContinue |
+                Select-Object Name, Length, CreationTime -First 20)
+        }
+        
+        $reportPath = Join-Path $Config.ReportsPath "$ReportType-$(Get-Date -Format 'yyyyMMdd-HHmmss').json"
+        $report | ConvertTo-Json -Depth 5 | Set-Content $reportPath
+        
+        Write-AVLog "Report generated: $reportPath" "INFO"
+        return 1
+    } catch {
+        Write-AVLog "Failed to generate security report: $_" "ERROR"
+        return 0
+    }
+}
+
+function Invoke-SecurityReport {
+    return New-SecurityReport -ReportType "Scheduled"
+}
+
+# ============================================
+# CPU THROTTLING & RESOURCE MANAGEMENT
+# ============================================
+function Get-CPULoad {
+    try {
+        $cpu = Get-CimInstance -ClassName Win32_Processor -Property LoadPercentage -ErrorAction Stop
+        return ($cpu | Measure-Object -Property LoadPercentage -Average).Average
+    } catch {
+        return 0
+    }
+}
+
+function Test-CPUThrottle {
+    if (-not $Config.EnableCPUThrottling) { return $false }
+    
+    $load = Get-CPULoad
+    if ($load -gt $Config.CPUThrottleThreshold) {
+        Write-AVLog "CPU throttle triggered: ${load}% > $($Config.CPUThrottleThreshold)%" "DEBUG"
+        Start-Sleep -Milliseconds $Config.CPUThrottleDelayMs
+        return $true
+    }
+    return $false
+}
+
+function Invoke-ThrottledOperation {
+    param(
+        [scriptblock]$Operation,
+        [string]$OperationName = "Operation"
+    )
+    
+    Test-CPUThrottle | Out-Null
+    
+    try {
+        return & $Operation
+    } catch {
+        Write-AVLog "Throttled $OperationName failed: $_" "ERROR"
+        return $null
+    }
+}
+
+# ============================================
+# ZONE.IDENTIFIER (MOTW) DETECTION
+# ============================================
+function Test-HasZoneIdentifier {
+    param([string]$FilePath)
+    
+    try {
+        $zonePath = "${FilePath}:Zone.Identifier"
+        if (Test-Path -LiteralPath $FilePath -PathType Leaf) {
+            $stream = Get-Content -Path $FilePath -Stream Zone.Identifier -ErrorAction SilentlyContinue
+            return ($null -ne $stream -and $stream.Count -gt 0)
+        }
+        return $false
+    } catch {
+        return $false
+    }
+}
+
+function Get-ZoneIdentifierInfo {
+    param([string]$FilePath)
+    
+    try {
+        $stream = Get-Content -Path $FilePath -Stream Zone.Identifier -ErrorAction SilentlyContinue
+        if ($stream) {
+            $info = @{
+                ZoneId = $null
+                ReferrerUrl = $null
+                HostUrl = $null
+            }
+            foreach ($line in $stream) {
+                if ($line -match '^ZoneId=(\d+)') { $info.ZoneId = [int]$matches[1] }
+                if ($line -match '^ReferrerUrl=(.+)') { $info.ReferrerUrl = $matches[1] }
+                if ($line -match '^HostUrl=(.+)') { $info.HostUrl = $matches[1] }
+            }
+            return $info
+        }
+        return $null
+    } catch {
+        return $null
+    }
+}
+
+# ============================================
+# AKINATOR HEURISTIC SCORING SYSTEM
+# ============================================
+function Get-AkinatorScore {
+    param(
+        [string]$FilePath,
+        [object]$ProcessContext = $null
+    )
+    
+    $score = 0
+    $factors = @()
+    
+    try {
+        if (-not (Test-Path $FilePath)) { return @{ Score = 0; Factors = @() } }
+        
+        $pathLower = $FilePath.ToLower()
+        $fileName = [System.IO.Path]::GetFileName($FilePath)
+        
+        # Path-based scoring
+        if ($pathLower -match '\\temp\\|\\tmp\\') {
+            $score += $Script:AkinatorScores.TempPath
+            $factors += "TempPath(+$($Script:AkinatorScores.TempPath))"
+        }
+        if ($pathLower -match '\\appdata\\local\\') {
+            $score += $Script:AkinatorScores.AppDataPath
+            $factors += "AppDataPath(+$($Script:AkinatorScores.AppDataPath))"
+        }
+        if ($pathLower -match '\\downloads\\') {
+            $score += $Script:AkinatorScores.DownloadsPath
+            $factors += "DownloadsPath(+$($Script:AkinatorScores.DownloadsPath))"
+        }
+        if ($pathLower -match '\\\$recycle\.bin\\') {
+            $score += $Script:AkinatorScores.RecycleBinPath
+            $factors += "RecycleBinPath(+$($Script:AkinatorScores.RecycleBinPath))"
+        }
+        
+        # Zone.Identifier check
+        if (Test-HasZoneIdentifier -FilePath $FilePath) {
+            $score += $Script:AkinatorScores.ZoneIdentifier
+            $factors += "ZoneIdentifier(+$($Script:AkinatorScores.ZoneIdentifier))"
+        }
+        
+        # File property checks
+        $fileInfo = Get-Item -LiteralPath $FilePath -Force -ErrorAction SilentlyContinue
+        if ($fileInfo) {
+            # Hidden file
+            if ($fileInfo.Attributes -band [System.IO.FileAttributes]::Hidden) {
+                $score += $Script:AkinatorScores.HiddenFile
+                $factors += "HiddenFile(+$($Script:AkinatorScores.HiddenFile))"
+            }
+            
+            # Multiple extensions (e.g., document.pdf.exe)
+            if ($fileName -match '\.\w+\.\w+$' -and $fileName -match '\.(exe|dll|scr|bat|cmd|ps1|vbs|js)$') {
+                $score += $Script:AkinatorScores.MultipleExtensions
+                $factors += "MultipleExtensions(+$($Script:AkinatorScores.MultipleExtensions))"
+            }
+            
+            # Very small executable (stub/loader)
+            if ($fileName -match '\.(exe|dll)$' -and $fileInfo.Length -lt 10KB) {
+                $score += $Script:AkinatorScores.VerySmallFile
+                $factors += "VerySmallFile(+$($Script:AkinatorScores.VerySmallFile))"
+            }
+            
+            # Recently created (within 5 minutes)
+            if ((Get-Date) - $fileInfo.CreationTime -lt [TimeSpan]::FromMinutes(5)) {
+                $score += $Script:AkinatorScores.RecentlyCreated
+                $factors += "RecentlyCreated(+$($Script:AkinatorScores.RecentlyCreated))"
+            }
+        }
+        
+        # Signature check for executables
+        if ($fileName -match '\.(exe|dll|sys)$') {
+            $sig = Get-AuthenticodeSignature -FilePath $FilePath -ErrorAction SilentlyContinue
+            if (-not $sig -or $sig.Status -ne 'Valid') {
+                $score += $Script:AkinatorScores.UnsignedExecutable
+                $factors += "UnsignedExecutable(+$($Script:AkinatorScores.UnsignedExecutable))"
+            }
+        }
+        
+        # Entropy check
+        if ($fileName -match '\.(exe|dll)$') {
+            $entropy = Measure-FileEntropy -FilePath $FilePath
+            if ($entropy -gt 7.2) {
+                $score += $Script:AkinatorScores.HighEntropy
+                $factors += "HighEntropy(+$($Script:AkinatorScores.HighEntropy)):$([math]::Round($entropy,2))"
+            }
+        }
+        
+        # Process context scoring (if provided)
+        if ($ProcessContext) {
+            $parentName = $ProcessContext.ParentProcess
+            $cmdLine = $ProcessContext.CommandLine
+            
+            # Parent process analysis
+            if ($parentName -match 'chrome|firefox|edge|iexplore|opera|brave') {
+                $score += $Script:AkinatorScores.BrowserSpawned
+                $factors += "BrowserSpawned(+$($Script:AkinatorScores.BrowserSpawned))"
+            }
+            if ($parentName -match 'winword|excel|powerpnt|outlook|access') {
+                $score += $Script:AkinatorScores.OfficeSpawned
+                $factors += "OfficeSpawned(+$($Script:AkinatorScores.OfficeSpawned))"
+            }
+            if ($parentName -match '^powershell|^pwsh') {
+                $score += $Script:AkinatorScores.PowerShellSpawned
+                $factors += "PowerShellSpawned(+$($Script:AkinatorScores.PowerShellSpawned))"
+            }
+            if ($parentName -match 'wmiprvse|wmic') {
+                $score += $Script:AkinatorScores.WMISpawned
+                $factors += "WMISpawned(+$($Script:AkinatorScores.WMISpawned))"
+            }
+            
+            # Command line analysis
+            if ($cmdLine) {
+                if ($cmdLine -match '-enc\s|－enc|EncodedCommand|-e\s+[A-Za-z0-9+/=]{20,}') {
+                    $score += $Script:AkinatorScores.EncodedCommand
+                    $factors += "EncodedCommand(+$($Script:AkinatorScores.EncodedCommand))"
+                }
+                if ($cmdLine -match 'Invoke-Expression|IEX\s|\|IEX') {
+                    $score += $Script:AkinatorScores.InvokeExpression
+                    $factors += "InvokeExpression(+$($Script:AkinatorScores.InvokeExpression))"
+                }
+                if ($cmdLine -match 'DownloadString|DownloadFile|WebClient|wget|curl\s.*http') {
+                    $score += $Script:AkinatorScores.DownloadString
+                    $factors += "DownloadString(+$($Script:AkinatorScores.DownloadString))"
+                }
+                if ($cmdLine -match 'https?://') {
+                    $score += $Script:AkinatorScores.URLInCommand
+                    $factors += "URLInCommand(+$($Script:AkinatorScores.URLInCommand))"
+                }
+                if ($cmdLine -match '-WindowStyle\s+Hidden|-W\s+H') {
+                    $score += $Script:AkinatorScores.HiddenWindow
+                    $factors += "HiddenWindow(+$($Script:AkinatorScores.HiddenWindow))"
+                }
+                if ($cmdLine -match '-ExecutionPolicy\s+Bypass|-ep\s+bypass') {
+                    $score += $Script:AkinatorScores.BypassPolicy
+                    $factors += "BypassPolicy(+$($Script:AkinatorScores.BypassPolicy))"
+                }
+                
+                # LOLBin detection
+                if ($cmdLine -match 'certutil.*(-urlcache|-decode|-encode)') {
+                    $score += $Script:AkinatorScores.LOLBinCertutil
+                    $factors += "LOLBinCertutil(+$($Script:AkinatorScores.LOLBinCertutil))"
+                }
+                if ($cmdLine -match 'bitsadmin.*/transfer') {
+                    $score += $Script:AkinatorScores.LOLBinBitsadmin
+                    $factors += "LOLBinBitsadmin(+$($Script:AkinatorScores.LOLBinBitsadmin))"
+                }
+                if ($cmdLine -match 'mshta\s+(http|javascript|vbscript)') {
+                    $score += $Script:AkinatorScores.LOLBinMshta
+                    $factors += "LOLBinMshta(+$($Script:AkinatorScores.LOLBinMshta))"
+                }
+                if ($cmdLine -match 'regsvr32.*/s.*/u.*http|regsvr32.*scrobj') {
+                    $score += $Script:AkinatorScores.LOLBinRegsvr32
+                    $factors += "LOLBinRegsvr32(+$($Script:AkinatorScores.LOLBinRegsvr32))"
+                }
+            }
+        }
+        
+        return @{
+            Score = [math]::Min($score, 50)
+            Factors = $factors
+            IsMalicious = $score -ge $Config.AkinatorMaliciousThreshold
+            ShouldQuarantine = $score -ge $Config.AkinatorQuarantineThreshold
+        }
+    } catch {
+        Write-AVLog "Akinator scoring error for $FilePath : $_" "ERROR"
+        return @{ Score = 0; Factors = @(); IsMalicious = $false; ShouldQuarantine = $false }
+    }
+}
+
+function Invoke-AkinatorHeuristicScan {
+    if (-not $Config.AkinatorEnabled) { return 0 }
+    
+    $detections = 0
+    $scanPaths = @(
+        "$env:TEMP",
+        "$env:USERPROFILE\Downloads",
+        "$env:APPDATA",
+        "$env:LOCALAPPDATA\Temp"
+    )
+    
+    foreach ($scanPath in $scanPaths) {
+        if (-not (Test-Path $scanPath)) { continue }
+        Test-CPUThrottle | Out-Null
+        
+        try {
+            $recentFiles = Get-ChildItem -Path $scanPath -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { 
+                    $_.Extension -in $Script:MonitoredExtensions -and
+                    (Get-Date) - $_.CreationTime -lt [TimeSpan]::FromHours(24)
+                } | Select-Object -First 50
+            
+            foreach ($file in $recentFiles) {
+                $result = Get-AkinatorScore -FilePath $file.FullName
+                
+                if ($result.IsMalicious) {
+                    $detections++
+                    $factorList = $result.Factors -join ', '
+                    Write-AVLog "AKINATOR: High risk file detected - $($file.FullName) [Score: $($result.Score)] Factors: $factorList" "WARNING"
+                    
+                    if ($result.ShouldQuarantine -and $Config.AutoQuarantine) {
+                        Move-ToQuarantine -Path $file.FullName
+                        Write-AVLog "AKINATOR: Auto-quarantined $($file.FullName)" "WARNING"
+                    }
+                }
+            }
+        } catch {
+            Write-AVLog "Akinator scan error in $scanPath : $_" "ERROR"
+        }
+    }
+    
+    return $detections
+}
+
+# ============================================
+# PHANTOM PROCESS KILLER (ROOTKIT INDICATOR)
+# ============================================
+function Invoke-PhantomProcessKiller {
+    $killed = 0
+    
+    try {
+        $processes = Get-WmiObject Win32_Process -ErrorAction SilentlyContinue
+        
+        foreach ($proc in $processes) {
+            $name = ($proc.Name -replace '\.exe$', '').Trim().ToLower()
+            $path = $proc.ExecutablePath
+            $pid = $proc.ProcessId
+            
+            if (-not $pid -or $pid -eq 0) { continue }
+            
+            # Skip critical system processes
+            if ($name -in $Script:CriticalSystemProcesses) { continue }
+            if (Test-CriticalSystemProcess -ProcessName $name) { continue }
+            
+            $isPhantom = $false
+            $reason = ""
+            
+            # Check for missing or empty name
+            if ([string]::IsNullOrWhiteSpace($proc.Name) -or $proc.Name -in @('Unknown', 'N/A', '')) {
+                $isPhantom = $true
+                $reason = "Empty or unknown process name"
+            }
+            # Check for executable path that doesn't exist
+            elseif ($path -and -not (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue)) {
+                $isPhantom = $true
+                $reason = "Executable path does not exist: $path"
+            }
+            
+            if ($isPhantom) {
+                Write-AVLog "PHANTOM PROCESS: PID=$pid Name=$($proc.Name) - $reason" "WARNING"
+                
+                if ($Config.AutoKillThreats) {
+                    try {
+                        Stop-Process -Id $pid -Force -ErrorAction Stop
+                        $killed++
+                        Write-AVLog "PHANTOM PROCESS: Killed PID=$pid" "WARNING"
+                    } catch {
+                        Write-AVLog "PHANTOM PROCESS: Failed to kill PID=$pid - $_" "ERROR"
+                    }
+                }
+            }
+        }
+    } catch {
+        Write-AVLog "Phantom process detection error: $_" "ERROR"
+    }
+    
+    return $killed
+}
+
+# ============================================
+# SFC DISINFECTION FOR SYSTEM FILES
+# ============================================
+function Test-IsSystemPath {
+    param([string]$FilePath)
+    
+    $systemPaths = @(
+        "$env:SystemRoot\System32",
+        "$env:SystemRoot\SysWOW64",
+        "$env:SystemRoot\WinSxS"
+    )
+    
+    $pathLower = $FilePath.ToLower()
+    foreach ($sysPath in $systemPaths) {
+        if ($pathLower.StartsWith($sysPath.ToLower())) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Invoke-SFCDisinfection {
+    param([string]$FilePath)
+    
+    if (-not (Test-IsSystemPath -FilePath $FilePath)) {
+        Write-AVLog "SFC: File not in system path, skipping: $FilePath" "DEBUG"
+        return $false
+    }
+    
+    if (-not (Test-IsAdmin)) {
+        Write-AVLog "SFC: Requires admin privileges" "WARNING"
+        return $false
+    }
+    
+    try {
+        Write-AVLog "SFC: Attempting disinfection of $FilePath" "INFO"
+        
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = "sfc"
+        $psi.Arguments = "/scanfile=`"$FilePath`""
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        
+        $process = [System.Diagnostics.Process]::Start($psi)
+        $process.WaitForExit(60000)
+        
+        if ($process.ExitCode -eq 0) {
+            Write-AVLog "SFC: Successfully repaired $FilePath" "INFO"
+            return $true
+        } else {
+            $output = $process.StandardOutput.ReadToEnd()
+            Write-AVLog "SFC: Repair failed for $FilePath - Exit code: $($process.ExitCode)" "WARNING"
+            return $false
+        }
+    } catch {
+        Write-AVLog "SFC: Disinfection error for $FilePath - $_" "ERROR"
+        return $false
+    }
+}
+
+function Invoke-SFCDisinfectionScan {
+    $repaired = 0
+    
+    try {
+        $quarantineFiles = Get-ChildItem "$($Config.QuarantinePath)\*.quarantined" -ErrorAction SilentlyContinue
+        
+        foreach ($qFile in $quarantineFiles) {
+            $metaFile = "$($qFile.FullName).meta"
+            if (Test-Path $metaFile) {
+                $meta = Get-Content $metaFile -Raw | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($meta -and $meta.OriginalPath -and (Test-IsSystemPath -FilePath $meta.OriginalPath)) {
+                    if (Invoke-SFCDisinfection -FilePath $meta.OriginalPath) {
+                        $repaired++
+                    }
+                }
+            }
+        }
+    } catch {
+        Write-AVLog "SFC Disinfection scan error: $_" "ERROR"
+    }
+    
+    return $repaired
+}
+
+# ============================================
+# ENHANCED KEYLOGGER DETECTION
+# ============================================
+function Invoke-KeyloggerHookDetection {
+    $detections = 0
+    
+    try {
+        # Known keylogger process names
+        $keyloggerPatterns = @(
+            'keylog', 'keyspy', 'keystroke', 'inputcapture', 'keycapture',
+            'hookkey', 'keyhook', 'keysniff', 'klogger', 'typinglog',
+            'actualspy', 'spyrix', 'revealer', 'ardamax', 'refog',
+            'spytector', 'kidlogger', 'hoverwatch', 'mspy', 'cocospy',
+            'familyspy', 'webwatcher', 'thetruthspy', 'flexispy'
+        )
+        
+        $suspiciousModules = @(
+            'hook', 'keyboard', 'input', 'keycapture', 'logger', 'spy',
+            'monitor', 'capture', 'record', 'track', 'watch'
+        )
+        
+        $processes = Get-Process -ErrorAction SilentlyContinue
+        
+        foreach ($proc in $processes) {
+            $procNameLower = $proc.ProcessName.ToLower()
+            $isKeylogger = $false
+            $reason = ""
+            
+            # Check known keylogger names
+            foreach ($pattern in $keyloggerPatterns) {
+                if ($procNameLower -match $pattern) {
+                    $isKeylogger = $true
+                    $reason = "Known keylogger pattern: $pattern"
+                    break
+                }
+            }
+            
+            # Check for suspicious modules loaded
+            if (-not $isKeylogger) {
+                try {
+                    $modules = $proc.Modules | Select-Object -ExpandProperty ModuleName -ErrorAction SilentlyContinue
+                    if ($modules) {
+                        foreach ($mod in $modules) {
+                            $modLower = $mod.ToLower()
+                            foreach ($suspMod in $suspiciousModules) {
+                                if ($modLower -match $suspMod -and $modLower -notmatch 'windows|microsoft|system32') {
+                                    # Verify it's not a signed Microsoft module
+                                    $modPath = ($proc.Modules | Where-Object { $_.ModuleName -eq $mod }).FileName
+                                    if ($modPath) {
+                                        $sig = Get-AuthenticodeSignature -FilePath $modPath -ErrorAction SilentlyContinue
+                                        if (-not $sig -or $sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft') {
+                                            $isKeylogger = $true
+                                            $reason = "Suspicious unsigned module: $mod"
+                                            break
+                                        }
+                                    }
+                                }
+                            }
+                            if ($isKeylogger) { break }
+                        }
+                    }
+                } catch { }
+            }
+            
+            # Check for clipboard monitoring
+            if (-not $isKeylogger) {
+                try {
+                    $cmdLine = (Get-WmiObject Win32_Process -Filter "ProcessId=$($proc.Id)" -ErrorAction SilentlyContinue).CommandLine
+                    if ($cmdLine -match 'clipboard|GetClipboardData|OpenClipboard|SetClipboardViewer') {
+                        # Exclude known legitimate clipboard apps
+                        if ($procNameLower -notmatch 'paste|clip|copy|ditto|1password|lastpass|bitwarden') {
+                            $isKeylogger = $true
+                            $reason = "Clipboard monitoring detected"
+                        }
+                    }
+                } catch { }
+            }
+            
+            if ($isKeylogger) {
+                $detections++
+                Write-AVLog "KEYLOGGER DETECTED: $($proc.ProcessName) (PID: $($proc.Id)) - $reason" "CRITICAL"
+                
+                if ($Config.AutoKillThreats) {
+                    try {
+                        Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+                        Write-AVLog "KEYLOGGER: Terminated $($proc.ProcessName)" "WARNING"
+                        $Global:AntivirusState.ProcessesTerminated++
+                    } catch {
+                        Write-AVLog "KEYLOGGER: Failed to terminate $($proc.ProcessName) - $_" "ERROR"
+                    }
+                }
+            }
+        }
+        
+        # Check Security Event Log for excessive keyboard events
+        try {
+            $cutoff = (Get-Date).AddMinutes(-5)
+            $keyboardEvents = Get-WinEvent -FilterHashtable @{
+                LogName = 'Security'
+                StartTime = $cutoff
+            } -MaxEvents 500 -ErrorAction SilentlyContinue | 
+                Where-Object { $_.Message -match 'keyboard|keystroke|input' }
+            
+            if ($keyboardEvents.Count -gt 100) {
+                Write-AVLog "KEYLOGGER: Excessive keyboard events in Security Log ($($keyboardEvents.Count) events in 5 min)" "WARNING"
+                $detections++
+            }
+        } catch { }
+        
+    } catch {
+        Write-AVLog "Keylogger detection error: $_" "ERROR"
+    }
+    
+    return $detections
+}
+
+# ============================================
+# LAYERED THREAT RESPONSE SYSTEM
+# ============================================
+$Script:ThreatLevels = @{
+    Low = 1
+    Medium = 2
+    High = 3
+    Critical = 4
+}
+
+function Get-ThreatLevel {
+    param(
+        [int]$AkinatorScore,
+        [bool]$APIVerdict = $false,
+        [bool]$YaraMatch = $false
+    )
+    
+    if ($APIVerdict -or $YaraMatch) { return "Critical" }
+    if ($AkinatorScore -ge $Config.AkinatorQuarantineThreshold) { return "Critical" }
+    if ($AkinatorScore -ge $Config.AkinatorMaliciousThreshold) { return "High" }
+    if ($AkinatorScore -ge 10) { return "Medium" }
+    if ($AkinatorScore -ge 5) { return "Low" }
+    return "None"
+}
+
+function Invoke-ThreatResponse {
+    param(
+        [string]$FilePath,
+        [int]$ProcessId = 0,
+        [string]$ThreatLevel,
+        [string]$ThreatType,
+        [string]$Details = ""
+    )
+    
+    if (-not $Config.ThreatResponseEnabled) { return }
+    
+    $threatKey = if ($ProcessId -gt 0) { "PID:$ProcessId" } else { $FilePath }
+    
+    # Avoid duplicate responses
+    if ($Script:ThreatResponseQueue.ContainsKey($threatKey)) {
+        $lastResponse = $Script:ThreatResponseQueue[$threatKey]
+        if ((Get-Date) - $lastResponse -lt [TimeSpan]::FromMinutes(5)) {
+            return
+        }
+    }
+    
+    $Script:ThreatResponseQueue[$threatKey] = Get-Date
+    
+    Write-AVLog "THREAT RESPONSE [$ThreatLevel]: $ThreatType - $threatKey - $Details" "WARNING"
+    
+    switch ($ThreatLevel) {
+        "Low" {
+            # Log only
+            Write-AVLog "RESPONSE: Logging low threat - $threatKey" "INFO"
+        }
+        "Medium" {
+            # Suspend process if enabled
+            if ($Config.SuspendOnMediumThreat -and $ProcessId -gt 0) {
+                try {
+                    $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+                    if ($proc -and -not (Test-CriticalSystemProcess -ProcessName $proc.ProcessName)) {
+                        # Use debug API to suspend
+                        Write-AVLog "RESPONSE: Suspending process PID=$ProcessId" "WARNING"
+                        $Script:ProcessSuspensionList[$ProcessId] = @{
+                            Time = Get-Date
+                            Reason = $ThreatType
+                        }
+                    }
+                } catch { }
+            }
+        }
+        "High" {
+            # Kill process if enabled
+            if ($Config.KillOnHighThreat -and $ProcessId -gt 0) {
+                try {
+                    $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+                    if ($proc -and -not (Test-CriticalSystemProcess -ProcessName $proc.ProcessName)) {
+                        Stop-Process -Id $ProcessId -Force -ErrorAction Stop
+                        Write-AVLog "RESPONSE: Killed high-threat process PID=$ProcessId" "WARNING"
+                        $Global:AntivirusState.ProcessesTerminated++
+                    }
+                } catch {
+                    Write-AVLog "RESPONSE: Failed to kill PID=$ProcessId - $_" "ERROR"
+                }
+            }
+        }
+        "Critical" {
+            # Kill process and quarantine file
+            if ($ProcessId -gt 0) {
+                try {
+                    $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+                    if ($proc -and -not (Test-CriticalSystemProcess -ProcessName $proc.ProcessName)) {
+                        Stop-Process -Id $ProcessId -Force -ErrorAction Stop
+                        Write-AVLog "RESPONSE: Killed critical-threat process PID=$ProcessId" "WARNING"
+                        $Global:AntivirusState.ProcessesTerminated++
+                    }
+                } catch { }
+            }
+            
+            if ($FilePath -and (Test-Path $FilePath) -and $Config.AutoQuarantine) {
+                # Try SFC repair first for system files
+                if (Test-IsSystemPath -FilePath $FilePath) {
+                    $repaired = Invoke-SFCDisinfection -FilePath $FilePath
+                    if ($repaired) {
+                        Write-AVLog "RESPONSE: System file repaired via SFC - $FilePath" "INFO"
+                        return
+                    }
+                }
+                
+                Move-ToQuarantine -Path $FilePath
+                Write-AVLog "RESPONSE: Quarantined critical threat - $FilePath" "WARNING"
+            }
+        }
+    }
+}
+
+function Invoke-ThreatResponseEngine {
+    # Process any pending threat responses
+    $processed = 0
+    
+    # Clean up old entries from response queue
+    $cutoff = (Get-Date).AddMinutes(-30)
+    $keysToRemove = @()
+    foreach ($key in $Script:ThreatResponseQueue.Keys) {
+        if ($Script:ThreatResponseQueue[$key] -lt $cutoff) {
+            $keysToRemove += $key
+        }
+    }
+    foreach ($key in $keysToRemove) {
+        $Script:ThreatResponseQueue.Remove($key)
+    }
+    
+    # Clean up suspension list
+    $keysToRemove = @()
+    foreach ($pid in $Script:ProcessSuspensionList.Keys) {
+        $entry = $Script:ProcessSuspensionList[$pid]
+        if ((Get-Date) - $entry.Time -gt [TimeSpan]::FromMinutes(10)) {
+            $keysToRemove += $pid
+        }
+    }
+    foreach ($pid in $keysToRemove) {
+        $Script:ProcessSuspensionList.Remove($pid)
+    }
+    
+    return $processed
+}
+
+# ============================================
+# RATE-LIMITED API CALLS
+# ============================================
+function Invoke-RateLimitedRestMethod {
+    param(
+        [string]$Uri,
+        [string]$Method = "Get",
+        [hashtable]$Body = $null,
+        [int]$TimeoutSec = 10
+    )
+    
+    $timeSinceLastCall = (Get-Date) - $Script:LastAPICall
+    $requiredDelay = $Config.APIRateLimitMs
+    
+    if ($timeSinceLastCall.TotalMilliseconds -lt $requiredDelay) {
+        Start-Sleep -Milliseconds ($requiredDelay - $timeSinceLastCall.TotalMilliseconds)
+    }
+    
+    $Script:LastAPICall = Get-Date
+    
+    for ($retry = 0; $retry -lt $Config.APIMaxRetries; $retry++) {
+        try {
+            if ($Body) {
+                return Invoke-RestMethod -Uri $Uri -Method $Method -Body $Body -TimeoutSec $TimeoutSec -ErrorAction Stop
+            } else {
+                return Invoke-RestMethod -Uri $Uri -Method $Method -TimeoutSec $TimeoutSec -ErrorAction Stop
+            }
+        } catch {
+            if ($retry -eq $Config.APIMaxRetries - 1) { throw }
+            Start-Sleep -Milliseconds (100 * ($retry + 1))
+        }
+    }
+}
+
+# ============================================
+# ENHANCED CACHE MANAGEMENT
+# ============================================
+function Get-CachedFileHash {
+    param([string]$FilePath)
+    
+    try {
+        $cacheKey = $FilePath.ToLower()
+        
+        if ($Script:KnownFilesCache.ContainsKey($cacheKey)) {
+            $Script:CacheHits++
+            return $Script:KnownFilesCache[$cacheKey]
+        }
+        
+        $Script:CacheMisses++
+        $hash = (Get-FileHash -Path $FilePath -Algorithm SHA256 -ErrorAction Stop).Hash
+        
+        if ($hash) {
+            if ($Script:KnownFilesCache.Count -ge $Config.MaxCacheSize) {
+                $removeCount = [math]::Floor($Config.MaxCacheSize * ($Config.CacheEvictionPercent / 100))
+                $keysToRemove = @($Script:KnownFilesCache.Keys)[0..($removeCount - 1)]
+                foreach ($key in $keysToRemove) {
+                    $Script:KnownFilesCache.Remove($key)
+                }
+                Write-AVLog "Cache evicted $removeCount entries (at max size)" "INFO"
+            }
+            $Script:KnownFilesCache[$cacheKey] = $hash
+        }
+        
+        return $hash
+    } catch {
+        return $null
+    }
+}
+
+function Invoke-CacheMaintenance {
+    try {
+        $initialCount = $Script:KnownFilesCache.Count
+        
+        if ($initialCount -gt ($Config.MaxCacheSize * 0.9)) {
+            $removeCount = [math]::Floor($initialCount * 0.2)
+            $keysToRemove = @($Script:KnownFilesCache.Keys)[0..($removeCount - 1)]
+            foreach ($key in $keysToRemove) {
+                $Script:KnownFilesCache.Remove($key)
+            }
+            Write-AVLog "Cache maintenance: removed $removeCount of $initialCount entries" "INFO"
+        }
+        
+        $hitRate = if (($Script:CacheHits + $Script:CacheMisses) -gt 0) {
+            [math]::Round(($Script:CacheHits / ($Script:CacheHits + $Script:CacheMisses)) * 100, 2)
+        } else { 0 }
+        
+        Write-AVLog "Cache stats: $($Script:KnownFilesCache.Count) entries, $hitRate% hit rate" "INFO"
+        return 0
+    } catch {
+        Write-AVLog "Cache maintenance error: $_" "ERROR"
+        return 1
+    }
+}
+
+# ============================================
+# PARALLEL SCANNING
+# ============================================
+function Invoke-ParallelScan {
+    param(
+        [string[]]$Paths,
+        [int]$MaxThreads = $Config.MaxParallelThreads
+    )
+    
+    try {
+        Write-AVLog "Starting parallel scan of $($Paths.Count) paths with $MaxThreads threads" "INFO"
+        
+        $batchSize = $Config.ParallelBatchSize
+        $allResults = @()
+        
+        for ($i = 0; $i -lt $Paths.Count; $i += $batchSize) {
+            $batch = $Paths[$i..[math]::Min($i + $batchSize - 1, $Paths.Count - 1)]
+            
+            $batchResults = $batch | ForEach-Object -ThrottleLimit $MaxThreads -Parallel {
+                $path = $_
+                try {
+                    if (Test-Path $path -ErrorAction SilentlyContinue) {
+                        $hash = (Get-FileHash -Path $path -Algorithm SHA256 -ErrorAction Stop).Hash
+                        [PSCustomObject]@{ Path = $path; Hash = $hash; Success = $true; Error = $null }
+                    } else {
+                        [PSCustomObject]@{ Path = $path; Hash = $null; Success = $false; Error = "Not found" }
+                    }
+                } catch {
+                    [PSCustomObject]@{ Path = $path; Hash = $null; Success = $false; Error = $_.Exception.Message }
+                }
+            }
+            
+            $allResults += $batchResults
+            
+            if (($i + $batchSize) -lt $Paths.Count) {
+                [System.GC]::Collect()
+            }
+        }
+        
+        $successCount = ($allResults | Where-Object Success).Count
+        Write-AVLog "Parallel scan complete: $successCount/$($Paths.Count) files processed" "INFO"
+        
+        return $allResults
+    } catch {
+        Write-AVLog "Parallel scan failed: $_" "ERROR"
+        return @()
+    }
+}
+
+# ============================================
+# SELF-PROTECTION FUNCTIONS
+# ============================================
+function Test-IsSelfOrRelated {
+    param([string]$FilePath)
+    
+    try {
+        $normalizedPath = [System.IO.Path]::GetFullPath($FilePath).ToLower()
+        $selfNormalized = [System.IO.Path]::GetFullPath($Script:SelfPath).ToLower()
+        $quarantineNormalized = [System.IO.Path]::GetFullPath($Config.QuarantinePath).ToLower()
+        
+        if ($normalizedPath -eq $selfNormalized) { return $true }
+        if ($normalizedPath.StartsWith($quarantineNormalized)) { return $true }
+        if ($normalizedPath.StartsWith($Script:SelfDirectory.ToLower())) { return $true }
+        
+        return $false
+    } catch {
+        return $true
+    }
+}
+
+function Test-CriticalSystemProcess {
+    param($Process)
+    
+    try {
+        if (-not $Process) { return $true }
+        
+        $procName = $Process.ProcessName.ToLower()
+        
+        if ($Script:CriticalSystemProcesses -contains $procName) { return $true }
+        if ($Script:MicrosoftStoreProcesses -contains $procName) { return $true }
+        if ($Script:GamingPlatformProcesses -contains $procName) { return $true }
+        if ($Script:HardwareDriverProcesses -contains $procName) { return $true }
+        if ($Script:MicrosoftOfficeProcesses -contains $procName) { return $true }
+        if ($Script:AdobeProcesses -contains $procName) { return $true }
+        if ($Script:ProductivityProcesses -contains $procName) { return $true }
+        
+        $path = $Process.Path
+        if ($path -match "\\windows\\system32\\" -or $path -match "\\windows\\syswow64\\") {
+            try {
+                $signature = Get-AuthenticodeSignature -FilePath $path -ErrorAction Stop
+                if ($signature.Status -eq "Valid" -and $signature.SignerCertificate.Subject -match "CN=Microsoft") {
+                    return $true
+                }
+            } catch {
+                return $true
+            }
+        }
+        
+        return $false
+    } catch {
+        return $true
+    }
+}
+
+function Protect-SensitiveData {
+    try {
+        if ($Script:HMACKey) {
+            [Array]::Clear($Script:HMACKey, 0, $Script:HMACKey.Length)
+            $Script:HMACKey = $null
+        }
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+        Write-AVLog "Sensitive data cleared from memory" "INFO"
+    } catch {}
+}
+
+# ============================================
+# PUA/PUP/PUM DETECTION FUNCTIONS
+# ============================================
+function Test-PUAShouldReport {
+    param([string]$Key)
+    if ($null -eq $Script:ReportedPUAItems) { $Script:ReportedPUAItems = @{} }
+    if ($Script:ReportedPUAItems.ContainsKey($Key)) { return $false }
+    $Script:ReportedPUAItems[$Key] = [DateTime]::UtcNow
+    return $true
+}
+
+function Invoke-PUADetection {
+    $detections = 0
+    try {
+        $processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | 
+            Select-Object ProcessId, Name, CommandLine, ExecutablePath
+        
+        foreach ($proc in $processes) {
+            if ($proc.ProcessId -eq $Script:SelfPID) { continue }
+            
+            $cmdLine = if ($proc.CommandLine) { $proc.CommandLine.ToLower() } else { "" }
+            $procName = if ($proc.Name) { $proc.Name.ToLower() } else { "" }
+            $procPath = if ($proc.ExecutablePath) { $proc.ExecutablePath.ToLower() } else { "" }
+            
+            foreach ($pattern in $Script:RogueSecurity) {
+                if ($cmdLine -match [regex]::Escape($pattern) -or $procName -match [regex]::Escape($pattern)) {
+                    $key = "$($proc.ProcessId)_PUA_RogueSecurity_$pattern"
+                    if (Test-PUAShouldReport -Key $key) {
+                        Write-AVLog "PUA Detected (Rogue Security): $($proc.Name) (PID: $($proc.ProcessId)) - Pattern: $pattern" "THREAT" "pua_detection.log"
+                        $Global:AntivirusState.ThreatCount++
+                        $detections++
+                        
+                        # Rogue security software is always high severity - kill if AutoKillPUA or AutoKillThreats
+                        if ($Config.AutoKillPUA -or $Config.AutoKillThreats) {
+                            try {
+                                Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+                                Write-AVLog "Terminated rogue security software: $($proc.Name) (PID: $($proc.ProcessId))" "INFO"
+                                $Global:AntivirusState.ProcessesTerminated++
+                                
+                                if ($procPath -and (Test-Path $procPath)) {
+                                    Move-ToQuarantine -Path $procPath -Reason "Rogue security software: $pattern"
+                                }
+                            } catch {}
+                        }
+                        Add-ThreatToResponseQueue -ThreatType "RogueSecurity" -ThreatPath $procPath -Severity "High"
+                    }
+                    break
+                }
+            }
+            
+            foreach ($pattern in $Script:SystemOptimizers) {
+                if ($cmdLine -match [regex]::Escape($pattern) -or $procName -match [regex]::Escape($pattern)) {
+                    $key = "$($proc.ProcessId)_PUA_Optimizer_$pattern"
+                    if (Test-PUAShouldReport -Key $key) {
+                        Write-AVLog "PUA Detected (System Optimizer): $($proc.Name) (PID: $($proc.ProcessId)) - Pattern: $pattern" "WARN" "pua_detection.log"
+                        $detections++
+                        
+                        # Kill system optimizers if AutoKillPUA is enabled
+                        if ($Config.AutoKillPUA) {
+                            try {
+                                Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+                                Write-AVLog "Terminated system optimizer: $($proc.Name) (PID: $($proc.ProcessId))" "INFO"
+                                $Global:AntivirusState.ProcessesTerminated++
+                            } catch {}
+                        }
+                    }
+                    break
+                }
+            }
+            
+            foreach ($pattern in $Script:CryptoMiners) {
+                if ($cmdLine -match [regex]::Escape($pattern) -or $procName -match [regex]::Escape($pattern)) {
+                    $key = "$($proc.ProcessId)_PUA_Miner_$pattern"
+                    if (Test-PUAShouldReport -Key $key) {
+                        Write-AVLog "CRYPTO MINER Detected: $($proc.Name) (PID: $($proc.ProcessId)) - Pattern: $pattern" "THREAT" "pua_detection.log"
+                        $Global:AntivirusState.ThreatCount++
+                        $detections++
+                        
+                        if ($Config.AutoKillCryptoMiners) {
+                            try {
+                                Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+                                Write-AVLog "Terminated crypto miner: $($proc.Name) (PID: $($proc.ProcessId))" "INFO"
+                                $Global:AntivirusState.ProcessesTerminated++
+                            } catch {}
+                        }
+                    }
+                    break
+                }
+            }
+        }
+        
+        if ($detections -gt 0) {
+            Write-AVLog "PUA Detection: Found $detections potentially unwanted applications" "WARN"
+        }
+    } catch {
+        Write-AVLog "PUA Detection error: $_" "ERROR"
+    }
+    return $detections
+}
+
+function Invoke-PUPDetection {
+    $detections = 0
+    try {
+        $scanPaths = @(
+            "$env:TEMP",
+            "$env:LOCALAPPDATA\Temp",
+            "$env:USERPROFILE\Downloads",
+            "$env:USERPROFILE\Desktop"
+        )
+        
+        $suspiciousExtensions = @(".exe", ".dll", ".ps1", ".vbs", ".bat", ".cmd", ".scr", ".pif", ".com")
+        
+        foreach ($basePath in $scanPaths) {
+            if (-not (Test-Path $basePath)) { continue }
+            
+            try {
+                $files = Get-ChildItem -Path $basePath -File -ErrorAction SilentlyContinue |
+                    Where-Object { $suspiciousExtensions -contains $_.Extension.ToLower() }
+                
+                foreach ($file in $files) {
+                    if ($file.CreationTime -gt (Get-Date).AddHours(-24)) {
+                        $key = "PUP_File_$($file.FullName)"
+                        if (Test-PUAShouldReport -Key $key) {
+                            Write-AVLog "PUP: New executable in monitored folder: $($file.FullName)" "WARN" "pup_detection.log"
+                            $detections++
+                            
+                            # Quarantine unsigned executables from temp/download folders
+                            if ($Config.AutoQuarantine) {
+                                try {
+                                    $sig = Get-AuthenticodeSignature -FilePath $file.FullName -ErrorAction SilentlyContinue
+                                    if ($sig.Status -ne "Valid") {
+                                        Move-ToQuarantine -Path $file.FullName -Reason "Unsigned PUP in monitored folder"
+                                        Write-AVLog "PUP: Quarantined unsigned file: $($file.FullName)" "INFO"
+                                        $Global:AntivirusState.FilesQuarantined++
+                                    }
+                                } catch {}
+                            }
+                        }
+                    }
+                }
+            } catch {}
+        }
+        
+        $registryPaths = @(
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+        )
+        
+        foreach ($regPath in $registryPaths) {
+            if (-not (Test-Path $regPath)) { continue }
+            
+            try {
+                $entries = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
+                $properties = $entries.PSObject.Properties | Where-Object { $_.Name -notmatch "^PS" }
+                
+                foreach ($prop in $properties) {
+                    $value = $prop.Value
+                    if ($value -match "\\temp\\|\\downloads\\|%temp%") {
+                        $key = "PUP_Reg_$($regPath)_$($prop.Name)"
+                        if (Test-PUAShouldReport -Key $key) {
+                            Write-AVLog "PUP: Suspicious startup entry: $($prop.Name) = $value" "WARN" "pup_detection.log"
+                            $detections++
+                            $Global:AntivirusState.ThreatCount++
+                            
+                            # Remove suspicious startup entries from temp/downloads
+                            if ($Config.AutoKillThreats) {
+                                try {
+                                    Remove-ItemProperty -Path $regPath -Name $prop.Name -Force -ErrorAction SilentlyContinue
+                                    Write-AVLog "PUP: REMOVED suspicious startup entry: $($prop.Name)" "INFO"
+                                    
+                                    # Also quarantine the referenced executable if it exists
+                                    $exePath = $value -replace '^"([^"]+)".*', '$1' -replace "^'([^']+)'.*", '$1'
+                                    if ($exePath -and (Test-Path $exePath)) {
+                                        Move-ToQuarantine -Path $exePath -Reason "PUP startup executable"
+                                    }
+                                } catch {
+                                    Write-AVLog "PUP: Failed to remove entry $($prop.Name): $_" "WARN"
+                                }
+                            }
+                            Add-ThreatToResponseQueue -ThreatType "PUPStartup" -ThreatPath "$regPath\$($prop.Name)" -Severity "Medium"
+                        }
+                    }
+                }
+            } catch {}
+        }
+        
+        if ($detections -gt 0) {
+            Write-AVLog "PUP Detection: Found $detections potentially unwanted programs" "WARN"
+        }
+    } catch {
+        Write-AVLog "PUP Detection error: $_" "ERROR"
+    }
+    return $detections
+}
+
+function Invoke-PUMDetection {
+    $detections = 0
+    try {
+        $drivers = Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue |
+            Where-Object { $_.State -eq "Running" }
+        
+        foreach ($drv in $drivers) {
+            if ($drv.PathName) {
+                $pathLower = $drv.PathName.ToLower()
+                
+                if ($pathLower -notmatch "system32\\drivers|windows\\system32|windows\\syswow64") {
+                    $key = "PUM_Drv_$($drv.Name)"
+                    if (Test-PUAShouldReport -Key $key) {
+                        Write-AVLog "PUM: Non-standard driver path: $($drv.Name) - $($drv.PathName)" "WARN" "pum_detection.log"
+                        $detections++
+                    }
+                }
+            }
+        }
+        
+        $browserHijackPaths = @(
+            "HKCU:\Software\Microsoft\Internet Explorer\Main",
+            "HKLM:\Software\Microsoft\Internet Explorer\Main"
+        )
+        
+        foreach ($path in $browserHijackPaths) {
+            if (-not (Test-Path $path)) { continue }
+            try {
+                $startPage = (Get-ItemProperty -Path $path -Name "Start Page" -ErrorAction SilentlyContinue)."Start Page"
+                if ($startPage -and $startPage -notmatch "msn\.com|microsoft\.com|bing\.com|google\.com|about:blank") {
+                    $key = "PUM_Browser_$path"
+                    if (Test-PUAShouldReport -Key $key) {
+                        Write-AVLog "PUM: Modified browser start page: $startPage" "WARN" "pum_detection.log"
+                        $detections++
+                        $Global:AntivirusState.ThreatCount++
+                        
+                        # Reset hijacked browser start page
+                        if ($Config.AutoKillThreats) {
+                            try {
+                                Set-ItemProperty -Path $path -Name "Start Page" -Value "about:blank" -ErrorAction SilentlyContinue
+                                Write-AVLog "PUM: RESET hijacked browser start page to about:blank" "INFO"
+                            } catch {
+                                Write-AVLog "PUM: Failed to reset start page: $_" "WARN"
+                            }
+                        }
+                        Add-ThreatToResponseQueue -ThreatType "BrowserHijack" -ThreatPath $startPage -Severity "Medium"
+                    }
+                }
+            } catch {}
+        }
+        
+        if ($detections -gt 0) {
+            Write-AVLog "PUM Detection: Found and handled $detections potentially unwanted modifications" "WARN"
+        }
+    } catch {
+        Write-AVLog "PUM Detection error: $_" "ERROR"
+    }
+    return $detections
+}
+
+function Invoke-WMIPhoneHomeDetection {
+    $detections = 0
+    $protectedProcesses = @('System', 'Idle', 'Registry', 'smss', 'csrss', 'wininit', 'services', 'lsass', 'svchost', 'winlogon', 'explorer', 'dwm')
+    
+    try {
+        $connections = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue
+        
+        foreach ($conn in $connections) {
+            $remoteIP = $conn.RemoteAddress
+            $remotePort = $conn.RemotePort
+            $localPort = $conn.LocalPort
+            $owningPid = $conn.OwningProcess
+            
+            if ($Script:SuspiciousPorts -contains $remotePort -or $Script:SuspiciousPorts -contains $localPort) {
+                $proc = Get-Process -Id $owningPid -ErrorAction SilentlyContinue
+                $key = "WMIPhone_${owningPid}_${remoteIP}_${remotePort}"
+                
+                if (Test-PUAShouldReport -Key $key) {
+                    Write-AVLog "Suspicious network connection: $($proc.Name) (PID: $owningPid) -> ${remoteIP}:${remotePort}" "THREAT" "wmi_phonehome.log"
+                    $Global:AntivirusState.ThreatCount++
+                    $detections++
+                    
+                    # Take action on suspicious connections
+                    if ($Config.AutoKillThreats -and $proc -and $proc.Name -notin $protectedProcesses) {
+                        # Kill the process making suspicious connection
+                        try {
+                            Stop-Process -Id $owningPid -Force -ErrorAction SilentlyContinue
+                            Write-AVLog "WMI Phone Home: KILLED process $($proc.Name) (PID: $owningPid) for suspicious connection" "INFO"
+                            $Global:AntivirusState.ProcessesTerminated++
+                        } catch {}
+                        
+                        # Block the suspicious IP with firewall
+                        try {
+                            $ruleName = "Block_WMIPhoneHome_$($remoteIP -replace ':', '_')"
+                            $existing = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+                            if (-not $existing) {
+                                New-NetFirewallRule -DisplayName $ruleName -Direction Outbound -RemoteAddress $remoteIP -Action Block -Profile Any -ErrorAction SilentlyContinue | Out-Null
+                                Write-AVLog "WMI Phone Home: BLOCKED suspicious IP $remoteIP" "INFO"
+                            }
+                        } catch {}
+                    }
+                    Add-ThreatToResponseQueue -ThreatType "WMIPhoneHome" -ThreatPath "$($proc.Name)|$remoteIP|$remotePort" -Severity "High"
+                }
+            }
+            
+            if ($owningPid -gt 0) {
+                $proc = Get-Process -Id $owningPid -ErrorAction SilentlyContinue
+                if ($proc -and $Script:WMIProcesses -contains $proc.Name.ToLower()) {
+                    if ($remoteIP -notin @("127.0.0.1", "::1", "0.0.0.0")) {
+                        $key = "WMIPhone_WMI_${owningPid}_${remoteIP}"
+                        if (Test-PUAShouldReport -Key $key) {
+                            Write-AVLog "WMI process with external connection: $($proc.Name) -> $remoteIP" "WARN" "wmi_phonehome.log"
+                            $detections++
+                            
+                            # Block external WMI connections
+                            if ($Config.AutoKillThreats) {
+                                try {
+                                    $ruleName = "Block_WMIExternal_$($remoteIP -replace ':', '_')"
+                                    $existing = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+                                    if (-not $existing) {
+                                        New-NetFirewallRule -DisplayName $ruleName -Direction Outbound -RemoteAddress $remoteIP -Action Block -Profile Any -ErrorAction SilentlyContinue | Out-Null
+                                        Write-AVLog "WMI Phone Home: BLOCKED WMI external connection to $remoteIP" "INFO"
+                                    }
+                                } catch {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        if ($detections -gt 0) {
+            Write-AVLog "WMI Phone Home Detection: Found and handled $detections suspicious connections" "WARN"
+        }
+    } catch {
+        Write-AVLog "WMI Phone Home Detection error: $_" "ERROR"
+    }
+    return $detections
 }
 
 function Test-CirclKnownGood {
@@ -643,6 +2536,58 @@ function Monitor-Jobs {
                     catch {
                         $consecutiveErrors++
                         Write-StabilityLog "Heartbeat failed: $_" "WARN"
+                    }
+                }
+                
+                # Periodic process scan every 30 seconds (like lightweight script)
+                if ($iteration % 30 -eq 0) {
+                    try {
+                        $threatCount = 0
+                        $scannedCount = 0
+                        Write-Host "[AV] Periodic scan running..." -ForegroundColor DarkCyan
+                        
+                        Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+                            $proc = $_
+                            try {
+                                $exePath = $proc.MainModule.FileName
+                                if ($exePath -and (Test-Path $exePath)) {
+                                    $scannedCount++
+                                    $exePathLower = $exePath.ToLower()
+                                    
+                                    # Skip system locations
+                                    if ($exePathLower -match '^c:\\windows\\|^c:\\program files') { return }
+                                    
+                                    # Skip protected processes
+                                    if ($proc.Name -in $Global:RTFM_ProtectedProcesses) { return }
+                                    
+                                    # Check if from risky location and unsigned
+                                    $isRiskyPath = $exePathLower -match '\\downloads\\|\\temp\\|\\desktop\\|\\appdata\\|\\public\\'
+                                    if ($isRiskyPath) {
+                                        $isUnsigned = $true
+                                        try {
+                                            $sig = Get-AuthenticodeSignature -FilePath $exePath -ErrorAction SilentlyContinue
+                                            if ($sig.Status -eq 'Valid') { $isUnsigned = $false }
+                                        } catch { }
+                                        
+                                        if ($isUnsigned) {
+                                            $threatCount++
+                                            Write-Host "  [!] Threat: $($proc.Name) (PID $($proc.Id)) - $exePath" -ForegroundColor Red
+                                            Global:Block-ThreatExecution -FilePath $exePath -ProcessId $proc.Id -Type "PERIODIC_SCAN" -Reason "Unsigned process from risky location"
+                                        }
+                                    }
+                                }
+                            } catch { }
+                        }
+                        
+                        if ($threatCount -gt 0) {
+                            Write-Host "[AV] Periodic scan: $threatCount threats blocked" -ForegroundColor Yellow
+                        } else {
+                            Write-Host "[AV] Periodic scan complete ($scannedCount processes)" -ForegroundColor DarkGray
+                        }
+                        Write-StabilityLog "Periodic scan: $scannedCount processes, $threatCount threats"
+                    }
+                    catch {
+                        Write-StabilityLog "Periodic scan failed: $_" "WARN"
                     }
                 }
 
@@ -3069,8 +5014,11 @@ function Invoke-RansomwareDetection {
 
 function Invoke-NetworkAnomalyDetection {
     param(
-        [bool]$AutoBlockThreats = $false
+        [bool]$AutoBlockThreats = $true
     )
+    
+    # Use global config if available
+    if ($Config.AutoKillThreats) { $AutoBlockThreats = $true }
 
     try {
         # Advanced suspicious port detection with severity scoring
@@ -3884,13 +5832,25 @@ function Invoke-ClipboardMonitoring {
             
             # Log to EDR
             Write-EDRLog -Module "ClipboardMonitoring" -Message "Sensitive clipboard data detected | Score: $ThreatScore | Patterns: $($DetectedPatterns -join ', ')" -Level $severity
+            Write-AVLog "ClipboardMonitoring: THREAT ($severity) - Sensitive data in clipboard | Patterns: $($DetectedPatterns -join ', ') | Score: $ThreatScore" "THREAT"
+            $Global:AntivirusState.ThreatCount++
             
             # Queue for response engine if critical
             if ($severity -eq "Critical" -or $ThreatScore -ge 45) {
                 Add-ThreatToResponseQueue -ThreatType "ClipboardSensitiveData" -ThreatPath "Clipboard" -Severity $severity
             }
             
-            return @{Detected = $true; Score = $ThreatScore; Patterns = $DetectedPatterns; Severity = $severity}
+            # Clear clipboard for critical threats (credential/key exposure protection)
+            if ($Config.AutoKillThreats -and $severity -eq "Critical") {
+                try {
+                    Set-Clipboard -Value "" -ErrorAction SilentlyContinue
+                    Write-AVLog "ClipboardMonitoring: CLEARED clipboard containing critical sensitive data" "INFO"
+                } catch {
+                    Write-AVLog "ClipboardMonitoring: Failed to clear clipboard: $_" "WARN"
+                }
+            }
+            
+            return @{Detected = $true; Score = $ThreatScore; Patterns = $DetectedPatterns; Severity = $severity; Cleared = ($severity -eq "Critical")}
         }
 
         return @{Detected = $false; Score = 0; Patterns = @()}
@@ -5959,8 +7919,11 @@ function Invoke-FirewallRuleMonitoring {
 
 function Invoke-ServiceMonitoring {
     param(
-        [bool]$AutoBlockThreats = $false
+        [bool]$AutoBlockThreats = $true
     )
+    
+    # Use global config if available
+    if ($Config.AutoKillThreats) { $AutoBlockThreats = $true }
 
     try {
     if (-not $Global:BaselineServices) {
@@ -13051,43 +15014,320 @@ function Invoke-MitreMapping {
 # --- RealTimeFileMonitor ---
 $Script:RTFM_Watchers = @()
 $Script:RTFM_Initialized = $false
+$Script:RTFM_WMIRegistered = $false
 
 function Start-RealtimeFileMonitor {
-    $drives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Root -match '^[A-Z]:\\$' }
-    foreach ($drive in $drives) {
-        $root = $drive.Root
-        if (-not (Test-Path $root)) { continue }
+    $highRiskFolders = @(
+        "$env:USERPROFILE\Downloads",
+        "$env:USERPROFILE\Desktop",
+        "$env:TEMP",
+        "$env:APPDATA",
+        "$env:LOCALAPPDATA\Temp",
+        "C:\Users\Public"
+    )
+    
+    foreach ($folder in $highRiskFolders) {
+        if (-not (Test-Path $folder)) { continue }
         try {
-            $watcher = New-Object System.IO.FileSystemWatcher
-            $watcher.Path = $root
-            $watcher.IncludeSubdirectories = $true
-            $watcher.NotifyFilter = [System.IO.NotifyFilters]::FileName -bor [System.IO.NotifyFilters]::LastWrite
+            $watcher = New-Object System.IO.FileSystemWatcher $folder, '*.*' -Property @{
+                IncludeSubdirectories = $true
+                NotifyFilter = [System.IO.NotifyFilters]'FileName, LastWrite'
+            }
+            
             $action = {
                 $path = $Event.SourceEventArgs.FullPath
+                $changeType = $Event.SourceEventArgs.ChangeType
                 $ext = [System.IO.Path]::GetExtension($path).ToLower()
-                if ($ext -in @(".exe", ".dll", ".sys", ".winmd")) {
-                    Start-Sleep -Seconds 1
+                $monitoredExts = @('.exe', '.dll', '.sys', '.winmd', '.ps1', '.bat', '.cmd', '.vbs', '.js', '.hta', '.msi', '.scr')
+                
+                # DEBUG: Log every file event
+                $debugLog = "$env:ProgramData\Antivirus\Logs\fsw_debug.log"
+                "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|$changeType|$path" | Add-Content -Path $debugLog -ErrorAction SilentlyContinue
+                
+                if ($ext -in $monitoredExts) {
+                    Start-Sleep -Milliseconds 800
                     if (Test-Path $path) {
                         try {
                             $hash = (Get-FileHash -Path $path -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
+                            if (-not $hash) { return }
+                            
                             $logPath = "$env:ProgramData\Antivirus\Logs\realtime_monitor_$(Get-Date -Format 'yyyy-MM-dd').log"
-                            "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|Created/Changed|$path|$hash" | Add-Content -Path $logPath -ErrorAction SilentlyContinue
-                            Write-EventLog -LogName Application -Source "AntivirusEDR" -EntryType Warning -EventId 2090 -Message "REAL-TIME: $path" -ErrorAction SilentlyContinue
+                            $logDir = Split-Path $logPath -Parent
+                            if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+                            "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|SCANNING|$path|$hash" | Add-Content -Path $logPath -ErrorAction SilentlyContinue
+                            
+                            # Check cache first (use global)
+                            if ($Global:RTFM_HashCache.ContainsKey($hash)) {
+                                if (-not $Global:RTFM_HashCache[$hash]) {
+                                    Global:Block-ThreatExecution -FilePath $path -ProcessId 0 -Type "FILE" -Reason "Known threat detected in real-time"
+                                }
+                                return
+                            }
+                            
+                            # Check if file is signed
+                            $isUnsigned = $true
+                            try {
+                                $signature = Get-AuthenticodeSignature -FilePath $path -ErrorAction SilentlyContinue
+                                if ($signature.Status -eq 'Valid') { $isUnsigned = $false }
+                            } catch { }
+                            
+                            # If signed, mark as safe and skip
+                            if (-not $isUnsigned) {
+                                $Global:RTFM_HashCache[$hash] = $true
+                                return
+                            }
+                            
+                            # UNSIGNED FILE IN MONITORED (RISKY) FOLDER - QUARANTINE IT
+                            # This folder is already a risky location (Downloads, Desktop, Temp, etc.)
+                            if ($ext -in @('.exe', '.scr', '.com', '.pif')) {
+                                $Global:RTFM_HashCache[$hash] = $false
+                                Block-ThreatExecution -FilePath $path -ProcessId 0 -Type "FILE" -Reason "Unsigned executable in monitored folder"
+                                return
+                            }
+                            
+                            # For DLLs and scripts, check threat intel first
+                            $isMalicious = $false
+                            $reason = ""
+                            
+                            # MalwareBazaar check
+                            try {
+                                $mbResponse = Invoke-RestMethod -Uri "https://mb-api.abuse.ch/api/v1/" -Method Post -Body @{query='get_info';hash=$hash} -TimeoutSec 5 -ErrorAction SilentlyContinue
+                                if ($mbResponse.query_status -eq 'ok') {
+                                    $isMalicious = $true
+                                    $reason = "MalwareBazaar match"
+                                }
+                            } catch { }
+                            
+                            # For DLLs in risky locations - quarantine if unsigned
+                            if (-not $isMalicious -and $ext -in @('.dll', '.winmd')) {
+                                $isMalicious = $true
+                                $reason = "Unsigned DLL in monitored folder"
+                            }
+                            
+                            # For scripts - quarantine (but whitelist known safe temp scripts)
+                            if (-not $isMalicious -and $ext -in @('.ps1', '.bat', '.cmd', '.vbs', '.js', '.hta')) {
+                                $fileName = [System.IO.Path]::GetFileName($path)
+                                # Whitelist PowerShell policy test scripts and IDE temp scripts
+                                $safePatterns = @('__PSScriptPolicyTest_', 'ps-script-')
+                                $isSafeScript = $false
+                                foreach ($pattern in $safePatterns) {
+                                    if ($fileName.StartsWith($pattern)) { $isSafeScript = $true; break }
+                                }
+                                if (-not $isSafeScript) {
+                                    $isMalicious = $true
+                                    $reason = "Script file in monitored folder"
+                                }
+                            }
+                            
+                            if ($isMalicious) {
+                                $Global:RTFM_HashCache[$hash] = $false
+                                Block-ThreatExecution -FilePath $path -ProcessId 0 -Type "FILE" -Reason "Real-time detection: $reason"
+                            } else {
+                                $Global:RTFM_HashCache[$hash] = $true
+                            }
                         } catch { }
                     }
                 }
             }
+            
             Register-ObjectEvent $watcher Created -Action $action | Out-Null
             Register-ObjectEvent $watcher Changed -Action $action | Out-Null
             $watcher.EnableRaisingEvents = $true
             $Script:RTFM_Watchers += $watcher
+            Write-AVLog "RealTimeFileMonitor: Watching $folder" "INFO"
         } catch { }
     }
+}
+
+# Global variables for WMI event access
+$Global:RTFM_ProtectedProcesses = @('System', 'Idle', 'Registry', 'smss', 'csrss', 'wininit', 'services', 'lsass', 
+                                     'svchost', 'winlogon', 'explorer', 'dwm', 'fontdrvhost', 'RuntimeBroker', 'sihost', 'taskhostw')
+$Global:RTFM_QuarantinePath = "$env:ProgramData\Antivirus\Quarantine"
+$Global:RTFM_HashCache = @{}
+
+function Global:Block-ThreatExecution {
+    param([string]$FilePath, [int]$ProcessId, [string]$Type, [string]$Reason)
+    
+    # Debug: Write to console and event log immediately
+    Write-Host "[RTFM] BLOCK-THREAT: $Type | $FilePath | PID:$ProcessId | $Reason" -ForegroundColor Red
+    Write-EventLog -LogName Application -Source "AntivirusEDR" -EntryType Warning -EventId 9999 -Message "Block-ThreatExecution called: $FilePath" -ErrorAction SilentlyContinue
+    
+    $logPath = "$env:ProgramData\Antivirus\Logs\realtime_blocks_$(Get-Date -Format 'yyyy-MM-dd').log"
+    $logDir = Split-Path $logPath -Parent
+    if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+    
+    "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|$Type|$FilePath|PID:$ProcessId|$Reason" | Add-Content -Path $logPath -ErrorAction SilentlyContinue
+    
+    # Kill process if not protected
+    $procBaseName = [System.IO.Path]::GetFileNameWithoutExtension((Split-Path $FilePath -Leaf))
+    if ($procBaseName -notin $Global:RTFM_ProtectedProcesses) {
+        try {
+            Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+        } catch { }
+    }
+    
+    # Quarantine the file
+    if (Test-Path $FilePath) {
+        $fileName = [System.IO.Path]::GetFileName($FilePath)
+        $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $quarantineDest = Join-Path $Global:RTFM_QuarantinePath "${fileName}_${timestamp}"
+        
+        if (-not (Test-Path $Global:RTFM_QuarantinePath)) {
+            New-Item -ItemType Directory -Path $Global:RTFM_QuarantinePath -Force | Out-Null
+        }
+        
+        try {
+            Move-Item -Path $FilePath -Destination $quarantineDest -Force -ErrorAction Stop
+            "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|QUARANTINED|$FilePath|$quarantineDest|$Reason" | Add-Content -Path $logPath -ErrorAction SilentlyContinue
+        } catch {
+            # Try with ownership fix
+            try {
+                $acl = Get-Acl $FilePath
+                $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+                $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, "FullControl", "Allow")
+                $acl.SetAccessRule($rule)
+                Set-Acl -Path $FilePath -AclObject $acl -ErrorAction SilentlyContinue
+                Move-Item -Path $FilePath -Destination $quarantineDest -Force -ErrorAction SilentlyContinue
+            } catch { }
+        }
+    }
+    
+    Write-EventLog -LogName Application -Source "AntivirusEDR" -EntryType Error -EventId 2091 -Message "BLOCKED $Type`: $FilePath (PID $ProcessId) - $Reason" -ErrorAction SilentlyContinue
+}
+
+function Start-WMIProcessMonitor {
+    if ($Script:RTFM_WMIRegistered) { return }
+    
+    try {
+        Register-WmiEvent -Query "SELECT * FROM Win32_ProcessStartTrace" -Action {
+            $procName = $Event.SourceEventArgs.NewEvent.ProcessName
+            $procId = $Event.SourceEventArgs.NewEvent.ProcessId
+            $filePath = $procName
+            
+            # DEBUG: Log every process start to a file
+            $debugLog = "$env:ProgramData\Antivirus\Logs\wmi_debug.log"
+            "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|PROCESS_START|$procName|PID:$procId" | Add-Content -Path $debugLog -ErrorAction SilentlyContinue
+            
+            # Try to get full path
+            try {
+                $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
+                if ($proc -and $proc.Path) { $filePath = $proc.Path }
+            } catch { }
+            
+            if (-not (Test-Path $filePath)) { return }
+            
+            $procBaseName = [System.IO.Path]::GetFileNameWithoutExtension($procName)
+            if ($procBaseName -in $Global:RTFM_ProtectedProcesses) { return }
+            
+            # Skip if in Windows/Program Files (system locations)
+            $filePathLower = $filePath.ToLower()
+            if ($filePathLower -match '^c:\\windows\\|^c:\\program files') { return }
+            
+            # Check signature - if valid, skip
+            $isUnsigned = $true
+            try {
+                $signature = Get-AuthenticodeSignature -FilePath $filePath -ErrorAction SilentlyContinue
+                if ($signature.Status -eq 'Valid') { $isUnsigned = $false }
+            } catch { }
+            
+            # If signed by trusted publisher, allow it
+            if (-not $isUnsigned) { return }
+            
+            # Check hash against cache
+            $hash = (Get-FileHash -Path $filePath -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
+            if ($hash -and $Global:RTFM_HashCache.ContainsKey($hash)) {
+                if ($Global:RTFM_HashCache[$hash] -eq $true) { return }  # Known good
+                if ($Global:RTFM_HashCache[$hash] -eq $false) {
+                    Block-ThreatExecution -FilePath $filePath -ProcessId $procId -Type "EXE" -Reason "Known threat executed"
+                    return
+                }
+            }
+            
+            # Check if from risky location (Downloads, Temp, Desktop, AppData, Public)
+            $isRiskyPath = $filePathLower -match '\\downloads\\|\\temp\\|\\desktop\\|\\appdata\\|\\public\\'
+            
+            # For unsigned executables from risky paths - BLOCK IMMEDIATELY
+            if ($isRiskyPath) {
+                $Global:RTFM_HashCache[$hash] = $false
+                Block-ThreatExecution -FilePath $filePath -ProcessId $procId -Type "EXE" -Reason "Unsigned executable from risky location"
+                return
+            }
+            
+            # For other unsigned executables - check threat intel
+            if ($hash) {
+                try {
+                    $mbResponse = Invoke-RestMethod -Uri "https://mb-api.abuse.ch/api/v1/" -Method Post -Body @{query='get_info';hash=$hash} -TimeoutSec 3 -ErrorAction SilentlyContinue
+                    if ($mbResponse.query_status -eq 'ok') {
+                        $Global:RTFM_HashCache[$hash] = $false
+                        Block-ThreatExecution -FilePath $filePath -ProcessId $procId -Type "EXE" -Reason "MalwareBazaar match"
+                    } else {
+                        $Global:RTFM_HashCache[$hash] = $true  # Not found = likely safe
+                    }
+                } catch { }
+            }
+        } -ErrorAction SilentlyContinue | Out-Null
+        
+        Write-AVLog "WMI Process Monitor: Registered" "INFO"
+    } catch {
+        Write-AVLog "WMI Process Monitor: Failed to register - $_" "WARN"
+    }
+    
+    # DLL Load Monitor
+    try {
+        Register-WmiEvent -Query "SELECT * FROM Win32_ModuleLoadTrace" -Action {
+            $modulePath = $Event.SourceEventArgs.NewEvent.FileName
+            $procId = $Event.SourceEventArgs.NewEvent.ProcessId
+            
+            if (-not $modulePath -or -not (Test-Path $modulePath)) { return }
+            
+            $ext = [System.IO.Path]::GetExtension($modulePath).ToLower()
+            if ($ext -notin @('.dll', '.winmd')) { return }
+            
+            # Check signature
+            try {
+                $signature = Get-AuthenticodeSignature -FilePath $modulePath -ErrorAction SilentlyContinue
+                if ($signature.Status -eq 'Valid') { return }
+            } catch { }
+            
+            $hash = (Get-FileHash -Path $modulePath -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
+            if ($hash -and $Global:RTFM_HashCache.ContainsKey($hash)) {
+                if (-not $Global:RTFM_HashCache[$hash]) {
+                    Block-ThreatExecution -FilePath $modulePath -ProcessId $procId -Type "DLL" -Reason "Known malicious DLL loaded"
+                }
+                return
+            }
+            
+            # Quick threat intel check for unsigned DLLs in risky locations
+            $pathLower = $modulePath.ToLower()
+            $riskyPaths = @('\temp\', '\downloads\', '\appdata\local\temp\', '\public\', '\desktop\')
+            $isRisky = $false
+            foreach ($rp in $riskyPaths) {
+                if ($pathLower -like "*$rp*") { $isRisky = $true; break }
+            }
+            
+            if ($isRisky -and $hash) {
+                try {
+                    $mbResponse = Invoke-RestMethod -Uri "https://mb-api.abuse.ch/api/v1/" -Method Post -Body @{query='get_info';hash=$hash} -TimeoutSec 3 -ErrorAction SilentlyContinue
+                    if ($mbResponse.query_status -eq 'ok') {
+                        $Global:RTFM_HashCache[$hash] = $false
+                        Block-ThreatExecution -FilePath $modulePath -ProcessId $procId -Type "DLL" -Reason "MalwareBazaar match"
+                    }
+                } catch { }
+            }
+        } -ErrorAction SilentlyContinue | Out-Null
+        
+        Write-AVLog "WMI Module Load Monitor: Registered" "INFO"
+    } catch {
+        Write-AVLog "WMI Module Load Monitor: Failed to register - $_" "WARN"
+    }
+    
+    $Script:RTFM_WMIRegistered = $true
 }
 
 function Invoke-RealTimeFileMonitor {
     if (-not $Script:RTFM_Initialized) {
         Start-RealtimeFileMonitor
+        Start-WMIProcessMonitor
         $Script:RTFM_Initialized = $true
     }
     return $Script:RTFM_Watchers.Count
@@ -13098,45 +15338,236 @@ $Script:DW_AllowedVendors = @("Microsoft", "Realtek", "Dolby", "Intel", "Advance
 
 function Invoke-DriverWatcher {
     $detections = 0
+    $threats = @()
     try {
         $drivers = Get-WmiObject Win32_PnPSignedDriver -ErrorAction SilentlyContinue |
-            Select-Object DeviceName, Manufacturer, DriverProviderName, DriverVersion, InfName
+            Select-Object DeviceName, Manufacturer, DriverProviderName, DriverVersion, InfName, DriverDate
         foreach ($driver in $drivers) {
             $vendor = $driver.DriverProviderName
             if ($vendor -and $vendor -notin $Script:DW_AllowedVendors) {
-                Write-EventLog -LogName Application -Source "AntivirusEDR" -EntryType Warning -EventId 2091 -Message "DriverWatcher: Unauthorized driver $($driver.DeviceName) | Vendor: $vendor" -ErrorAction SilentlyContinue
+                $severity = "Medium"
+                $reasons = @("Non-whitelisted driver vendor: $vendor")
+                
+                # Check for recently installed drivers (within 24 hours)
+                if ($driver.DriverDate) {
+                    try {
+                        $driverDate = [DateTime]::ParseExact($driver.DriverDate.Substring(0,8), "yyyyMMdd", $null)
+                        if ($driverDate -gt (Get-Date).AddDays(-1)) {
+                            $severity = "High"
+                            $reasons += "Recently installed driver"
+                        }
+                    } catch { }
+                }
+                
+                # Check for suspicious driver names
+                $suspiciousNames = @("rootkit", "stealth", "hide", "hook", "inject", "bypass")
+                foreach ($name in $suspiciousNames) {
+                    if ($driver.DeviceName -match $name -or $driver.InfName -match $name) {
+                        $severity = "Critical"
+                        $reasons += "Suspicious driver name pattern: $name"
+                        break
+                    }
+                }
+                
+                $threats += @{
+                    DeviceName = $driver.DeviceName
+                    Vendor = $vendor
+                    InfName = $driver.InfName
+                    Severity = $severity
+                    Reasons = $reasons
+                }
+                
+                Write-EventLog -LogName Application -Source "AntivirusEDR" -EntryType Warning -EventId 2091 -Message "DriverWatcher: Unauthorized driver $($driver.DeviceName) | Vendor: $vendor | Severity: $severity" -ErrorAction SilentlyContinue
+                Write-AVLog "DriverWatcher: THREAT ($severity) - $($driver.DeviceName) | Vendor: $vendor | Reasons: $($reasons -join '; ')" "WARNING"
                 $detections++
+                
+                # Queue critical threats for response
+                if ($severity -eq "Critical" -or $severity -eq "High") {
+                    Add-ThreatToResponseQueue -ThreatType "SuspiciousDriver" -ThreatPath "Driver:$($driver.DeviceName)" -Severity $severity
+                    $Global:AntivirusState.ThreatCount++
+                    
+                    # For critical drivers, attempt to disable
+                    if ($Config.AutoKillThreats -and $severity -eq "Critical") {
+                        try {
+                            $deviceId = (Get-PnpDevice | Where-Object { $_.FriendlyName -eq $driver.DeviceName } | Select-Object -First 1).InstanceId
+                            if ($deviceId) {
+                                Disable-PnpDevice -InstanceId $deviceId -Confirm:$false -ErrorAction SilentlyContinue
+                                Write-AVLog "DriverWatcher: DISABLED critical driver - $($driver.DeviceName)" "THREAT"
+                            }
+                        } catch {
+                            Write-AVLog "DriverWatcher: Failed to disable driver $($driver.DeviceName): $_" "WARN"
+                        }
+                    }
+                }
             }
         }
         if ($detections -gt 0) {
             $logPath = "$env:ProgramData\Antivirus\Logs\DriverWatcher_$(Get-Date -Format 'yyyy-MM-dd').log"
-            "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|Found $detections non-whitelisted drivers" | Add-Content -Path $logPath -ErrorAction SilentlyContinue
-            Write-AVLog "DriverWatcher: Found $detections non-whitelisted driver(s)" "WARNING"
+            foreach ($t in $threats) {
+                "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|$($t.Severity)|$($t.DeviceName)|$($t.Vendor)|$($t.Reasons -join '; ')" | Add-Content -Path $logPath -ErrorAction SilentlyContinue
+            }
         }
     } catch { Write-AVLog "DriverWatcher error: $_" "ERROR" }
     return $detections
 }
 
 # --- CrudePayloadGuard ---
-$Script:CrudePayloadPattern = '(?i)(<script|javascript:|onerror=|onload=|alert\()'
+$Script:CrudePayloadPattern = '(?i)(<script|javascript:|onerror=|onload=|alert\(|eval\(|document\.write|\.innerHTML\s*=)'
+$Script:ProtectedProcessNames = @('System', 'Idle', 'Registry', 'smss', 'csrss', 'wininit', 'services', 'lsass', 'svchost', 'winlogon', 'explorer', 'dwm')
 
 function Invoke-CrudePayloadGuard {
     $detections = 0
     try {
-        $processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Select-Object ProcessId, Name, CommandLine
+        $processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Select-Object ProcessId, Name, CommandLine, ExecutablePath
         foreach ($proc in $processes) {
             if (-not $proc.CommandLine) { continue }
+            if ($proc.ProcessId -eq $PID -or $proc.ProcessId -eq $Script:SelfPID) { continue }
+            
+            $procBaseName = [System.IO.Path]::GetFileNameWithoutExtension($proc.Name)
+            if ($procBaseName -in $Script:ProtectedProcessNames) { continue }
+            
             if ($proc.CommandLine -match $Script:CrudePayloadPattern) {
+                $severity = "High"
+                
+                # Check for more severe patterns
+                if ($proc.CommandLine -match 'eval\(|document\.cookie|XMLHttpRequest|fetch\(' -or $proc.CommandLine.Length -gt 1000) {
+                    $severity = "Critical"
+                }
+                
                 Write-EventLog -LogName Application -Source "AntivirusEDR" -EntryType Warning -EventId 2092 -Message "CrudePayloadGuard: Potential XSS/payload in PID $($proc.ProcessId) - $($proc.Name)" -ErrorAction SilentlyContinue
+                Write-AVLog "CrudePayloadGuard: THREAT ($severity) - PID $($proc.ProcessId) | Process: $($proc.Name) | Payload detected in command line" "THREAT"
                 $detections++
+                $Global:AntivirusState.ThreatCount++
+                
+                # Take action on high/critical threats
+                if ($Config.AutoKillThreats -and $severity -in @("High", "Critical")) {
+                    try {
+                        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+                        Write-AVLog "CrudePayloadGuard: KILLED process with payload - PID $($proc.ProcessId)" "THREAT"
+                        
+                        # Quarantine the executable if path is available
+                        if ($proc.ExecutablePath -and (Test-Path $proc.ExecutablePath)) {
+                            Move-ToQuarantine -Path $proc.ExecutablePath -Reason "Crude payload detected in process"
+                        }
+                    } catch {
+                        Write-AVLog "CrudePayloadGuard: Failed to kill PID $($proc.ProcessId): $_" "WARN"
+                    }
+                }
+                
+                Add-ThreatToResponseQueue -ThreatType "CrudePayload" -ThreatPath "PID:$($proc.ProcessId)|$($proc.Name)" -Severity $severity
             }
         }
         if ($detections -gt 0) {
-            Write-AVLog "CrudePayloadGuard: Found $detections crude payload(s)" "THREAT"
+            Write-AVLog "CrudePayloadGuard: Found and handled $detections crude payload(s)" "THREAT"
         }
     } catch { Write-AVLog "CrudePayloadGuard error: $_" "ERROR" }
     return $detections
 }
+
+# ============================================
+# INTERACTIVE EXCLUSION MANAGER
+# ============================================
+function Show-ExclusionManager {
+    Write-Host "`n========================================" -ForegroundColor Cyan
+    Write-Host "       GSHIELD EXCLUSION MANAGER" -ForegroundColor Cyan
+    Write-Host "========================================`n" -ForegroundColor Cyan
+    
+    while ($true) {
+        Write-Host "[1] Add Process Exclusion" -ForegroundColor Green
+        Write-Host "[2] Add File/Path Exclusion" -ForegroundColor Green
+        Write-Host "[3] View Current Exclusions" -ForegroundColor Yellow
+        Write-Host "[4] Remove Exclusion" -ForegroundColor Red
+        Write-Host "[5] Export Whitelist" -ForegroundColor Cyan
+        Write-Host "[6] View Cache Statistics" -ForegroundColor Magenta
+        Write-Host "[7] Generate Security Report" -ForegroundColor Blue
+        Write-Host "[8] Return to Monitoring" -ForegroundColor Gray
+        Write-Host ""
+        
+        $choice = Read-Host "Select option (1-8)"
+        
+        switch ($choice) {
+            "1" {
+                $procName = Read-Host "Enter process name (e.g., myapp.exe)"
+                $reason = Read-Host "Enter reason for exclusion"
+                if ($procName) {
+                    Add-ToWhitelist -ProcessName $procName -Reason $reason -Category "UserDefined"
+                    Write-Host "[+] Process added to whitelist: $procName" -ForegroundColor Green
+                }
+            }
+            "2" {
+                $filePath = Read-Host "Enter full file path"
+                $reason = Read-Host "Enter reason for exclusion"
+                if ($filePath -and (Test-Path $filePath)) {
+                    Add-ToWhitelist -FilePath $filePath -Reason $reason -Category "UserDefined"
+                    Write-Host "[+] File added to whitelist: $filePath" -ForegroundColor Green
+                } else {
+                    Write-Host "[-] Invalid path or file not found" -ForegroundColor Red
+                }
+            }
+            "3" {
+                Write-Host "`nWhitelisted Processes:" -ForegroundColor Cyan
+                $Script:Whitelist.Processes.GetEnumerator() | ForEach-Object {
+                    Write-Host "  - $($_.Key): $($_.Value.Reason)" -ForegroundColor Gray
+                }
+                Write-Host "`nWhitelisted Files:" -ForegroundColor Cyan
+                $Script:Whitelist.Files.GetEnumerator() | ForEach-Object {
+                    Write-Host "  - $($_.Value.Path)" -ForegroundColor Gray
+                    Write-Host "    Hash: $($_.Key)" -ForegroundColor DarkGray
+                }
+                Read-Host "`nPress Enter to continue"
+            }
+            "4" {
+                $identifier = Read-Host "Enter process name, file path, or hash to remove"
+                if ($identifier) {
+                    if (Remove-FromWhitelist -Identifier $identifier) {
+                        Write-Host "[+] Removed from whitelist" -ForegroundColor Green
+                    } else {
+                        Write-Host "[-] Item not found" -ForegroundColor Red
+                    }
+                }
+            }
+            "5" {
+                $exportPath = "$($Config.ReportsPath)\whitelist_export_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+                $Script:Whitelist | ConvertTo-Json -Depth 5 | Set-Content $exportPath
+                Write-Host "[+] Whitelist exported to: $exportPath" -ForegroundColor Green
+                Read-Host "Press Enter to continue"
+            }
+            "6" {
+                $hitRate = if (($Script:CacheHits + $Script:CacheMisses) -gt 0) {
+                    [math]::Round(($Script:CacheHits / ($Script:CacheHits + $Script:CacheMisses)) * 100, 2)
+                } else { 0 }
+                Write-Host "`nCache Statistics:" -ForegroundColor Cyan
+                Write-Host "  Entries: $($Script:KnownFilesCache.Count)" -ForegroundColor Gray
+                Write-Host "  Cache Hits: $($Script:CacheHits)" -ForegroundColor Green
+                Write-Host "  Cache Misses: $($Script:CacheMisses)" -ForegroundColor Yellow
+                Write-Host "  Hit Rate: $hitRate%" -ForegroundColor $(if ($hitRate -gt 50) { "Green" } else { "Yellow" })
+                Read-Host "`nPress Enter to continue"
+            }
+            "7" {
+                $reportPath = New-SecurityReport -ReportType "Manual"
+                Write-Host "[+] Report generated" -ForegroundColor Green
+                Read-Host "Press Enter to continue"
+            }
+            "8" {
+                Write-Host "[*] Returning to monitoring..." -ForegroundColor Yellow
+                return
+            }
+            default {
+                Write-Host "[-] Invalid option" -ForegroundColor Red
+            }
+        }
+        Write-Host ""
+    }
+}
+
+# ============================================
+# CLEANUP ON EXIT
+# ============================================
+Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+    Protect-SensitiveData
+    Update-DatabaseIntegrity
+    Write-AVLog "GShield shutting down - cleanup complete" "INFO"
+} -ErrorAction SilentlyContinue | Out-Null
 
 # ===================== Main =====================
 
@@ -13152,6 +15583,18 @@ try {
 
     # Initialize directories and state
     Initialize-Directories
+    
+    # Initialize security features
+    Write-Host "[*] Initializing security features..." -ForegroundColor Cyan
+    Initialize-HMACKey
+    Initialize-WhitelistDatabase
+    
+    # Load hash database with integrity check
+    if (Test-DatabaseIntegrity) {
+        Load-HashDatabase
+    } else {
+        Write-Host "[!] Database integrity check failed - starting fresh" -ForegroundColor Yellow
+    }
 
     Write-Host "[*] Starting detection jobs...`n" -ForegroundColor Cyan
 
@@ -13240,7 +15683,19 @@ try {
         "MitreMapping",
         "RealTimeFileMonitor",
         "DriverWatcher",
-        "CrudePayloadGuard"
+        "CrudePayloadGuard",
+        "PUADetection",
+        "PUPDetection",
+        "PUMDetection",
+        "WMIPhoneHomeDetection",
+        "SecurityReport",
+        "DatabaseIntegrityCheck",
+        "CacheMaintenance",
+        "PhantomProcessKiller",
+        "KeyloggerHookDetection",
+        "AkinatorHeuristicScan",
+        "SFCDisinfectionScan",
+        "ThreatResponseEngine"
     )
 
     foreach ($modName in $moduleNames) {
@@ -13291,6 +15746,156 @@ try {
 
     Write-StabilityLog "Antivirus fully started with $($Global:AntivirusState.Jobs.Count) active jobs"
     Write-AVLog "About to enter Monitor-Jobs loop"
+
+    # Initialize real-time monitors IMMEDIATELY at startup (not as scheduled module)
+    Write-Host "`n[*] Initializing real-time protection..." -ForegroundColor Cyan
+    
+    # FileSystemWatcher setup
+    try {
+        Start-RealtimeFileMonitor
+        Write-Host "[+] FileSystemWatcher monitors active" -ForegroundColor Green
+        Write-StabilityLog "FileSystemWatcher monitors initialized"
+    } catch {
+        Write-Host "[!] FileSystemWatcher failed: $_" -ForegroundColor Yellow
+        Write-StabilityLog "FileSystemWatcher init failed: $_" "WARN"
+    }
+    
+    # WMI Process Monitor - INLINE at script level (not inside function) for proper event persistence
+    Write-Host "[*] Registering WMI process monitor..." -ForegroundColor Cyan
+    try {
+        $wmiDebugLog = "$env:ProgramData\Antivirus\Logs\wmi_debug.log"
+        "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|WMI_INIT|Starting WMI registration" | Add-Content -Path $wmiDebugLog -ErrorAction SilentlyContinue
+        
+        Register-WmiEvent -Query "SELECT * FROM Win32_ProcessStartTrace" -SourceIdentifier "ProcessStartMonitor" -Action {
+            $procName = $Event.SourceEventArgs.NewEvent.ProcessName
+            $procId = $Event.SourceEventArgs.NewEvent.ProcessId
+            $filePath = $procName
+            
+            # DEBUG: Log EVERY process start
+            $debugLog = "$env:ProgramData\Antivirus\Logs\wmi_debug.log"
+            "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|PROC_START|$procName|PID:$procId" | Add-Content -Path $debugLog -ErrorAction SilentlyContinue
+            
+            # Get full path
+            try {
+                $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
+                if ($proc -and $proc.Path) { $filePath = $proc.Path }
+            } catch { }
+            
+            if (-not (Test-Path $filePath)) { return }
+            
+            # Skip system processes
+            $protectedProcs = @('System','smss','csrss','wininit','services','lsass','svchost','dwm','explorer','taskhostw','sihost','ctfmon','RuntimeBroker','SearchHost','StartMenuExperienceHost','ShellExperienceHost','conhost','powershell','pwsh','cmd','mmc','taskmgr','regedit','notepad','code','cursor')
+            $procBaseName = [System.IO.Path]::GetFileNameWithoutExtension($procName)
+            if ($procBaseName -in $protectedProcs) { return }
+            
+            # Skip Windows/Program Files
+            $filePathLower = $filePath.ToLower()
+            if ($filePathLower -match '^c:\\windows\\|^c:\\program files') { return }
+            
+            # Check signature
+            $isUnsigned = $true
+            try {
+                $signature = Get-AuthenticodeSignature -FilePath $filePath -ErrorAction SilentlyContinue
+                if ($signature.Status -eq 'Valid') { $isUnsigned = $false }
+            } catch { }
+            
+            if (-not $isUnsigned) { return }
+            
+            # Risky location check
+            $isRiskyPath = $filePathLower -match '\\downloads\\|\\temp\\|\\desktop\\|\\appdata\\|\\public\\'
+            
+            if ($isRiskyPath) {
+                "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|BLOCKING|$filePath|PID:$procId|Unsigned from risky path" | Add-Content -Path $debugLog -ErrorAction SilentlyContinue
+                Global:Block-ThreatExecution -FilePath $filePath -ProcessId $procId -Type "EXE" -Reason "Unsigned executable from risky location"
+            }
+        } | Out-Null
+        
+        "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|WMI_INIT|ProcessStartTrace registered" | Add-Content -Path $wmiDebugLog -ErrorAction SilentlyContinue
+        Write-Host "[+] WMI ProcessStartTrace registered" -ForegroundColor Green
+        Write-StabilityLog "WMI ProcessStartTrace registered at script level"
+    } catch {
+        Write-Host "[!] WMI ProcessStart registration failed: $_" -ForegroundColor Red
+        Write-StabilityLog "WMI ProcessStart failed: $_" "ERROR"
+        "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|WMI_ERROR|ProcessStartTrace failed: $_" | Add-Content -Path "$env:ProgramData\Antivirus\Logs\wmi_debug.log" -ErrorAction SilentlyContinue
+    }
+    
+    # WMI DLL Monitor - INLINE
+    try {
+        Register-WmiEvent -Query "SELECT * FROM Win32_ModuleLoadTrace" -SourceIdentifier "ModuleLoadMonitor" -Action {
+            $modulePath = $Event.SourceEventArgs.NewEvent.ImageName
+            $procId = $Event.SourceEventArgs.NewEvent.ProcessId
+            
+            if (-not (Test-Path $modulePath)) { return }
+            
+            $modulePathLower = $modulePath.ToLower()
+            if ($modulePathLower -match '^c:\\windows\\|^c:\\program files') { return }
+            if ($modulePathLower -notmatch '\.dll$') { return }
+            
+            $isRiskyPath = $modulePathLower -match '\\downloads\\|\\temp\\|\\desktop\\|\\appdata\\|\\public\\'
+            if (-not $isRiskyPath) { return }
+            
+            $isUnsigned = $true
+            try {
+                $signature = Get-AuthenticodeSignature -FilePath $modulePath -ErrorAction SilentlyContinue
+                if ($signature.Status -eq 'Valid') { $isUnsigned = $false }
+            } catch { }
+            
+            if ($isUnsigned) {
+                $debugLog = "$env:ProgramData\Antivirus\Logs\wmi_debug.log"
+                "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|DLL_BLOCK|$modulePath|PID:$procId|Unsigned DLL from risky path" | Add-Content -Path $debugLog -ErrorAction SilentlyContinue
+                Global:Block-ThreatExecution -FilePath $modulePath -ProcessId $procId -Type "DLL" -Reason "Unsigned DLL from risky location"
+            }
+        } | Out-Null
+        
+        Write-Host "[+] WMI ModuleLoadTrace registered" -ForegroundColor Green
+        Write-StabilityLog "WMI ModuleLoadTrace registered at script level"
+    } catch {
+        Write-Host "[!] WMI ModuleLoad registration failed: $_" -ForegroundColor Yellow
+        Write-StabilityLog "WMI ModuleLoad failed: $_" "WARN"
+    }
+    
+    Write-Host "[+] Real-time protection ACTIVE`n" -ForegroundColor Green
+    
+    # Initial scan of high-risk folders (like lightweight script)
+    Write-Host "[*] Performing initial scan of high-risk folders..." -ForegroundColor Cyan
+    $highRiskFolders = @(
+        "$env:USERPROFILE\Downloads",
+        "$env:USERPROFILE\Desktop",
+        "$env:TEMP",
+        "$env:LOCALAPPDATA\Temp"
+    )
+    $initialScanCount = 0
+    foreach ($folder in $highRiskFolders) {
+        if (Test-Path $folder) {
+            Get-ChildItem -Path $folder -File -ErrorAction SilentlyContinue | Where-Object {
+                $_.Extension -in @('.exe', '.dll', '.scr', '.ps1', '.bat', '.cmd', '.vbs', '.js', '.hta')
+            } | ForEach-Object {
+                $filePath = $_.FullName
+                $fileName = $_.Name
+                
+                # Skip whitelisted temp scripts
+                if ($fileName -match '^(__PSScriptPolicyTest_|ps-script-)') { return }
+                
+                # Check signature
+                $isUnsigned = $true
+                try {
+                    $sig = Get-AuthenticodeSignature -FilePath $filePath -ErrorAction SilentlyContinue
+                    if ($sig.Status -eq 'Valid') { $isUnsigned = $false }
+                } catch { }
+                
+                if ($isUnsigned) {
+                    $initialScanCount++
+                    Write-Host "  [!] Found unsigned: $fileName" -ForegroundColor Yellow
+                    Global:Block-ThreatExecution -FilePath $filePath -ProcessId 0 -Type "INITIAL_SCAN" -Reason "Unsigned file in high-risk folder"
+                }
+            }
+        }
+    }
+    if ($initialScanCount -gt 0) {
+        Write-Host "[+] Initial scan quarantined $initialScanCount files`n" -ForegroundColor Green
+    } else {
+        Write-Host "[+] Initial scan complete - no threats found`n" -ForegroundColor Green
+    }
 
     Monitor-Jobs
 }
