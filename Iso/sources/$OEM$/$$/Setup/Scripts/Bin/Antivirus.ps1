@@ -180,6 +180,10 @@ function Test-ShouldExclude {
     
     $lower = $FilePath.ToLower()
     
+    # Exclude antivirus's own folder to prevent self-quarantine
+    $avFolderLower = $Config.BaseDirectory.ToLower()
+    if ($lower -like "$avFolderLower\*" -or $lower -eq $avFolderLower) { return $true }
+    
     if ($lower -like '*\assembly\*') { return $true }
     if ($lower -like '*\winsxs\*') { return $true }
     if ($lower -like '*\microsoft.net\*') { return $true }
