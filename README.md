@@ -6,13 +6,13 @@
 
 <p align="center">
   <strong>A comprehensive Windows security hardening and protection suite</strong><br>
-  <em>Enterprise-grade EDR • 70+ Security Modules • Automated Threat Response</em>
+  <em>Enterprise-grade EDR • 95+ Security Modules • Automated Threat Response</em>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?style=flat-square&logo=windows&logoColor=white" alt="Windows"/>
   <img src="https://img.shields.io/badge/PowerShell-5.1+-5391FE?style=flat-square&logo=powershell&logoColor=white" alt="PowerShell"/>
-  <img src="https://img.shields.io/badge/Modules-70+-red?style=flat-square" alt="Modules"/>
+  <img src="https://img.shields.io/badge/Modules-95+-red?style=flat-square" alt="Modules"/>
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License"/>
 </p>
 
@@ -28,19 +28,23 @@
 
 ## 🎯 Overview
 
-**GSecurity** is a complete endpoint detection and response (EDR) solution for Windows systems. It combines 70+ security modules into a single unified PowerShell engine, providing real-time antivirus protection, network monitoring, behavioral threat detection, privacy spoofing, vulnerability patching, and comprehensive system hardening.
+**GSecurity** is a complete endpoint detection and response (EDR) solution for Windows systems. It combines 95+ security modules into a single unified PowerShell engine, providing **active threat mitigation** - not just detection, but automatic quarantine, process termination, network blocking, and system remediation. Features include real-time antivirus protection, network monitoring, behavioral threat detection, privacy spoofing, vulnerability patching, PUA/PUP detection, heuristic analysis, and comprehensive system hardening.
 
 ### ✨ Key Benefits
 
 | Feature | Description |
 |---------|-------------|
+| ⚔️ **Active Threat Mitigation** | Automatic quarantine, process termination, network blocking, and system remediation |
 | 🔒 **Multi-Layer Protection** | Real-time file monitoring, memory scanning, YARA rules, and threat intelligence |
 | 🧠 **Behavioral Analysis** | Detects focus abuse, flash attacks, cursor manipulation, and visual exploits |
 | 🕵️ **Privacy Shield** | Identity spoofing and fingerprint randomization to defeat tracking |
 | 🩹 **Auto-Patching** | Automatic CISA KEV vulnerability detection and mitigation |
-| 🌐 **Network Security** | DNS-over-HTTPS/TLS, browser traffic monitoring, and smart blocking |
-| 🔐 **Credential Protection** | Password management and security policy hardening |
-| 🎯 **MITRE ATT&CK** | Detection mapped to MITRE ATT&CK framework |
+| 🌐 **Network Security** | DNS-over-HTTPS/TLS, browser traffic monitoring, firewall blocking |
+| 🔐 **Credential Protection** | LSASS protection, credential dump blocking, and security policy hardening |
+| 🎯 **MITRE ATT&CK** | Detection and response mapped to MITRE ATT&CK framework |
+| 🔍 **Heuristic Analysis** | Akinator engine with intelligent threat scoring and behavioral patterns |
+| 🚫 **PUA/PUP Removal** | Auto-kills crypto miners, removes adware, resets browser hijacks |
+| ⚡ **Performance Optimized** | CPU throttling, parallel scanning, and intelligent caching |
 | 📦 **Easy Deployment** | Can be integrated directly into Windows installation media |
 
 ---
@@ -51,7 +55,7 @@ GSecurity uses a modular architecture where all security features are integrated
 
 | Component | Description |
 |-----------|-------------|
-| 🦠 **Antivirus.ps1** | The main EDR engine with 70+ integrated security modules |
+| 🦠 **Antivirus.ps1** | The main EDR engine with 95+ integrated security modules |
 | 🛡️ **GSecurity.bat** | Orchestrator that applies registry hardening and triggers setup |
 | 📝 **GSecurity.reg** | Comprehensive registry security tweaks |
 | ⚙️ **Antivirus.cmd** | Installer that deploys files and creates scheduled tasks |
@@ -61,7 +65,7 @@ GSecurity uses a modular architecture where all security features are integrated
 
 ## 🚀 Security Modules
 
-GSecurity includes 70+ integrated security modules organized by category:
+GSecurity includes 95+ integrated security modules organized by category:
 
 ### 🦠 Threat Detection & Response
 
@@ -74,6 +78,19 @@ GSecurity includes 70+ integrated security modules organized by category:
 | File Entropy Detection | Detects packed/encrypted malware | 120s |
 | Attack Tools Detection | Identifies known hacking tools | 30s |
 | Ransomware Detection | Monitors for encryption behavior | 15s |
+| Akinator Heuristic Scan | AI-like threat scoring with behavioral patterns | 120s |
+| Threat Response Engine | Automated response to detected threats | 10s |
+| Parallel Scan | Multi-threaded file scanning for performance | 300s |
+
+### 🚫 PUA/PUP Detection
+
+| Module | Description | Interval |
+|--------|-------------|----------|
+| PUA Detection | Potentially Unwanted Applications (RATs, miners) | 180s |
+| PUP Detection | Potentially Unwanted Programs (toolbars, adware) | 180s |
+| PUM Detection | Potentially Unwanted Modifications (hijacked settings) | 180s |
+| Phantom Process Killer | Terminates hidden/orphaned malicious processes | 30s |
+| WMI Phone Home Detection | Detects WMI-based telemetry abuse | 30s |
 
 ### 🧠 Behavioral Analysis
 
@@ -85,6 +102,7 @@ GSecurity includes 70+ integrated security modules organized by category:
 | Suspicious Parent-Child Detection | Abnormal process relationships | 45s |
 | LOLBin Detection | Living-off-the-land binary abuse | 15s |
 | AMSI Bypass Detection | PowerShell/script evasion attempts | 15s |
+| Keylogger Hook Detection | Detects keyboard hook injection | 60s |
 
 ### 🔐 Credential & Access Security
 
@@ -151,6 +169,9 @@ GSecurity includes 70+ integrated security modules organized by category:
 | Shadow Copy Monitoring | VSS manipulation detection | 30s |
 | Firewall Rule Monitoring | Unauthorized rule changes | 120s |
 | ASR Rules | Attack Surface Reduction | 86400s |
+| SFC Disinfection Scan | System File Checker integrity restoration | 300s |
+| Database Integrity Check | Validates security database integrity (HMAC) | 300s |
+| Cache Maintenance | Optimizes detection cache performance | 600s |
 
 ### 🩹 Vulnerability Management
 
@@ -182,6 +203,9 @@ GSecurity includes 70+ integrated security modules organized by category:
 | Script Content Scan | Malicious script detection | 120s |
 | Script Host Detection | Suspicious script execution | 60s |
 | Process Auditing | Comprehensive process logging | 86400s |
+| Security Report | Generates comprehensive security reports | 3600s |
+| IDS Detection | Intrusion Detection System alerts | 60s |
+| Honeypot Monitoring | Decoy file/folder access detection | 30s |
 
 ### 🔒 System Hardening (via GSecurity.bat)
 
@@ -218,7 +242,7 @@ cd GSecurity
 # Navigate to scripts directory
 cd Iso\sources\$OEM$\$$\Setup\Scripts\Bin
 
-# Run the EDR engine directly (all 70+ modules included)
+# Run the EDR engine directly (all 95+ modules included)
 powershell -ExecutionPolicy Bypass -File .\Antivirus.ps1
 ```
 
@@ -250,7 +274,7 @@ See [Windows ISO Integration](#-windows-iso-integration) for automated deploymen
 
 ### 🦠 Antivirus.ps1 — The Main EDR Engine
 
-**Comprehensive Endpoint Detection & Response with 70+ Integrated Modules**
+**Comprehensive Endpoint Detection & Response with 95+ Integrated Modules**
 
 ```powershell
 # Run the EDR engine (starts all security modules)
@@ -270,25 +294,73 @@ Get-Content "C:\ProgramData\Antivirus\Logs\stability_log.txt"
 
 ```powershell
 $Config = @{
+    # Core Settings
     AutoKillThreats = $true       # Automatically terminate malicious processes
     AutoQuarantine = $true        # Automatically quarantine threats
     MaxMemoryUsageMB = 500        # Memory usage limit
     EnableUnsignedDLLScanner = $true  # Scan for suspicious unsigned DLLs
+    
+    # Database & Cache
+    MaxDatabaseEntries = 50000    # Maximum hash database entries
+    DatabaseCleanupDays = 30      # Days before old entries are cleaned
+    MaxCacheSize = 10000          # Maximum cache entries
+    
+    # Performance
+    MaxParallelThreads = 8        # Threads for parallel scanning
+    EnableCPUThrottling = $true   # Enable CPU usage throttling
+    CPUThrottleThreshold = 85     # Throttle when CPU exceeds this %
+    
+    # PUA/PUP Response
+    AutoKillPUA = $false          # Auto-kill potentially unwanted apps
+    AutoKillCryptoMiners = $true  # Auto-kill crypto miners
+    
+    # Heuristic Analysis (Akinator)
+    AkinatorEnabled = $true       # Enable heuristic scanning
+    AkinatorMaliciousThreshold = 15   # Score threshold for malicious
+    AkinatorQuarantineThreshold = 25  # Score threshold for quarantine
+    
+    # Threat Response
+    ThreatResponseEnabled = $true     # Enable automated response
+    SuspendOnMediumThreat = $true     # Suspend processes on medium threats
+    KillOnHighThreat = $true          # Kill processes on high threats
 }
 ```
 
+**Reactive Threat Response:**
+
+GSecurity implements **active threat mitigation**, not just detection and logging. When threats are detected, the following actions are taken automatically:
+
+| Threat Type | Reactive Actions |
+|-------------|------------------|
+| **Malicious Files** | Quarantine file, terminate using processes, block hash |
+| **Crypto Miners** | Kill process, quarantine executable, log to threat DB |
+| **Rogue Security** | Kill process, quarantine, add to response queue |
+| **Ransomware** | Kill process, block file operations, alert user |
+| **Fileless Malware** | Terminate PowerShell/WMI process, log encoded command |
+| **Network Threats** | Block IP via firewall, terminate suspicious connection |
+| **LOLBin Abuse** | Kill process, log command line for investigation |
+| **Credential Dumping** | Kill process, protect LSASS, block access |
+| **PUA/PUP** | Kill process, remove startup entries, reset browser hijacks |
+| **WMI Persistence** | Remove malicious WMI filters/consumers/bindings |
+| **Scheduled Task Malware** | Disable and remove malicious scheduled tasks |
+| **Suspicious Drivers** | Disable driver, add to threat queue |
+| **Clipboard Data Theft** | Clear clipboard containing critical sensitive data |
+
 **Module Timing Configuration:**
 
-All 70+ modules run on configurable intervals. Key intervals include:
+All 95+ modules run on configurable intervals. Key intervals include:
 
 | Module Category | Default Interval |
 |-----------------|------------------|
 | Real-time protection (GFocus, Subliminal) | 2-5 seconds |
 | Threat detection (Hash, YARA, Ransomware) | 15-30 seconds |
 | Behavioral analysis (Process, Network) | 15-60 seconds |
+| PUA/PUP detection | 30-180 seconds |
 | System monitoring (Services, Firewall) | 60-120 seconds |
-| Heavy scans (Rootkit, File Integrity) | 180-300 seconds |
-| Scheduled tasks (CVE Patcher, Auditing) | 3600-86400 seconds |
+| Heuristic analysis (Akinator) | 120 seconds |
+| Heavy scans (Rootkit, File Integrity, SFC) | 180-300 seconds |
+| Maintenance (Cache, Database, Parallel) | 300-600 seconds |
+| Reports & scheduled tasks (CVE, Auditing) | 3600-86400 seconds |
 
 ---
 
@@ -357,6 +429,8 @@ Antivirus.cmd
 | Quarantine | `C:\ProgramData\Antivirus\Quarantine\` | Isolated threats |
 | Hash Database | `C:\ProgramData\Antivirus\Data\known_files.db` | Cached file verdicts |
 | Whitelist | `C:\ProgramData\Antivirus\Data\whitelist.json` | Allowed files/paths |
+| DB Integrity | `C:\ProgramData\Antivirus\Data\db_integrity.hmac` | Database integrity HMAC |
+| Reports | `C:\ProgramData\Antivirus\Reports\` | Security reports (hourly) |
 
 ---
 
@@ -462,7 +536,7 @@ GSecurity/
             ├── 📁 $$/Setup/Scripts/
             │   ├── 📄 SetupComplete.cmd    # Post-install trigger
             │   └── 📁 Bin/
-            │       ├── 🦠 Antivirus.ps1    # Main EDR engine (70+ modules)
+            │       ├── 🦠 Antivirus.ps1    # Main EDR engine (95+ modules)
             │       ├── 🛡️ GSecurity.bat    # Registry hardening orchestrator
             │       ├── ⚙️ Antivirus.cmd    # Installer & system hardening
             │       ├── 📝 GSecurity.reg    # Security registry tweaks
@@ -486,11 +560,11 @@ C:\ProgramData\Antivirus/
 │   └── 📄 stability_log.txt         # Module health log
 ├── 📁 Quarantine/                   # Isolated threats
 ├── 📁 Data/
-│   ├── 📄 known_files.db            # Hash verdict cache
+│   ├── 📄 known_files.db            # Hash verdict cache (50k max entries)
 │   ├── 📄 whitelist.json            # Allowed files/paths
-│   └── 📄 db_integrity.hmac         # Database integrity
-├── 📁 Reports/                      # Generated reports
-├── 🦠 Antivirus.ps1                 # Main EDR engine
+│   └── 📄 db_integrity.hmac         # Database integrity HMAC
+├── 📁 Reports/                      # Security reports (hourly, 30-day retention)
+├── 🦠 Antivirus.ps1                 # Main EDR engine (95+ modules)
 ├── ⚙️ Antivirus.cmd                 # Installer script
 ├── 📋 Antivirus.xml                 # Scheduled task
 └── 📝 GSecurity.reg                 # Registry tweaks
@@ -510,6 +584,8 @@ C:\ProgramData\Antivirus/
 | 🌐 **Network Blocking** | GFocus module may block browser connections |
 | 🔐 **Permission Changes** | Critical system files have permissions hardened |
 | 🛡️ **SMB Disabled** | LanmanWorkstation/Server disabled (may affect network shares) |
+| 🚫 **PUA Detection** | May flag legitimate remote access tools (TeamViewer, AnyDesk, etc.) |
+| ⛏️ **Crypto Miner Auto-Kill** | Crypto miners are terminated automatically by default |
 
 ### ✅ Best Practices
 
@@ -529,6 +605,8 @@ C:\ProgramData\Antivirus/
 | **Local Processing** | All behavioral analysis, monitoring, and blocking happens locally |
 | **Privacy Spoofing** | PrivacyForge module generates fake identities to protect real data |
 | **DNS Encryption** | All DNS queries encrypted via DoH/DoT |
+| **Intelligent Caching** | Hash verdicts cached locally to minimize external API calls |
+| **Rate Limiting** | API calls throttled (100ms delay) to prevent fingerprinting |
 
 ---
 
@@ -538,18 +616,28 @@ Since all modules are integrated into a single engine, resources are shared effi
 
 | Metric | Idle | Active Scan | Peak |
 |--------|------|-------------|------|
-| **CPU** | < 2% | 5-10% | < 15% |
-| **RAM** | ~100 MB | ~200 MB | < 500 MB* |
+| **CPU** | < 2% | 5-10% | < 15%* |
+| **RAM** | ~100 MB | ~200 MB | < 500 MB** |
 | **Disk I/O** | Minimal | Medium | Medium |
 
-*\*Configurable via `MaxMemoryUsageMB` setting*
+*\*CPU throttling automatically activates above 85% (configurable)*
+*\*\*Configurable via `MaxMemoryUsageMB` setting*
+
+**Performance Optimizations:**
+
+- **CPU Throttling** — Automatically pauses scans when CPU exceeds threshold
+- **Parallel Scanning** — Multi-threaded file scanning (up to 8 threads)
+- **Intelligent Caching** — LRU cache with 10,000 entries to avoid redundant API calls
+- **Rate-Limited APIs** — 100ms delay between threat intel API calls
+- **Cache Maintenance** — Automatic cleanup of stale cache entries
 
 **Module Scheduling:**
 
 - High-frequency modules (2-5s): GFocus, device guardians, subliminal detection
-- Medium-frequency (15-60s): Threat detection, behavioral analysis
-- Low-frequency (120-300s): Deep scans, integrity checks
-- Scheduled (3600s+): CVE patching, auditing
+- Medium-frequency (15-60s): Threat detection, behavioral analysis, PUA/PUP
+- Low-frequency (120-300s): Deep scans, integrity checks, heuristics
+- Maintenance (300-600s): Cache cleanup, database integrity, parallel scans
+- Scheduled (3600s+): CVE patching, reports, auditing
 
 The staggered intervals ensure consistent performance without CPU spikes.
 
@@ -622,6 +710,43 @@ ipconfig /flushdns
 
 # Verify configuration
 ipconfig /all | findstr "DNS"
+```
+
+### PUA/PUP False Positives
+
+```powershell
+# Disable auto-kill for PUA (keeps detection but won't terminate)
+# Edit Antivirus.ps1 and set:
+# AutoKillPUA = $false
+
+# Whitelist a specific application
+$whitelist = Get-Content "C:\ProgramData\Antivirus\Data\whitelist.json" | ConvertFrom-Json
+$whitelist.Processes += @{ Name = "myapp.exe"; Reason = "Legitimate tool" }
+$whitelist | ConvertTo-Json -Depth 3 | Set-Content "C:\ProgramData\Antivirus\Data\whitelist.json"
+```
+
+### Performance Issues (CPU Throttling)
+
+```powershell
+# Adjust CPU throttling threshold (default 85%)
+# Edit Antivirus.ps1 and modify:
+# CPUThrottleThreshold = 90    # Higher = less throttling
+# CPUThrottleDelayMs = 1000    # Lower = shorter pauses
+
+# Disable CPU throttling entirely (not recommended)
+# EnableCPUThrottling = $false
+```
+
+### Heuristic Analysis (Akinator) Tuning
+
+```powershell
+# Adjust sensitivity thresholds
+# Edit Antivirus.ps1:
+# AkinatorMaliciousThreshold = 20   # Higher = fewer detections
+# AkinatorQuarantineThreshold = 30  # Higher = fewer auto-quarantines
+
+# Disable heuristic scanning entirely
+# AkinatorEnabled = $false
 ```
 
 ### Uninstalling GSecurity
