@@ -55,7 +55,6 @@ $Script:ManagedJobConfig = @{
     BeaconDetectionIntervalSeconds = 60
     CodeInjectionDetectionIntervalSeconds = 30
     DataExfiltrationDetectionIntervalSeconds = 30
-    ElfCatcherIntervalSeconds = 30
     FileEntropyDetectionIntervalSeconds = 120
     HoneypotMonitoringIntervalSeconds = 30
     LateralMovementDetectionIntervalSeconds = 30
@@ -64,7 +63,6 @@ $Script:ManagedJobConfig = @{
     ReflectiveDLLInjectionDetectionIntervalSeconds = 30
     ResponseEngineIntervalSeconds = 10
     PrivacyForgeSpoofingIntervalSeconds = 60
-    ElfDLLUnloaderIntervalSeconds = 10
     UnsignedDLLRemoverIntervalSeconds = 300
     YaraDetectionIntervalSeconds = 120
     IdsDetectionIntervalSeconds = 60
@@ -75,7 +73,6 @@ $Script:ManagedJobConfig = @{
     LocalProxyDetectionIntervalSeconds = 60
     ScriptContentScanIntervalSeconds = 120
     ScriptHostDetectionIntervalSeconds = 60
-    NeuroBehaviorMonitorIntervalSeconds = 15
     StartupPersistenceDetectionIntervalSeconds = 120
     SuspiciousParentChildDetectionIntervalSeconds = 45
     ScriptBlockLoggingCheckIntervalSeconds = 86400
@@ -1149,6 +1146,38 @@ function Stop-ThreatProcess {
     param([int]$ProcessId, [string]$ProcessName)
     
     if ($ProcessId -eq $PID -or $ProcessId -eq $Script:SelfPID) { return }
+    
+    # Critical system processes that must NEVER be terminated
+    $ProtectedProcessNames = @(
+        'System', 'Idle', 'Registry', 'smss', 'csrss', 'wininit', 'services', 
+        'lsass', 'svchost', 'winlogon', 'explorer', 'dwm', 'fontdrvhost',
+        'RuntimeBroker', 'sihost', 'taskhostw', 'SearchIndexer', 'spoolsv',
+        'WmiPrvSE', 'dllhost', 'conhost', 'ctfmon', 'SecurityHealthService',
+        'MsMpEng', 'NisSrv', 'audiodg', 'dasHost', 'WUDFHost', 'SearchHost',
+        'StartMenuExperienceHost', 'ShellExperienceHost', 'TextInputHost'
+    )
+    
+    # Check if process name matches protected list (case-insensitive)
+    $procNameClean = $ProcessName -replace '\.exe$', ''
+    if ($ProtectedProcessNames -contains $procNameClean) {
+        Write-AVLog "BLOCKED: Refusing to terminate protected system process: $ProcessName (PID: $ProcessId)" "WARN"
+        return
+    }
+    
+    # Additional check: verify process path is not in Windows directory for critical names
+    try {
+        $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if ($proc -and $proc.Path) {
+            $pathLower = $proc.Path.ToLower()
+            if ($pathLower -like '*\windows\system32\*' -or $pathLower -like '*\windows\syswow64\*') {
+                # Extra caution for system directory processes
+                if ($procNameClean -match '^(winlogon|lsass|csrss|services|smss|wininit|svchost)$') {
+                    Write-AVLog "BLOCKED: Refusing to terminate system process from Windows directory: $ProcessName (PID: $ProcessId)" "WARN"
+                    return
+                }
+            }
+        }
+    } catch { }
     
     try {
         Stop-Process -Id $ProcessId -Force -ErrorAction Stop
@@ -8205,13 +8234,7 @@ function Test-SuspiciousDLL {
         return $null
     }
     
-    # Pattern 1: _elf.dll pattern (known malicious pattern)
-    if ($dllNameLower -like '*_elf.dll' -or $dllNameLower -match '_elf') {
-        $suspicious = $true
-        $reasons += "ELF pattern DLL detected"
-    }
-    
-    # Pattern 2: Suspicious .winmd files outside Windows directory
+    # Pattern 1: Suspicious .winmd files outside Windows directory
     if ($dllNameLower -like '*.winmd' -and $DllPath -notmatch '\\Windows\\') {
         $suspicious = $true
         $reasons += "WINMD file outside Windows directory"
@@ -8261,96 +8284,6 @@ function Test-SuspiciousDLL {
     }
     
     return $null
-}
-
-function Invoke-ElfCatcher {
-    $detections = @()
-    
-    try {
-        foreach ($target in $Script:BrowserTargets) {
-            try {
-                $procs = Get-Process -Name $target -ErrorAction SilentlyContinue
-                
-                foreach ($proc in $procs) {
-                    try {
-                        # Scan all loaded modules in the process
-                        $modules = $proc.Modules | Where-Object { $_.FileName -like "*.dll" -or $_.FileName -like "*.winmd" }
-                        
-                        foreach ($mod in $modules) {
-                            try {
-                                $dllName = [System.IO.Path]::GetFileName($mod.FileName)
-                                $dllPath = $mod.FileName
-                                
-                                # Check if we've already processed this DLL
-                                $key = "$($proc.Id):$dllPath"
-                                if ($Script:ProcessedDlls.ContainsKey($key)) {
-                                    continue
-                                }
-                                
-                                # Test for suspicious DLL
-                                $result = Test-SuspiciousDLL -DllName $dllName -DllPath $dllPath -ProcessName $proc.ProcessName
-                                
-                                if ($result) {
-                                    $detections += @{
-                                        ProcessId = $proc.Id
-                                        ProcessName = $proc.ProcessName
-                                        DllName = $dllName
-                                        DllPath = $dllPath
-                                        BaseAddress = $mod.BaseAddress.ToString()
-                                        Reasons = $result.Reasons
-                                        Risk = $result.Risk
-                                    }
-                                    
-                                    # Mark as processed
-                                    $Script:ProcessedDlls[$key] = Get-Date
-                                    
-                                    Write-AVLog "ELF CATCHER: Suspicious DLL in $($proc.ProcessName) (PID: $($proc.Id)) - $dllName - $($result.Reasons -join ', ')" "THREAT" "elf_catcher_detections.log"
-                                    $Global:AntivirusState.ThreatCount++
-                                }
-                            } catch {
-                                # Module may have unloaded during iteration
-                                continue
-                            }
-                        }
-                    } catch {
-                        # Process may have exited during iteration
-                        continue
-                    }
-                }
-            } catch {
-                # Process not found, continue
-                continue
-            }
-        }
-        
-        # Periodic cleanup of processed list to prevent memory bloat
-        if ($Script:ProcessedDlls.Count -gt 1000) {
-            $oldKeys = $Script:ProcessedDlls.Keys | Where-Object {
-                ((Get-Date) - $Script:ProcessedDlls[$_]).TotalHours -gt 24
-            }
-            foreach ($key in $oldKeys) {
-                $Script:ProcessedDlls.Remove($key)
-            }
-        }
-        
-        if ($detections.Count -gt 0) {
-            $logPath = "$Script:InstallPath\Logs\ElfCatcher_$(Get-Date -Format 'yyyy-MM-dd').log"
-            $logDir = Split-Path $logPath -Parent
-            if (!(Test-Path $logDir)) {
-                New-Item -ItemType Directory -Path $logDir -Force | Out-Null
-            }
-            $detections | ForEach-Object {
-                "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|PID:$($_.ProcessId)|$($_.ProcessName)|$($_.DllName)|$($_.DllPath)|$($_.Reasons -join ';')" |
-                    Add-Content -Path $logPath -ErrorAction SilentlyContinue
-            }
-            
-            Write-AVLog "ElfCatcher detection completed: $($detections.Count) suspicious DLL(s) found" "INFO" "elf_catcher_detections.log"
-        }
-    } catch {
-        Write-AVLog "ElfCatcher error: $_" "ERROR" "elf_catcher_detections.log"
-    }
-    
-    return $detections.Count
 }
 
 $Script:ScannedFiles = @{}
@@ -9891,105 +9824,6 @@ function Invoke-PrivacyForgeSpoofClipboard {
 # These modules operate independently and do not respect whitelists or use the response engine
 # They share logs and quarantine folders with the main antivirus
 
-# ELF DLL Unloader - Actively unloads ELF DLLs from browser processes
-function Invoke-ElfDLLUnloader {
-    # This module operates independently - no whitelist checks, no response engine
-    try {
-        # Add DLL unloader C# code if not already loaded
-        if (-not ([System.Management.Automation.PSTypeName]'DLLUnloader').Type) {
-            Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class DLLUnloader {
-    [DllImport("kernel32.dll")]
-    public static extern IntPtr OpenProcess(int access, bool inherit, int pid);
-    [DllImport("kernel32.dll")]
-    public static extern IntPtr GetProcAddress(IntPtr mod, string name);
-    [DllImport("kernel32.dll")]
-    public static extern IntPtr GetModuleHandle(string name);
-    [DllImport("kernel32.dll")]
-    public static extern IntPtr CreateRemoteThread(IntPtr proc, IntPtr attr, uint stack, IntPtr start, IntPtr param, uint flags, IntPtr id);
-    [DllImport("kernel32.dll")]
-    public static extern uint WaitForSingleObject(IntPtr handle, uint ms);
-    [DllImport("kernel32.dll")]
-    public static extern bool CloseHandle(IntPtr handle);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-    public static extern bool MoveFileEx(string src, string dst, int flags);
-}
-"@
-        }
-        
-        $whitelist = @('ntdll.dll', 'kernel32.dll', 'kernelbase.dll', 'user32.dll', 'gdi32.dll', 'msvcrt.dll', 'advapi32.dll')
-        $targets = @('chrome', 'msedge', 'firefox', 'brave', 'opera', 'vivaldi', 'iexplore', 'microsoftedge', 'waterfox', 'palemoon')
-        
-        if (-not $Script:ElfDLLProcessed) {
-            $Script:ElfDLLProcessed = @{}
-        }
-        
-        $unloadedCount = 0
-        
-        foreach ($procName in $targets) {
-            $procs = Get-Process -Name $procName -ErrorAction SilentlyContinue
-            foreach ($proc in $procs) {
-                try {
-                    $hProc = [DLLUnloader]::OpenProcess(0x1F0FFF, $false, $proc.Id)
-                    if ($hProc -eq [IntPtr]::Zero) { continue }
-                    
-                    $freeLib = [DLLUnloader]::GetProcAddress([DLLUnloader]::GetModuleHandle("kernel32.dll"), "FreeLibrary")
-                    
-                    foreach ($mod in $proc.Modules) {
-                        $name = [System.IO.Path]::GetFileName($mod.FileName).ToLower()
-                        if ($whitelist -contains $name) { continue }
-                        
-                        $key = "$($proc.Id):$($mod.FileName)"
-                        if ($Script:ElfDLLProcessed.ContainsKey($key)) { continue }
-                        
-                        if ($name -like '*_elf.dll') {
-                            Write-AVLog "ELF DLL Unloader: Unloading $name from $procName (PID $($proc.Id))" "INFO" "elf_dll_unloader.log"
-                            
-                            $thread = [DLLUnloader]::CreateRemoteThread($hProc, [IntPtr]::Zero, 0, $freeLib, $mod.BaseAddress, 0, [IntPtr]::Zero)
-                            if ($thread -ne [IntPtr]::Zero) {
-                                [DLLUnloader]::WaitForSingleObject($thread, 5000) | Out-Null
-                                [DLLUnloader]::CloseHandle($thread) | Out-Null
-                                
-                                if ([DLLUnloader]::MoveFileEx($mod.FileName, $null, 4)) {
-                                    Write-AVLog "ELF DLL Unloader: Scheduled deletion on reboot: $($mod.FileName)" "INFO" "elf_dll_unloader.log"
-                                }
-                                
-                                $unloadedCount++
-                            }
-                            $Script:ElfDLLProcessed[$key] = Get-Date
-                        }
-                    }
-                    
-                    [DLLUnloader]::CloseHandle($hProc) | Out-Null
-                } catch {
-                    Write-AVLog "ELF DLL Unloader error for process $procName (PID: $($proc.Id)): $_" "WARN" "elf_dll_unloader.log"
-                }
-            }
-        }
-        
-        # Cleanup old processed entries
-        if ($Script:ElfDLLProcessed.Count -gt 1000) {
-            $oldKeys = $Script:ElfDLLProcessed.Keys | Where-Object {
-                ((Get-Date) - $Script:ElfDLLProcessed[$_]).TotalHours -gt 24
-            }
-            foreach ($key in $oldKeys) {
-                $Script:ElfDLLProcessed.Remove($key)
-            }
-        }
-        
-        if ($unloadedCount -gt 0) {
-            Write-AVLog "ELF DLL Unloader: Unloaded $unloadedCount ELF DLL(s)" "INFO" "elf_dll_unloader.log"
-        }
-        
-        return $unloadedCount
-    } catch {
-        Write-AVLog "ELF DLL Unloader error: $_" "ERROR" "elf_dll_unloader.log"
-        return 0
-    }
-}
-
 # Unsigned DLL Remover - Scans and quarantines unsigned DLLs/WINMD files
 function Invoke-UnsignedDLLRemover {
     # This module operates independently - no whitelist checks, no response engine
@@ -10866,157 +10700,6 @@ function Invoke-ScriptHostDetection {
     }
 }
 
-# --- NeuroBehaviorMonitor ---
-$Script:NBM_LastRun = [DateTime]::MinValue
-$Script:NBM_TickInterval = 1
-$Script:NBM_FocusHistory = @{}
-$Script:NBM_LastBrightness = -1
-$Script:NBM_FlashScore = 0
-$Script:NBM_LastCursorPos = @{X=0;Y=0}
-$Script:NBM_CursorFirstSeen = [DateTime]::MinValue
-$Script:NBM_CursorJitterCount = 0
-$Script:NBM_LastAvgR = -1
-$Script:NBM_LastAvgG = -1
-$Script:NBM_LastAvgB = -1
-$Script:NBM_DistortScore = 0
-$Script:NBM_ReportedItems = @{}
-$Script:NBM_TopmostAllowlist = @("explorer","taskmgr","dwm","systemsettings","applicationframehost","shellexperiencehost","searchapp","startmenuexperiencehost","msedge","chrome","firefox")
-
-function Test-NBMShouldReport {
-    param([string]$Key)
-    if ($Script:NBM_ReportedItems.ContainsKey($Key)) { return $false }
-    $Script:NBM_ReportedItems[$Key] = [DateTime]::UtcNow
-    return $true
-}
-
-function Invoke-NeuroBehaviorMonitor {
-    $now = Get-Date
-    if ($Script:NBM_LastRun -ne [DateTime]::MinValue -and ($now - $Script:NBM_LastRun).TotalSeconds -lt $Script:NBM_TickInterval) {
-        return
-    }
-    $Script:NBM_LastRun = $now
-    try {
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
-        Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
-        if (-not ([System.Management.Automation.PSTypeName]'NeuroWin32AV').Type) {
-            Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class NeuroWin32AV {
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
-    [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
-    public const int GWL_EXSTYLE = -20;
-    public const int WS_EX_TOPMOST = 0x00000008;
-}
-"@ -ErrorAction SilentlyContinue
-        }
-        $hWnd = [NeuroWin32AV]::GetForegroundWindow()
-        if ($hWnd -eq [IntPtr]::Zero) { return }
-        $fpid = 0
-        [NeuroWin32AV]::GetWindowThreadProcessId($hWnd, [ref]$fpid) | Out-Null
-        if ($fpid -eq 0) { return }
-        $proc = Get-Process -Id $fpid -ErrorAction SilentlyContinue
-        $procName = if ($proc) { $proc.ProcessName } else { "unknown" }
-        if ($procName -eq "powershell" -and $fpid -eq $PID) { return }
-
-        $bmp = [System.Drawing.Bitmap]::new(64,64)
-        $g = [System.Drawing.Graphics]::FromImage($bmp)
-        $g.CopyFromScreen(0,0,0,0,$bmp.Size)
-        $g.Dispose()
-        $sumR=0;$sumG=0;$sumB=0;$sumBright=0;$samples=0
-        for ($x=0; $x -lt 64; $x+=4) {
-            for ($y=0; $y -lt 64; $y+=4) {
-                $c = $bmp.GetPixel($x,$y)
-                $sumR+=$c.R; $sumG+=$c.G; $sumB+=$c.B
-                $sumBright+=$c.R+$c.G+$c.B
-                $samples++
-            }
-        }
-        $bmp.Dispose()
-        $n = if ($samples -gt 0) { $samples } else { 1 }
-        $avgR=$sumR/$n; $avgG=$sumG/$n; $avgB=$sumB/$n
-        $bright = $sumBright
-
-        # Focus steal detection
-        if (-not $Script:NBM_FocusHistory.ContainsKey($fpid)) { $Script:NBM_FocusHistory[$fpid]=@{Count=0;FirstSeen=[DateTime]::UtcNow} }
-        $fe = $Script:NBM_FocusHistory[$fpid]
-        $fe.Count++; $elapsed = ([DateTime]::UtcNow - $fe.FirstSeen).TotalSeconds
-        if ($elapsed -gt 10) { $fe.Count=1; $fe.FirstSeen=[DateTime]::UtcNow }
-        $Script:NBM_FocusHistory[$fpid]=$fe
-        if ($elapsed -lt 10 -and $fe.Count -gt 8) {
-            $key = "NBM_FocusAbuse:$procName"
-            if (Test-NBMShouldReport -Key $key) {
-                Write-AVLog "NeuroBehaviorMonitor: Focus abuse by $procName (PID: $fpid)" "THREAT"
-            }
-            $Script:NBM_FocusHistory[$fpid]=@{Count=0;FirstSeen=[DateTime]::UtcNow}
-        }
-
-        # Flash stimulus detection
-        if ($Script:NBM_LastBrightness -ge 0) {
-            $delta = [Math]::Abs($bright - $Script:NBM_LastBrightness)
-            if ($delta -gt 40000) { $Script:NBM_FlashScore++ } else { $Script:NBM_FlashScore = [Math]::Max(0, $Script:NBM_FlashScore - 1) }
-            if ($Script:NBM_FlashScore -ge 6) {
-                $key = "NBM_Flash:$procName"
-                if (Test-NBMShouldReport -Key $key) {
-                    Write-AVLog "NeuroBehaviorMonitor: Flash stimulus detected ($procName)" "THREAT"
-                }
-                $Script:NBM_FlashScore = 0
-            }
-        }
-        $Script:NBM_LastBrightness = $bright
-
-        # Topmost abuse detection
-        $exStyle = [NeuroWin32AV]::GetWindowLong($hWnd, [NeuroWin32AV]::GWL_EXSTYLE)
-        if (([int]$exStyle -band [NeuroWin32AV]::WS_EX_TOPMOST) -ne 0 -and $Script:NBM_TopmostAllowlist -notcontains $procName.ToLower()) {
-            $key = "NBM_Topmost:$procName"
-            if (Test-NBMShouldReport -Key $key) {
-                Write-AVLog "NeuroBehaviorMonitor: Topmost abuse by $procName (PID: $fpid)" "THREAT"
-            }
-        }
-
-        # Cursor jitter detection
-        try {
-            $pos = [System.Windows.Forms.Cursor]::Position
-            $dx = [Math]::Abs($pos.X - $Script:NBM_LastCursorPos.X)
-            $dy = [Math]::Abs($pos.Y - $Script:NBM_LastCursorPos.Y)
-            $Script:NBM_LastCursorPos = @{X=$pos.X; Y=$pos.Y}
-            if ($Script:NBM_CursorFirstSeen -eq [DateTime]::MinValue) { $Script:NBM_CursorFirstSeen = [DateTime]::UtcNow } else {
-                $elapsed2 = ([DateTime]::UtcNow - $Script:NBM_CursorFirstSeen).TotalSeconds
-                if ($elapsed2 -gt 10) { $Script:NBM_CursorJitterCount=0; $Script:NBM_CursorFirstSeen=[DateTime]::UtcNow }
-                if ($dx + $dy -gt 60) { $Script:NBM_CursorJitterCount++ }
-                if ($elapsed2 -lt 10 -and $Script:NBM_CursorJitterCount -gt 6) {
-                    $key = "NBM_Cursor:$procName"
-                    if (Test-NBMShouldReport -Key $key) { Write-AVLog "NeuroBehaviorMonitor: Cursor jitter abuse ($procName)" "THREAT" }
-                    $Script:NBM_CursorJitterCount=0; $Script:NBM_CursorFirstSeen=[DateTime]::UtcNow
-                }
-            }
-        } catch { }
-
-        # Color distortion detection
-        if ($Script:NBM_LastAvgR -ge 0) {
-            $invR = 255 - $Script:NBM_LastAvgR; $invG = 255 - $Script:NBM_LastAvgG; $invB = 255 - $Script:NBM_LastAvgB
-            $isInv = [Math]::Abs($avgR - $invR) -lt 25 -and [Math]::Abs($avgG - $invG) -lt 25 -and [Math]::Abs($avgB - $invB) -lt 25
-            $dR=[Math]::Abs($avgR - $Script:NBM_LastAvgR); $dG=[Math]::Abs($avgG - $Script:NBM_LastAvgG); $dB=[Math]::Abs($avgB - $Script:NBM_LastAvgB)
-            if ($isInv) {
-                $key = "NBM_Color:$procName"
-                if (Test-NBMShouldReport -Key $key) { Write-AVLog "NeuroBehaviorMonitor: Color distortion/inversion ($procName)" "THREAT" }
-            } else {
-                $maxD = [Math]::Max($dR, [Math]::Max($dG, $dB))
-                if ($maxD -gt 70) { $Script:NBM_DistortScore++ } else { $Script:NBM_DistortScore = [Math]::Max(0, $Script:NBM_DistortScore - 1) }
-                if ($Script:NBM_DistortScore -ge 5) {
-                    $key = "NBM_Distort:$procName"
-                    if (Test-NBMShouldReport -Key $key) { Write-AVLog "NeuroBehaviorMonitor: Screen distortion ($procName)" "THREAT" }
-                    $Script:NBM_DistortScore = 0
-                }
-            }
-        }
-        $Script:NBM_LastAvgR=$avgR; $Script:NBM_LastAvgG=$avgG; $Script:NBM_LastAvgB=$avgB
-    } catch {
-        Write-AVLog "NeuroBehaviorMonitor error: $_" "ERROR"
-    }
-}
-
 # --- StartupPersistenceDetection ---
 $Script:SPD_ReportedItems = @{}
 $Script:SPD_ScriptExtensions = @(".vbs",".vbe",".js",".jse",".wsf",".ps1",".bat",".cmd",".scr")
@@ -11806,7 +11489,6 @@ Write-Host "[PROTECTION] Anti-termination safeguards active" -ForegroundColor Gr
         "BeaconDetection",
         "CodeInjectionDetection",
         "DataExfiltrationDetection",
-        "ElfCatcher",
         "FileEntropyDetection",
         "HoneypotMonitoring",
         "LateralMovementDetection",
@@ -11815,7 +11497,6 @@ Write-Host "[PROTECTION] Anti-termination safeguards active" -ForegroundColor Gr
         "ReflectiveDLLInjectionDetection",
         "ResponseEngine",
         "PrivacyForgeSpoofing",
-        "ElfDLLUnloader",
         "UnsignedDLLRemover",
         "YaraDetection",
         "IdsDetection",
@@ -11826,7 +11507,6 @@ Write-Host "[PROTECTION] Anti-termination safeguards active" -ForegroundColor Gr
         "LocalProxyDetection",
         "ScriptContentScan",
         "ScriptHostDetection",
-        "NeuroBehaviorMonitor",
         "StartupPersistenceDetection",
         "SuspiciousParentChildDetection",
         "ScriptBlockLoggingCheck",
