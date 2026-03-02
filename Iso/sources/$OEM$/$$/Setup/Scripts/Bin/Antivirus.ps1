@@ -83,11 +83,12 @@ $ProtectedProcesses = @(
 $EvilStrings = @(
     'mimikatz', 'sekurlsa::', 'kerberos::', 'lsadump::', 'wdigest', 'tspkg',
     'http-beacon', 'https-beacon', 'cobaltstrike', 'sleepmask', 'reflective',
-    'amsi.dll', 'AmsiScanBuffer', 'EtwEventWrite', 'MiniDumpWriteDump',
-    'VirtualAllocEx', 'WriteProcessMemory', 'CreateRemoteThread',
     'ReflectiveLoader', 'sharpchrome', 'rubeus', 'safetykatz', 'sharphound',
     'invoke-mimikatz', 'invoke-bloodhound', 'powersploit', 'empire'
 )
+# Note: Removed 'amsi.dll', 'AmsiScanBuffer', 'EtwEventWrite', 'MiniDumpWriteDump',
+# 'VirtualAllocEx', 'WriteProcessMemory', 'CreateRemoteThread' - these are legitimate
+# Windows APIs/DLLs that many normal programs use. Flagging them causes false positives.
 
 New-Item -ItemType Directory -Path $Config.BaseDirectory, $Config.QuarantineDirectory, $Config.BackupDirectory, $RulesDirectory -Force -ErrorAction SilentlyContinue | Out-Null
 
@@ -1063,17 +1064,68 @@ function Stop-ThreatProcess {
 }
 
 function Invoke-LOLBinDetection {
+    # Living Off the Land Binaries - legitimate Windows tools abused by attackers
+    # Extended patterns based on LOLBAS project (https://lolbas-project.github.io/)
     $LOLBins = @{
-        "certutil"   = "-decode|-urlcache|-verifyctl|-encode"
-        "bitsadmin"  = "transfer|addfile|/download"
-        "mshta"      = "http://|https://|javascript:|vbscript:"
-        "regsvr32"   = "scrobj\.dll|/s|http://|https://"
-        "rundll32"   = "javascript:|http://|shell32\.dll,Control_RunDLL"
-        "wmic"       = "process call create|/node:|format:.*http|xsl:http"
-        "powershell" = "-enc\s|-encodedcommand|downloadstring|iex\s|invoke-expression|-nop|-w\s*hidden|bypass"
-        "msiexec"    = "/quiet|/q.*http"
-        "cscript"    = "http://|https://"
-        "wscript"    = "http://|https://"
+        "certutil"   = "-decode|-urlcache|-verifyctl|-encode|-ping|-f\s+http"
+        "bitsadmin"  = "transfer|addfile|/download|/create|/addfile|/SetNotifyCmdLine"
+        "mshta"      = "http://|https://|javascript:|vbscript:|about:"
+        "regsvr32"   = "scrobj\.dll|/s|/n|/u|/i:http|/i:ftp"
+        "rundll32"   = "javascript:|http://|shell32\.dll,Control_RunDLL|advpack\.dll|ieadvpack\.dll|zipfldr\.dll"
+        "wmic"       = "process call create|/node:|format:.*http|xsl:http|/format:"
+        "powershell" = "-enc\s|-encodedcommand|downloadstring|iex\s|invoke-expression|-nop|-w\s*hidden|bypass|-ep\s+bypass|webclient|Net\.WebClient|bitstransfer"
+        "msiexec"    = "/quiet|/q.*http|/i\s+http|/i\s+\\\\|/y\s+|/y.*\.dll|/z.*\.dll"
+        "cscript"    = "http://|https://|//e:jscript|//e:vbscript"
+        "wscript"    = "http://|https://|//e:jscript|//e:vbscript"
+        "cmd"        = "/c.*powershell.*-enc|/c.*certutil.*-urlcache|/c.*bitsadmin.*transfer"
+        "forfiles"   = "/c.*cmd|/c.*powershell"
+        "pcalua"     = "-a.*\.exe|-a.*\.dll|-a.*http"
+        "msconfig"   = "-5|/auto"
+        "msbuild"    = "\.csproj|\.xml|/p:.*http"
+        "installutil"= "/logfile=|/LogToConsole=false"
+        "regasm"     = "/u\s+"
+        "regsvcs"    = "/u\s+"
+        "cmstp"      = "/ni|/s|/au|\.inf"
+        "dnscmd"     = "/config|/enumrecords"
+        "eudcedit"   = ".*"
+        "eventvwr"   = ".*"
+        "expand"     = "-f:.*\.dll|-f:.*\.exe|http://|https://"
+        "extrac32"   = "/y|/c|\.cab"
+        "findstr"    = "/s.*password|/s.*credential"
+        "ftp"        = "-s:"
+        "gpscript"   = "/startup|/logon"
+        "hh"         = "http://|https://|\.chm"
+        "ieexec"     = "http://|https://"
+        "infdefaultinstall" = ".*\.inf"
+        "makecab"    = "/d.*cmd|/d.*powershell"
+        "mavinject"  = "/injectrunning"
+        "mftrace"    = ".*\.dll"
+        "microsoft.workflow.compiler" = ".*\.xml"
+        "mmc"        = "-a.*\.msc|\.msc.*http"
+        "msdeploy"   = "-source:.*-dest:"
+        "msdt"       = "PCWDiagnostic|/id"
+        "netsh"      = "add helper|trace start"
+        "odbcconf"   = "/a.*regsvr|/f.*\.rsp"
+        "pcwrun"     = ".*\.exe"
+        "presentationhost" = ".*\.xbap|.*\.xaml"
+        "print"      = "/d:.*\.exe|/d:.*\.dll"
+        "psr"        = "/start|/gui 0"
+        "rasautou"   = "-a.*-e"
+        "rdrleakdiag"= "/fullmemdmp"
+        "reg"        = "export.*sam|export.*security|save.*sam|save.*security|add.*Run"
+        "regedit"    = "/s.*\.reg|/e.*\.reg"
+        "replace"    = "/a.*\.exe|/a.*\.dll"
+        "rpcping"    = "-u.*-a.*-f"
+        "runscripthelper" = "surfacecheck"
+        "sc"         = "create.*binpath|config.*binpath"
+        "schtasks"   = "/create.*/tr.*powershell|/create.*/tr.*cmd|/create.*/tr.*http"
+        "scriptrunner" = "-appvscript"
+        "syncappvpublishingserver" = ".*powershell|.*\;"
+        "tttracer"   = "-dumpfull"
+        "verclsid"   = "/c|/s"
+        "wab"        = ".*"
+        "winrm"      = "invoke|create.*powershell"
+        "xwizard"    = "runwizard|/extract"
     }
     
     foreach ($proc in Get-WmiObject Win32_Process -EA 0) {
@@ -1302,7 +1354,9 @@ function Invoke-TokenManipulationDetection {
 }
 
 function Invoke-ProcessHollowingDetection {
-    $systemProcs = @("svchost.exe", "explorer.exe", "lsass.exe", "csrss.exe", "services.exe")
+    # System processes and their legitimate locations
+    $systemProcsSystem32 = @("svchost.exe", "lsass.exe", "csrss.exe", "services.exe", "smss.exe", "wininit.exe")
+    $systemProcsWindows = @("explorer.exe")  # explorer.exe is in C:\Windows, not System32
     
     foreach ($proc in Get-CimInstance Win32_Process -EA 0) {
         if ($proc.ProcessId -eq $PID) { continue }
@@ -1316,9 +1370,15 @@ function Invoke-ProcessHollowingDetection {
                 continue
             }
             
-            # System process from wrong location
-            if ($proc.Name -in $systemProcs -and $proc.ExecutablePath -and $proc.ExecutablePath -notmatch "Windows\\System32") {
-                Write-Log "Fake system process: $($proc.Name)"
+            # System32 processes from wrong location
+            if ($proc.Name -in $systemProcsSystem32 -and $proc.ExecutablePath -and $proc.ExecutablePath -notmatch "Windows\\System32") {
+                Write-Log "Fake system process: $($proc.Name) at $($proc.ExecutablePath)"
+                Stop-ThreatProcess -ProcessId $proc.ProcessId -ProcessName $proc.Name
+            }
+            
+            # Windows folder processes from wrong location
+            if ($proc.Name -in $systemProcsWindows -and $proc.ExecutablePath -and $proc.ExecutablePath -notmatch "^C:\\Windows\\[^\\]+$") {
+                Write-Log "Fake system process: $($proc.Name) at $($proc.ExecutablePath)"
                 Stop-ThreatProcess -ProcessId $proc.ProcessId -ProcessName $proc.Name
             }
         } catch {}
@@ -1377,6 +1437,398 @@ function Invoke-NetworkAnomalyDetection {
                 Stop-ThreatProcess -ProcessId $proc.Id -ProcessName $proc.ProcessName
             }
         }
+    }
+}
+
+# ===================== Advanced Abuse Detection Functions =====================
+
+function Invoke-CameraMicAccessDetection {
+    # Detects suspicious processes accessing camera/microphone via Media Foundation
+    # MFCaptureEngine.dll is legitimately used by apps for camera/mic access
+    # But malware can abuse this for surveillance
+    
+    $whitelistedApps = @(
+        'brave', 'chrome', 'firefox', 'msedge', 'opera',  # Browsers
+        'teams', 'zoom', 'skype', 'discord', 'slack',     # Communication apps
+        'obs64', 'obs32', 'streamlabs',                   # Streaming
+        'WindowsCamera', 'Camera',                         # Windows Camera
+        'SecurityHealthService', 'MsMpEng'                # Windows Security
+    )
+    
+    foreach ($proc in Get-Process -EA 0) {
+        if ($proc.Id -eq $PID) { continue }
+        try {
+            $loadedMF = $proc.Modules | Where-Object { $_.ModuleName -match 'MFCaptureEngine|mfplat|mf\.dll' }
+            if (-not $loadedMF) { continue }
+            
+            $procName = $proc.ProcessName.ToLower()
+            $isWhitelisted = $whitelistedApps | Where-Object { $procName -like "*$_*" }
+            
+            if (-not $isWhitelisted) {
+                # Check if the process is signed
+                $sig = Get-AuthenticodeSignature $proc.Path -EA 0
+                $isSigned = $sig.Status -eq 'Valid'
+                
+                # Check if from suspicious location
+                $isSuspiciousPath = $proc.Path -match '\\Temp\\|\\Downloads\\|\\AppData\\Local\\Temp\\'
+                
+                # Check if has no visible window (hidden process)
+                $hasWindow = $proc.MainWindowHandle -ne [IntPtr]::Zero
+                
+                if (-not $isSigned -or $isSuspiciousPath -or -not $hasWindow) {
+                    Write-Log "CAMERA/MIC ACCESS ALERT: $($proc.ProcessName) (PID:$($proc.Id)) accessing media capture"
+                    Write-Log "  -> Path: $($proc.Path)"
+                    Write-Log "  -> Signed: $isSigned | SuspiciousPath: $isSuspiciousPath | HasWindow: $hasWindow"
+                    Send-ThreatAlert -Severity "HIGH" -Message "Suspicious camera/mic access" -Details "$($proc.ProcessName) at $($proc.Path)"
+                    
+                    if (-not $isSigned -and $isSuspiciousPath) {
+                        Stop-ThreatProcess -ProcessId $proc.Id -ProcessName $proc.ProcessName
+                    }
+                }
+            }
+        } catch {}
+    }
+}
+
+function Invoke-COMHijackingDetection {
+    # Detects COM object hijacking where malware registers fake COM objects in HKCU
+    # that shadow legitimate HKLM entries, causing legitimate processes to load malicious DLLs
+    
+    $suspiciousPaths = @('\\Temp\\', '\\Downloads\\', '\\AppData\\Local\\Temp\\', '\\Desktop\\', '\\Public\\')
+    
+    try {
+        # Get all HKCU COM registrations
+        $hkcuClsids = Get-ChildItem "HKCU:\Software\Classes\CLSID" -EA 0
+        
+        foreach ($clsid in $hkcuClsids) {
+            $clsidName = $clsid.PSChildName
+            $inprocServer = Get-ItemProperty "$($clsid.PSPath)\InprocServer32" -EA 0
+            
+            if (-not $inprocServer) { continue }
+            
+            $dllPath = $inprocServer.'(default)'
+            if (-not $dllPath) { continue }
+            
+            # Check if this CLSID also exists in HKLM (shadowing)
+            $hklmExists = Test-Path "HKLM:\Software\Classes\CLSID\$clsidName"
+            
+            # Check if DLL path is suspicious
+            $isSuspiciousPath = $false
+            foreach ($badPath in $suspiciousPaths) {
+                if ($dllPath -match [regex]::Escape($badPath)) {
+                    $isSuspiciousPath = $true
+                    break
+                }
+            }
+            
+            # Check if DLL is signed
+            $isSigned = $false
+            if (Test-Path $dllPath) {
+                $sig = Get-AuthenticodeSignature $dllPath -EA 0
+                $isSigned = $sig.Status -eq 'Valid'
+            }
+            
+            if ($hklmExists -and ($isSuspiciousPath -or -not $isSigned)) {
+                Write-Log "COM HIJACKING DETECTED: $clsidName"
+                Write-Log "  -> DLL: $dllPath"
+                Write-Log "  -> Shadows HKLM: $hklmExists | Suspicious Path: $isSuspiciousPath | Signed: $isSigned"
+                Send-ThreatAlert -Severity "CRITICAL" -Message "COM hijacking detected" -Details "CLSID: $clsidName -> $dllPath"
+                
+                # Quarantine the malicious DLL
+                if (Test-Path $dllPath) {
+                    Move-ToQuarantine -FilePath $dllPath -Reason "COM hijacking payload"
+                }
+                
+                # Remove the HKCU registration
+                Remove-Item -Path $clsid.PSPath -Recurse -Force -EA 0
+                Write-Log "  -> Removed malicious HKCU COM registration"
+            }
+        }
+    } catch {
+        Write-Log "COM hijacking detection error: $_"
+    }
+}
+
+function Invoke-ProxySettingsAbuseDetection {
+    # Detects malware modifying proxy settings to intercept browser traffic (MITM)
+    # Monitors Internet Settings registry keys for unauthorized changes
+    
+    $proxyKeys = @{
+        'ProxyEnable' = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+        'ProxyServer' = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+        'AutoConfigURL' = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'  # WPAD
+    }
+    
+    # Known legitimate proxy patterns (corporate, VPN, etc.)
+    $legitimateProxies = @(
+        'localhost', '127.0.0.1', '*.internal', '*.corp'
+    )
+    
+    try {
+        $settings = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -EA 0
+        
+        # Check if proxy is enabled
+        if ($settings.ProxyEnable -eq 1) {
+            $proxyServer = $settings.ProxyServer
+            $autoConfigUrl = $settings.AutoConfigURL
+            
+            $isLegitimate = $false
+            foreach ($legit in $legitimateProxies) {
+                if ($proxyServer -like $legit) {
+                    $isLegitimate = $true
+                    break
+                }
+            }
+            
+            # Suspicious indicators
+            $isSuspicious = $false
+            $reason = ""
+            
+            # Check for external proxy pointing to unknown addresses
+            if ($proxyServer -and -not $isLegitimate) {
+                if ($proxyServer -match '^\d+\.\d+\.\d+\.\d+:\d+$') {
+                    # Raw IP address proxy - suspicious
+                    $isSuspicious = $true
+                    $reason = "Raw IP proxy: $proxyServer"
+                }
+            }
+            
+            # Check for WPAD pointing to suspicious URLs
+            if ($autoConfigUrl) {
+                if ($autoConfigUrl -match 'http://' -and $autoConfigUrl -notmatch 'wpad\.|\.internal|\.corp|\.local') {
+                    $isSuspicious = $true
+                    $reason = "Suspicious WPAD URL: $autoConfigUrl"
+                }
+            }
+            
+            if ($isSuspicious) {
+                Write-Log "PROXY ABUSE DETECTED: $reason"
+                Send-ThreatAlert -Severity "HIGH" -Message "Proxy settings tampered" -Details $reason
+                
+                # Log but don't auto-remediate (might break legitimate corporate setups)
+                Write-Log "  -> Review manually: HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"
+            }
+        }
+        
+        # Also check for WinHTTP proxy (system-wide)
+        $winhttp = netsh winhttp show proxy 2>$null
+        if ($winhttp -match 'Proxy Server.*:\s+(\S+)') {
+            $systemProxy = $Matches[1]
+            if ($systemProxy -ne 'Direct access' -and $systemProxy -match '^\d+\.\d+\.\d+\.\d+:\d+$') {
+                Write-Log "SYSTEM PROXY DETECTED: $systemProxy (WinHTTP)"
+                Write-Log "  -> May be legitimate corporate proxy, review manually"
+            }
+        }
+    } catch {
+        Write-Log "Proxy detection error: $_"
+    }
+}
+
+function Invoke-DLLSearchOrderHijacking {
+    # Detects DLL search order hijacking where known Windows DLL names
+    # are placed in application directories to be loaded instead of System32 versions
+    
+    # Common DLLs that are targets for search order hijacking
+    $targetDLLs = @(
+        'version.dll', 'winmm.dll', 'dwmapi.dll', 'uxtheme.dll', 'samcli.dll',
+        'propsys.dll', 'ntmarta.dll', 'secur32.dll', 'userenv.dll', 'profapi.dll',
+        'cryptsp.dll', 'rsaenh.dll', 'gpapi.dll', 'dpapi.dll', 'mpr.dll',
+        'shfolder.dll', 'cabinet.dll', 'linkinfo.dll', 'ntshrui.dll', 'srvcli.dll',
+        'cscapi.dll', 'netutils.dll', 'dbghelp.dll', 'dbgcore.dll', 'fltlib.dll',
+        'wldap32.dll', 'crypt32.dll', 'msasn1.dll', 'imagehlp.dll', 'wintrust.dll'
+    )
+    
+    foreach ($proc in Get-Process -EA 0) {
+        if ($proc.Id -eq $PID) { continue }
+        try {
+            foreach ($mod in $proc.Modules) {
+                $modName = $mod.ModuleName.ToLower()
+                $modPath = $mod.FileName.ToLower()
+                
+                # Check if this is a known target DLL
+                if ($modName -in $targetDLLs) {
+                    # Check if it's loaded from non-System32 location
+                    $isFromSystem32 = $modPath -match 'windows\\system32\\' -or $modPath -match 'windows\\syswow64\\'
+                    
+                    if (-not $isFromSystem32) {
+                        # Verify signature
+                        $sig = Get-AuthenticodeSignature $mod.FileName -EA 0
+                        $isSigned = $sig.Status -eq 'Valid'
+                        $isMicrosoft = $sig.SignerCertificate.Subject -match 'Microsoft'
+                        
+                        if (-not $isSigned -or -not $isMicrosoft) {
+                            Write-Log "DLL SEARCH ORDER HIJACK: $($proc.ProcessName) loaded $modName from $($mod.FileName)"
+                            Write-Log "  -> Expected: C:\\Windows\\System32\\$modName"
+                            Write-Log "  -> Signed: $isSigned | Microsoft: $isMicrosoft"
+                            Send-ThreatAlert -Severity "CRITICAL" -Message "DLL hijacking detected" -Details "$($proc.ProcessName) loaded fake $modName"
+                            
+                            # Stop the affected process
+                            Stop-ThreatProcess -ProcessId $proc.Id -ProcessName $proc.ProcessName
+                            
+                            # Quarantine the malicious DLL
+                            Move-ToQuarantine -FilePath $mod.FileName -Reason "DLL search order hijack"
+                            break
+                        }
+                    }
+                }
+            }
+        } catch {}
+    }
+}
+
+function Invoke-ProxywareDetection {
+    # Detects proxyware/bandwidth hijacking malware like Honeygain, Peer2Profit, etc.
+    # These monetize victim's internet connection without consent
+    
+    $proxywareIndicators = @{
+        Processes = @('honeygain', 'peer2profit', 'packetstream', 'traffmonetizer', 'iproyal', 'pawns', 'earnapp', 'nanowire', 'spider')
+        Domains = @('honeygain.com', 'peer2profit.com', 'packetstream.io', 'traffmonetizer.com', 'iproyal.com', 'pawns.app', 'earnapp.com')
+        Services = @('HoneygainService', 'Peer2ProfitService', 'PacketStreamService')
+    }
+    
+    # Check running processes
+    foreach ($indicator in $proxywareIndicators.Processes) {
+        $found = Get-Process -EA 0 | Where-Object { $_.ProcessName -like "*$indicator*" }
+        if ($found) {
+            foreach ($proc in $found) {
+                Write-Log "PROXYWARE DETECTED: $($proc.ProcessName) (PID: $($proc.Id))"
+                Send-ThreatAlert -Severity "HIGH" -Message "Proxyware detected" -Details $proc.ProcessName
+                Stop-ThreatProcess -ProcessId $proc.Id -ProcessName $proc.ProcessName
+            }
+        }
+    }
+    
+    # Check services
+    foreach ($svcName in $proxywareIndicators.Services) {
+        $svc = Get-Service -Name $svcName -EA 0
+        if ($svc) {
+            Write-Log "PROXYWARE SERVICE: $($svc.Name) ($($svc.Status))"
+            Stop-Service -Name $svcName -Force -EA 0
+            Set-Service -Name $svcName -StartupType Disabled -EA 0
+        }
+    }
+    
+    # Check installed programs
+    $installed = Get-ItemProperty "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*", "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*" -EA 0
+    foreach ($indicator in $proxywareIndicators.Processes) {
+        $found = $installed | Where-Object { $_.DisplayName -like "*$indicator*" }
+        if ($found) {
+            Write-Log "PROXYWARE INSTALLED: $($found.DisplayName)"
+            Send-ThreatAlert -Severity "HIGH" -Message "Proxyware installed" -Details $found.DisplayName
+        }
+    }
+    
+    # Check startup entries
+    $startupPaths = @(
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run",
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run"
+    )
+    foreach ($path in $startupPaths) {
+        if (-not (Test-Path $path)) { continue }
+        $props = Get-ItemProperty -Path $path -EA 0
+        foreach ($indicator in $proxywareIndicators.Processes) {
+            foreach ($prop in $props.PSObject.Properties) {
+                if ($prop.Value -like "*$indicator*") {
+                    Write-Log "PROXYWARE STARTUP: $($prop.Name) -> $($prop.Value)"
+                    Remove-ItemProperty -Path $path -Name $prop.Name -EA 0
+                }
+            }
+        }
+    }
+}
+
+function Invoke-ShadowProxyCaptureDetection {
+    # Niche detection: Identifies processes loading a suspicious COMBINATION of:
+    # - COM proxy/stub DLLs (system communication hooks)
+    # - Media capture DLLs (camera/mic access)
+    # - User management DLLs (account/credential access)
+    #
+    # Individually these are legitimate Windows components.
+    # Combined in a non-system process = potential surveillance malware
+    
+    $suspiciousModules = @{
+        # COM Proxy/Stub - inter-process communication hooks
+        ProxyStub = @('npmproxy.dll', 'onecoreapiproxystub.dll', 'onecoreuapcommonproxystub.dll', 
+                      'onecorecommonproxystub.dll', 'usermgrproxy.dll', 'edaboradutilsproxy.dll')
+        # Media capture - camera/microphone access
+        MediaCapture = @('mfcaptureengine.dll', 'mfplat.dll', 'mfsensorgroup.dll', 
+                         'windows.media.capture.dll', 'frameserver.dll', 'frameservermonitor.dll')
+        # User/credential management
+        UserMgmt = @('usermgrcli.dll', 'usermgrproxy.dll', 'credprovs.dll', 'authui.dll')
+        # Network interception
+        NetIntercept = @('winhttp.dll', 'wininet.dll', 'urlmon.dll', 'rasapi32.dll')
+    }
+    
+    # Known legitimate processes that may load these combinations
+    $whitelistedProcesses = @(
+        'svchost', 'explorer', 'dwm', 'sihost', 'taskhostw', 'runtimebroker',
+        'searchhost', 'startmenuexperiencehost', 'shellexperiencehost',
+        'systemsettings', 'applicationframehost', 'textinputhost',
+        'securityhealthservice', 'msmpeng', 'nissrv',
+        'teams', 'zoom', 'skype', 'discord', 'slack',  # Communication apps
+        'brave', 'chrome', 'firefox', 'msedge', 'opera'  # Browsers
+    )
+    
+    foreach ($proc in Get-Process -EA 0) {
+        if ($proc.Id -eq $PID) { continue }
+        
+        $procNameLower = $proc.ProcessName.ToLower()
+        if ($procNameLower -in $whitelistedProcesses) { continue }
+        
+        try {
+            $loadedModules = $proc.Modules | ForEach-Object { $_.ModuleName.ToLower() }
+            if (-not $loadedModules) { continue }
+            
+            # Count how many categories of suspicious modules are loaded
+            $categories = @{
+                ProxyStub = $false
+                MediaCapture = $false
+                UserMgmt = $false
+                NetIntercept = $false
+            }
+            
+            foreach ($mod in $loadedModules) {
+                if ($suspiciousModules.ProxyStub -contains $mod) { $categories.ProxyStub = $true }
+                if ($suspiciousModules.MediaCapture -contains $mod) { $categories.MediaCapture = $true }
+                if ($suspiciousModules.UserMgmt -contains $mod) { $categories.UserMgmt = $true }
+                if ($suspiciousModules.NetIntercept -contains $mod) { $categories.NetIntercept = $true }
+            }
+            
+            $loadedCategories = ($categories.Values | Where-Object { $_ -eq $true }).Count
+            
+            # Alert if process loads 3+ categories (proxy + capture + something else)
+            if ($loadedCategories -ge 3) {
+                # Additional checks to reduce false positives
+                $isSigned = $false
+                $isFromSafeLocation = $false
+                
+                if ($proc.Path) {
+                    $sig = Get-AuthenticodeSignature $proc.Path -EA 0
+                    $isSigned = $sig.Status -eq 'Valid'
+                    $isFromSafeLocation = $proc.Path -match '^C:\\Windows\\|^C:\\Program Files'
+                }
+                
+                # Only alert for unsigned or suspiciously located processes
+                if (-not $isSigned -or -not $isFromSafeLocation) {
+                    $loadedCats = @()
+                    if ($categories.ProxyStub) { $loadedCats += "ProxyStub" }
+                    if ($categories.MediaCapture) { $loadedCats += "MediaCapture" }
+                    if ($categories.UserMgmt) { $loadedCats += "UserMgmt" }
+                    if ($categories.NetIntercept) { $loadedCats += "NetIntercept" }
+                    
+                    Write-Log "SHADOW PROXY-CAPTURE DETECTED: $($proc.ProcessName) (PID: $($proc.Id))"
+                    Write-Log "  -> Path: $($proc.Path)"
+                    Write-Log "  -> Loaded categories: $($loadedCats -join ', ')"
+                    Write-Log "  -> Signed: $isSigned | SafeLocation: $isFromSafeLocation"
+                    Send-ThreatAlert -Severity "CRITICAL" -Message "Suspicious module combination detected" -Details "$($proc.ProcessName) loaded: $($loadedCats -join ', ')"
+                    
+                    # Kill if unsigned AND from suspicious location
+                    if (-not $isSigned -and -not $isFromSafeLocation) {
+                        Stop-ThreatProcess -ProcessId $proc.Id -ProcessName $proc.ProcessName
+                    }
+                }
+            }
+        } catch {}
     }
 }
 
@@ -1817,37 +2269,11 @@ public class DLLUnloaderLite {
 "@ -EA 0
         }
         
-        $targets = @('chrome', 'msedge', 'firefox', 'brave', 'opera')
-        $whitelist = @('ntdll.dll', 'kernel32.dll', 'user32.dll', 'gdi32.dll')
-        
-        foreach ($procName in $targets) {
-            foreach ($proc in Get-Process -Name $procName -EA 0) {
-                try {
-                    $hProc = [DLLUnloaderLite]::OpenProcess(0x1F0FFF, $false, $proc.Id)
-                    if ($hProc -eq [IntPtr]::Zero) { continue }
-                    
-                    $freeLib = [DLLUnloaderLite]::GetProcAddress([DLLUnloaderLite]::GetModuleHandle("kernel32.dll"), "FreeLibrary")
-                    
-                    foreach ($mod in $proc.Modules) {
-                        $name = [IO.Path]::GetFileName($mod.FileName).ToLower()
-                        $key = "$($proc.Id):$($mod.FileName)"
-                        
-                        if ($whitelist -contains $name -or $Script:ElfDLLProcessed.ContainsKey($key)) { continue }
-                        
-                        if ($name -like '*_elf.dll') {
-                            Write-Log "ELF Unloader: Unloading $name from $procName"
-                            $thread = [DLLUnloaderLite]::CreateRemoteThread($hProc, [IntPtr]::Zero, 0, $freeLib, $mod.BaseAddress, 0, [IntPtr]::Zero)
-                            if ($thread -ne [IntPtr]::Zero) {
-                                [DLLUnloaderLite]::WaitForSingleObject($thread, 5000) | Out-Null
-                                [DLLUnloaderLite]::CloseHandle($thread) | Out-Null
-                            }
-                            $Script:ElfDLLProcessed[$key] = Get-Date
-                        }
-                    }
-                    [DLLUnloaderLite]::CloseHandle($hProc) | Out-Null
-                } catch {}
-            }
-        }
+        # This function was intended to detect malicious ELF binaries loaded as DLLs
+        # but the pattern '*_elf.dll' incorrectly matches legitimate browser DLLs like chrome_elf.dll
+        # DISABLED: This function causes browser instability by unloading chrome_elf.dll
+        # TODO: Rewrite to detect actual Linux ELF binaries, not DLLs with 'elf' in the name
+        return
     } catch {}
 }
 
@@ -2588,6 +3014,25 @@ try {
             Start-Sleep -Seconds 5
             
             Invoke-DriverWatcher
+            Start-Sleep -Seconds 5
+            
+            # Advanced abuse detection (new)
+            Invoke-CameraMicAccessDetection
+            Start-Sleep -Seconds 5
+            
+            Invoke-COMHijackingDetection
+            Start-Sleep -Seconds 5
+            
+            Invoke-ProxySettingsAbuseDetection
+            Start-Sleep -Seconds 5
+            
+            Invoke-DLLSearchOrderHijacking
+            Start-Sleep -Seconds 5
+            
+            Invoke-ProxywareDetection
+            Start-Sleep -Seconds 5
+            
+            Invoke-ShadowProxyCaptureDetection
             Start-Sleep -Seconds 5
             
             # Memory scanning (previously in separate jobs)
