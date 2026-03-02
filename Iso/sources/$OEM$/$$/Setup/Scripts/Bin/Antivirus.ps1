@@ -38,6 +38,15 @@ $BehaviorConfig = @{
     ThreatIntelUpdateDays   = 7
 }
 
+$KeyScramblerConfig = @{
+    EnableKeyScrambler      = $true
+    FloodChance             = 0.5
+    BeforeKeyChance         = 0.75
+    AfterKeyChance          = 0.75
+    MinFakeChars            = 1
+    MaxFakeChars            = 6
+}
+
 $RulesDirectory = Join-Path $Config.BaseDirectory "rules"
 $KnownFilesCache = @{}
 
@@ -1414,6 +1423,232 @@ function Invoke-NetworkAnomalyDetection {
     }
 }
 
+# ===================== KeyScrambler Anti-Keylogger Protection =====================
+
+$KeyScramblerSource = @"
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+public class KeyScrambler
+{
+    private const int WH_KEYBOARD_LL = 13;
+    private const int WM_KEYDOWN = 0x0100;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KBDLLHOOKSTRUCT
+    {
+        public uint vkCode;
+        public uint scanCode;
+        public uint flags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct INPUT
+    {
+        public uint type;
+        public INPUTUNION u;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    public struct INPUTUNION
+    {
+        [FieldOffset(0)] public KEYBDINPUT ki;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KEYBDINPUT
+    {
+        public ushort wVk;
+        public ushort wScan;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    private const uint INPUT_KEYBOARD = 1;
+    private const uint KEYEVENTF_UNICODE = 0x0004;
+    private const uint KEYEVENTF_KEYUP   = 0x0002;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(int idHook, IntPtr lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll")] private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+    [DllImport("user32.dll")] private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] private static extern bool GetMessage(out MSG msg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+    [DllImport("user32.dll")] private static extern bool TranslateMessage(ref MSG msg);
+    [DllImport("user32.dll")] private static extern IntPtr DispatchMessage(ref MSG msg);
+    [DllImport("user32.dll")] private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+    [DllImport("user32.dll")] private static extern IntPtr GetMessageExtraInfo();
+    [DllImport("user32.dll")] private static extern short GetKeyState(int nVirtKey);
+    [DllImport("kernel32.dll")] private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public POINT pt; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int x; public int y; }
+
+    private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+    private static IntPtr _hookID = IntPtr.Zero;
+    private static LowLevelKeyboardProc _proc;
+    private static Random _rnd = new Random();
+    
+    private static double _floodChance = 0.5;
+    private static double _beforeKeyChance = 0.75;
+    private static double _afterKeyChance = 0.75;
+    private static int _minFakeChars = 1;
+    private static int _maxFakeChars = 6;
+
+    public static void Configure(double floodChance, double beforeChance, double afterChance, int minChars, int maxChars)
+    {
+        _floodChance = floodChance;
+        _beforeKeyChance = beforeChance;
+        _afterKeyChance = afterChance;
+        _minFakeChars = minChars;
+        _maxFakeChars = maxChars;
+    }
+
+    public static void Start()
+    {
+        if (_hookID != IntPtr.Zero) return;
+
+        _proc = HookCallback;
+        _hookID = SetWindowsHookEx(WH_KEYBOARD_LL,
+            Marshal.GetFunctionPointerForDelegate(_proc),
+            GetModuleHandle(null), 0);
+
+        if (_hookID == IntPtr.Zero)
+            throw new Exception("KeyScrambler hook failed: " + Marshal.GetLastWin32Error());
+
+        MSG msg;
+        while (GetMessage(out msg, IntPtr.Zero, 0, 0))
+        {
+            TranslateMessage(ref msg);
+            DispatchMessage(ref msg);
+        }
+    }
+
+    public static void Stop()
+    {
+        if (_hookID != IntPtr.Zero)
+        {
+            UnhookWindowsHookEx(_hookID);
+            _hookID = IntPtr.Zero;
+        }
+    }
+
+    public static bool IsRunning()
+    {
+        return _hookID != IntPtr.Zero;
+    }
+
+    private static bool ModifiersDown()
+    {
+        return (GetKeyState(0x10) & 0x8000) != 0 ||  // Shift
+               (GetKeyState(0x11) & 0x8000) != 0 ||  // Ctrl
+               (GetKeyState(0x12) & 0x8000) != 0;    // Alt
+    }
+
+    private static void InjectFakeChar(char c)
+    {
+        var inputs = new INPUT[2];
+
+        inputs[0].type = INPUT_KEYBOARD;
+        inputs[0].u.ki.wVk = 0;
+        inputs[0].u.ki.wScan = (ushort)c;
+        inputs[0].u.ki.dwFlags = KEYEVENTF_UNICODE;
+        inputs[0].u.ki.dwExtraInfo = GetMessageExtraInfo();
+
+        inputs[1] = inputs[0];
+        inputs[1].u.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+
+        SendInput(2, inputs, Marshal.SizeOf(typeof(INPUT)));
+        Thread.Sleep(_rnd.Next(1, 7));
+    }
+
+    private static void Flood()
+    {
+        if (_rnd.NextDouble() < _floodChance) return;
+        int count = _rnd.Next(_minFakeChars, _maxFakeChars + 1);
+        for (int i = 0; i < count; i++)
+            InjectFakeChar((char)_rnd.Next('A', 'Z' + 1));
+    }
+
+    private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && wParam == (IntPtr)WM_KEYDOWN)
+        {
+            KBDLLHOOKSTRUCT k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
+
+            if ((k.flags & 0x10) != 0) return CallNextHookEx(_hookID, nCode, wParam, lParam);
+            if (ModifiersDown()) return CallNextHookEx(_hookID, nCode, wParam, lParam);
+
+            if (k.vkCode >= 65 && k.vkCode <= 90)
+            {
+                if (_rnd.NextDouble() < _beforeKeyChance) Flood();
+                var ret = CallNextHookEx(_hookID, nCode, wParam, lParam);
+                if (_rnd.NextDouble() < _afterKeyChance) Flood();
+                return ret;
+            }
+        }
+        return CallNextHookEx(_hookID, nCode, wParam, lParam);
+    }
+}
+"@
+
+$Script:KeyScramblerJob = $null
+
+function Start-KeyScrambler {
+    if (-not $KeyScramblerConfig.EnableKeyScrambler) {
+        Write-Log "KeyScrambler is disabled in configuration"
+        return
+    }
+    
+    Write-Log "Initializing KeyScrambler anti-keylogger protection..."
+    
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'KeyScrambler').Type) {
+            Add-Type -TypeDefinition $KeyScramblerSource -Language CSharp -ErrorAction Stop
+            Write-Log "KeyScrambler compiled successfully"
+        }
+        
+        [KeyScrambler]::Configure(
+            $KeyScramblerConfig.FloodChance,
+            $KeyScramblerConfig.BeforeKeyChance,
+            $KeyScramblerConfig.AfterKeyChance,
+            $KeyScramblerConfig.MinFakeChars,
+            $KeyScramblerConfig.MaxFakeChars
+        )
+        
+        $Script:KeyScramblerJob = Start-Job -ScriptBlock {
+            param($Source, $FloodChance, $BeforeChance, $AfterChance, $MinChars, $MaxChars)
+            
+            Add-Type -TypeDefinition $Source -Language CSharp -ErrorAction Stop
+            
+            [KeyScrambler]::Configure($FloodChance, $BeforeChance, $AfterChance, $MinChars, $MaxChars)
+            [KeyScrambler]::Start()
+        } -ArgumentList $KeyScramblerSource, $KeyScramblerConfig.FloodChance, $KeyScramblerConfig.BeforeKeyChance, $KeyScramblerConfig.AfterKeyChance, $KeyScramblerConfig.MinFakeChars, $KeyScramblerConfig.MaxFakeChars
+        
+        Write-Log "KeyScrambler ACTIVE - anti-keylogger protection enabled"
+        Write-Log "  -> You see only your real typing"
+        Write-Log "  -> Keyloggers receive garbage mixed with your keystrokes"
+    }
+    catch {
+        Write-Log "KeyScrambler initialization failed: $_"
+    }
+}
+
+function Stop-KeyScrambler {
+    if ($Script:KeyScramblerJob) {
+        Stop-Job -Job $Script:KeyScramblerJob -ErrorAction SilentlyContinue
+        Remove-Job -Job $Script:KeyScramblerJob -Force -ErrorAction SilentlyContinue
+        $Script:KeyScramblerJob = $null
+        Write-Log "KeyScrambler stopped"
+    }
+}
+
 # ===================== Niche/Specialized Detection Functions =====================
 
 # NeuroBehaviorMonitor state variables
@@ -1814,7 +2049,8 @@ public class GFocusUI {
         $isBrowser = $fgProc.ProcessName -match $Script:GFocus_Browsers
         $isControlledApp = $fgProc.ProcessName -match $Script:GFocus_ControlledApps
         
-        # ==================== BROWSER HANDLING ====================
+        # ==================== BROWSER ADDRESS BAR DETECTION ====================
+        # Only read address bar when browser is in foreground
         if ($isBrowser) {
             $userInput = $null
             
@@ -1868,30 +2104,31 @@ public class GFocusUI {
                     } catch {}
                 }
             }
-            
-            # Extend grace for active browser connections
-            $browserProcs = Get-Process | Where-Object { $_.ProcessName -match $Script:GFocus_Browsers } | Select-Object -ExpandProperty Id
-            $browserConns = Get-NetTCPConnection -State Established -EA 0 | Where-Object { $_.OwningProcess -in $browserProcs }
-            
-            foreach ($conn in $browserConns) {
-                $ip = $conn.RemoteAddress
-                if ($ip -match "^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|::1|fe80)") { continue }
-                
-                if ($Script:GFocus_BrowserAllowedIPs.ContainsKey($ip)) {
-                    $Script:GFocus_BrowserAllowedIPs[$ip] = $now.AddSeconds($Script:GFocus_GracePeriod)
-                } elseif (-not $Script:GFocus_BrowserBlockedIPs.ContainsKey($ip)) {
-                    # Block non-user-initiated browser connection
-                    $ruleName = "GFocus_Browser_$($ip -replace '[.:]','_')"
-                    New-NetFirewallRule -DisplayName $ruleName -Direction Outbound -RemoteAddress $ip -Action Block -EA 0 | Out-Null
-                    $Script:GFocus_BrowserBlockedIPs[$ip] = $ruleName
-                    Write-Log "GFocus: Blocked browser connection to $ip (not user-initiated)"
-                }
-            }
-            
-            # Cleanup expired browser IPs
-            $expired = @($Script:GFocus_BrowserAllowedIPs.Keys | Where-Object { $Script:GFocus_BrowserAllowedIPs[$_] -lt $now })
-            foreach ($ip in $expired) { $Script:GFocus_BrowserAllowedIPs.Remove($ip) }
         }
+        
+        # ==================== BROWSER CONNECTION MONITORING ====================
+        # Always monitor ALL browser processes (they spawn multiple child processes)
+        $browserProcs = Get-Process -EA 0 | Where-Object { $_.ProcessName -match $Script:GFocus_Browsers } | Select-Object -ExpandProperty Id
+        $browserConns = Get-NetTCPConnection -State Established -EA 0 | Where-Object { $_.OwningProcess -in $browserProcs }
+        
+        foreach ($conn in $browserConns) {
+            $ip = $conn.RemoteAddress
+            if ($ip -match "^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|::1|fe80)") { continue }
+            
+            if ($Script:GFocus_BrowserAllowedIPs.ContainsKey($ip)) {
+                $Script:GFocus_BrowserAllowedIPs[$ip] = $now.AddSeconds($Script:GFocus_GracePeriod)
+            } elseif (-not $Script:GFocus_BrowserBlockedIPs.ContainsKey($ip)) {
+                # Block non-user-initiated browser connection
+                $ruleName = "GFocus_Browser_$($ip -replace '[.:]','_')"
+                New-NetFirewallRule -DisplayName $ruleName -Direction Outbound -RemoteAddress $ip -Action Block -EA 0 | Out-Null
+                $Script:GFocus_BrowserBlockedIPs[$ip] = $ruleName
+                Write-Log "GFocus: Blocked browser connection to $ip (not user-initiated)"
+            }
+        }
+        
+        # Cleanup expired browser IPs
+        $expired = @($Script:GFocus_BrowserAllowedIPs.Keys | Where-Object { $Script:GFocus_BrowserAllowedIPs[$_] -lt $now })
+        foreach ($ip in $expired) { $Script:GFocus_BrowserAllowedIPs.Remove($ip) }
         
         # ==================== CONTROLLED APP HANDLING ====================
         # Apps like PowerShell only get network access when in foreground
@@ -2211,6 +2448,10 @@ try {
 if ($Config.EnableMemoryScanning) {
     Start-MemoryScanner
     Start-YaraMemoryScanner
+}
+
+if ($KeyScramblerConfig.EnableKeyScrambler) {
+    Start-KeyScrambler
 }
 
 if ($IsAdmin -and $Config.EnableThreatIntel) {
