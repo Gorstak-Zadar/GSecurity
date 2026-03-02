@@ -1,7 +1,9 @@
 # Antivirus.ps1
 # Author: Gorstak
 
+# ========================= CONFIGURATION =========================
 $Config = @{
+    # Paths
     BaseDirectory           = "C:\ProgramData\Antivirus"
     QuarantineDirectory     = "C:\ProgramData\Antivirus\Quarantine"
     BackupDirectory         = "C:\ProgramData\Antivirus\Backup"
@@ -9,28 +11,33 @@ $Config = @{
     BlockedLogFile          = "C:\ProgramData\Antivirus\blocked.log"
     DatabaseFile            = "C:\ProgramData\Antivirus\known_files.db"
     
-    MaxDatabaseEntries      = 50000
-    MaxLogSizeMB            = 10
-    MemoryScanIntervalSec   = 8
-    MemoryScanMaxSizeMB     = 150
-    ProcessTimeoutSeconds   = 30
-    DatabaseCleanupDays     = 30
+    # Memory & Performance Settings (OPTIMIZED TO REDUCE RAM)
+    MaxDatabaseEntries      = 50000          # Limit cache size
+    MaxLogSizeMB            = 10             # Rotate logs at 10MB
+    MemoryScanIntervalSec   = 8              # Scan memory every 8s (was 15s)
+    MemoryScanMaxSizeMB     = 150            # Only scan processes UNDER 150MB (small = suspicious)
+    ProcessTimeoutSeconds   = 30             # Kill stuck operations
+    DatabaseCleanupDays     = 30             # Remove entries older than 30 days
     
+    # Feature Flags
     EnableMemoryScanning    = $true
     EnableRealtimeMonitor   = $true
     EnableThreatIntel       = $true
     EnableAlerts            = $true
     AutoQuarantine          = $true
     
-    MalwareBazaarApiKey     = ""
+    # API Configuration
+    MalwareBazaarApiKey     = ""             # Optional API key
     CirclHashLookupUrl      = "https://hashlookup.circl.lu/lookup/sha256"
     CymruApiUrl             = "https://api.malwarehash.cymru.com/v1/hash"
     MalwareBazaarApiUrl     = "https://mb-api.abuse.ch/api/v1/"
     
-    CymruDetectionThreshold = 60
-    SuspiciousFileSizeKB    = 3072
+    # Threat Detection Thresholds
+    CymruDetectionThreshold = 60             # Require 60% AV detection
+    SuspiciousFileSizeKB    = 3072           # 3MB max for suspicious DLLs
 }
 
+# Behavior monitoring settings
 $BehaviorConfig = @{
     EnableBehaviorKill      = $true
     EnableAutoBlockC2       = $true
@@ -38,60 +45,138 @@ $BehaviorConfig = @{
     ThreatIntelUpdateDays   = 7
 }
 
+# KeyScrambler anti-keylogger settings
 $KeyScramblerConfig = @{
-    EnableKeyScrambler      = $true
-    FloodChance             = 0.5
-    BeforeKeyChance         = 0.75
-    AfterKeyChance          = 0.75
-    MinFakeChars            = 1
-    MaxFakeChars            = 6
+    EnableKeyScrambler      = $false          # Disabled by default - can interfere with typing
+    FloodChance             = 0.5             # Probability of injecting fake keystrokes
+    BeforeKeyChance         = 0.75            # Probability of injecting before real key
+    AfterKeyChance          = 0.75            # Probability of injecting after real key
+    MinFakeChars            = 1               # Minimum fake characters per injection
+    MaxFakeChars            = 6               # Maximum fake characters per injection
 }
 
+# ========================= INITIALIZATION =========================
 $RulesDirectory = Join-Path $Config.BaseDirectory "rules"
 $KnownFilesCache = @{}
 
+# Check admin privileges
 $IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
 
-$AllowedSIDs = @('S-1-2-0', 'S-1-5-20')
+# Allowed system accounts
+$AllowedSIDs = @(
+    'S-1-2-0',   # Console user
+    'S-1-5-20'   # Network Service
+)
 
-$RiskyPaths = @('\temp\', '\downloads\', '\appdata\local\temp\', '\public\', '\windows\temp\', '\appdata\roaming\', '\desktop\')
+# High-risk paths where unsigned DLLs are suspicious
+$RiskyPaths = @(
+    '\temp\', '\downloads\', '\appdata\local\temp\', '\public\', '\windows\temp\',
+    '\appdata\roaming\', '\desktop\'
+)
 
-# Monitor only specific extensions
-$MonitoredExtensions = @('.com', '.exe', '.exif', '.dll', '.winmd')
-
-# Executable extensions for special handling
-$ExecutableExtensions = @(
+# Comprehensive monitored file extensions (200+ extensions)
+$MonitoredExtensions = @(
+    # Executables and core system files
     '.exe', '.dll', '.sys', '.ocx', '.scr', '.com', '.cpl', '.msi', '.drv', '.winmd',
+    
+    # Scripts
     '.ps1', '.bat', '.cmd', '.vbs', '.js', '.hta', '.jse', '.wsf', '.wsh', '.psc1',
+    
+    # Archives and compressed files
     '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.bzip', '.bzip2', '.xz', '.tgz',
     '.tbz', '.taz', '.tpz', '.z', '.lzh', '.lha', '.arc', '.arj', '.cab', '.iso', '.img',
+    
+    # Office documents
     '.doc', '.docx', '.docm', '.docb', '.dot', '.dotx', '.dotm', '.xls', '.xlsx', '.xlsm',
     '.xlsb', '.xlt', '.xltx', '.xltm', '.xlam', '.xla', '.xlm', '.xll', '.xlw', '.ppt',
     '.pptx', '.pptm', '.pps', '.ppsx', '.ppsm', '.pot', '.potx', '.potm', '.ppa', '.ppam',
-    '.rtf', '.odt', '.ods', '.mdb', '.accdb', '.accde', '.accda', '.accdr', '.accdt',
+    '.rtf', '.odt', '.ods',
+    
+    # Database files
+    '.mdb', '.accdb', '.accde', '.accda', '.accdr', '.accdt', '.accdu', '.mde', '.mda',
+    '.mdn', '.mdt', '.mdw', '.mdf', '.ldb', '.laccdb',
+    
+    # Web and markup
     '.htm', '.html', '.mht', '.mhtml', '.xml', '.xsl', '.xps', '.svg',
-    '.reg', '.inf', '.ini', '.cfg', '.config', '.manifest', '.lnk', '.url',
-    '.chm', '.hta', '.msp', '.msu', '.apk', '.crx', '.xpi', '.eml', '.msg'
+    
+    # Development and programming
+    '.c', '.h', '.cpp', '.py', '.py3', '.pyc', '.pyo', '.pyw', '.pyx', '.pyz', '.pyzw',
+    '.rb', '.pl', '.perl', '.java', '.class', '.jar', '.war',
+    
+    # Configuration and registry
+    '.reg', '.inf', '.ini', '.cfg', '.config', '.manifest', '.setting', '.pol',
+    
+    # Shortcuts and links
+    '.lnk', '.url', '.website', '.webloc', '.desktop', '.desklink',
+    
+    # Windows specific
+    '.gadget', '.appref-ms', '.application', '.vbp', '.vb', '.bas', '.prg', '.pif',
+    '.scf', '.sct', '.shb', '.shs', '.vxd', '.hlp', '.chm', '.hta',
+    
+    # Installers and packages
+    '.msp', '.mst', '.msu', '.pkg', '.deb', '.rpm',
+    
+    # Media that can contain scripts
+    '.swf',
+    
+    # Virtual disks
+    '.vhd', '.vhdx', '.vmdk', '.vdi',
+    
+    # Mac specific
+    '.dmg', '.app', '.command', '.terminal', '.tool',
+    
+    # Linux executables
+    '.elf', '.bin', '.run', '.sh', '.ksh', '.csh',
+    
+    # Mobile apps
+    '.apk', '.ipa', '.xap',
+    
+    # Browser extensions
+    '.crx', '.xpi',
+    
+    # Certificate and encryption
+    '.cer', '.crt', '.der', '.pfx', '.p12', '.pem',
+    
+    # Email
+    '.eml', '.msg', '.pst', '.ost',
+    
+    # Other potentially dangerous
+    '.ace', '.air', '.ax', '.cnv', '.cpl', '.diagcab', '.drv', '.fon', '.grp',
+    '.hlp', '.hpj', '.inf', '.ins', '.isp', '.its', '.job', '.jse', '.lib', '.library-ms',
+    '.local', '.mad', '.maf', '.mag', '.mam', '.manifest', '.map', '.mapimail', '.mas',
+    '.mat', '.mau', '.mav', '.maw', '.may', '.mcf', '.mcl', '.mhtml', '.mmc', '.mof',
+    '.msc', '.msh', '.msh1', '.msh2', '.msh1xml', '.msh2xml', '.mshxml', '.msp', '.mui',
+    '.mydocs', '.nls', '.nsh', '.ntfs', '.ocx', '.ops', '.osd', '.pa', '.pcd', '.pif',
+    '.plg', '.prf', '.printerexport', '.prn', '.ps1xml', '.ps2', '.ps2xml', '.psc1',
+    '.psc2', '.psd1', '.psm1', '.pst', '.pstreg', '.reg', '.rgs', '.scr', '.sct',
+    '.search-ms', '.searchconnector-ms', '.settingcontent-ms', '.shb', '.shs', '.slk',
+    '.sldm', '.sldx', '.spl', '.stm', '.sys', '.theme', '.themepack', '.tmp', '.tsp',
+    '.url', '.vbe', '.vbs', '.vsmacros', '.vss', '.vst', '.vsw', '.was', '.wbk', '.webpnp',
+    '.website', '.wiz', '.wll', '.wpk', '.ws', '.wsc', '.wsf', '.wsh', '.xbap', '.xip',
+    '.xla', '.xlam', '.xld', '.xldm', '.xll', '.xlm', '.xnk', '.xrm-ms', '.zoo'
 )
 
+# Protected processes that should never be killed
 $ProtectedProcesses = @(
     'System', 'Idle', 'Registry', 'smss', 'csrss', 'wininit', 'services', 'lsass',
     'svchost', 'winlogon', 'explorer', 'dwm', 'SearchUI', 'SearchIndexer', 'fontdrvhost',
     'RuntimeBroker', 'sihost', 'taskhostw'
 )
 
+# Evil strings for in-memory detection
 $EvilStrings = @(
     'mimikatz', 'sekurlsa::', 'kerberos::', 'lsadump::', 'wdigest', 'tspkg',
     'http-beacon', 'https-beacon', 'cobaltstrike', 'sleepmask', 'reflective',
+    'amsi.dll', 'AmsiScanBuffer', 'EtwEventWrite', 'MiniDumpWriteDump',
+    'VirtualAllocEx', 'WriteProcessMemory', 'CreateRemoteThread',
     'ReflectiveLoader', 'sharpchrome', 'rubeus', 'safetykatz', 'sharphound',
     'invoke-mimikatz', 'invoke-bloodhound', 'powersploit', 'empire'
 )
-# Note: Removed 'amsi.dll', 'AmsiScanBuffer', 'EtwEventWrite', 'MiniDumpWriteDump',
-# 'VirtualAllocEx', 'WriteProcessMemory', 'CreateRemoteThread' - these are legitimate
-# Windows APIs/DLLs that many normal programs use. Flagging them causes false positives.
 
+# ========================= CREATE DIRECTORIES =========================
 New-Item -ItemType Directory -Path $Config.BaseDirectory, $Config.QuarantineDirectory, $Config.BackupDirectory, $RulesDirectory -Force -ErrorAction SilentlyContinue | Out-Null
 
+# ========================= LOGGING FUNCTIONS =========================
 function Write-Log {
     param([string]$Message)
     
@@ -106,20 +191,23 @@ function Write-Log {
     
     Write-Host $logLine
     
+    # Log rotation
     if (Test-Path $Config.LogFile) {
         $logSize = (Get-Item $Config.LogFile -ErrorAction SilentlyContinue).Length
         if ($logSize -ge ($Config.MaxLogSizeMB * 1MB)) {
             $archiveName = "$($Config.BaseDirectory)\av_log_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
             try {
                 Rename-Item -Path $Config.LogFile -NewName $archiveName -ErrorAction SilentlyContinue
+                Write-Host "Log rotated to: $archiveName"
             } catch {}
         }
     }
 }
 
-Write-Log "=== Antivirus Starting ==="
+Write-Log "=== Clean Antivirus Starting ==="
 Write-Log "Admin: $IsAdmin | User: $env:USERNAME | SID: $([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)"
 
+# ========================= DATABASE MANAGEMENT =========================
 function Load-Database {
     if (Test-Path $Config.DatabaseFile) {
         try {
@@ -132,6 +220,7 @@ function Load-Database {
                     $safe = [bool]::Parse($matches[2])
                     $timestamp = $matches[3]
                     
+                    # Skip entries older than cleanup threshold
                     try {
                         $entryDate = [datetime]::Parse($timestamp)
                         if ($entryDate -lt (Get-Date).AddDays(-$Config.DatabaseCleanupDays)) {
@@ -142,13 +231,14 @@ function Load-Database {
                     $KnownFilesCache[$hash] = $safe
                     $count++
                     
+                    # Enforce max database size
                     if ($count -ge $Config.MaxDatabaseEntries) {
                         break
                     }
                 }
             }
             
-            Write-Log "Loaded $count entries from database"
+            Write-Log "Loaded $count entries from database (cleaned old entries)"
         } catch {
             Write-Log "Failed to load database: $_"
             $KnownFilesCache.Clear()
@@ -177,6 +267,7 @@ function Save-ToDatabase {
         Write-Log "Failed to save to database: $_"
     }
     
+    # Trigger garbage collection if cache is too large
     if ($KnownFilesCache.Count -gt $Config.MaxDatabaseEntries) {
         [System.GC]::Collect()
         [System.GC]::WaitForPendingFinalizers()
@@ -185,19 +276,21 @@ function Save-ToDatabase {
 
 Load-Database
 
+# ========================= FILE EXCLUSIONS =========================
 function Test-ShouldExclude {
     param([string]$FilePath)
     
     $lower = $FilePath.ToLower()
     
-    # Exclude antivirus's own folder to prevent self-quarantine
-    $avFolderLower = $Config.BaseDirectory.ToLower()
-    if ($lower -like "$avFolderLower\*" -or $lower -eq $avFolderLower) { return $true }
-    
+    # Exclude system assemblies and framework files
     if ($lower -like '*\assembly\*') { return $true }
     if ($lower -like '*\winsxs\*') { return $true }
     if ($lower -like '*\microsoft.net\*') { return $true }
+    
+    # Exclude Windows system config
     if ($lower -like '*\windows\system32\config\*') { return $true }
+    
+    # Exclude IME files
     if ($lower -like '*ctfmon*' -or $lower -like '*msctf.dll' -or $lower -like '*msutb.dll') {
         return $true
     }
@@ -205,13 +298,15 @@ function Test-ShouldExclude {
     return $false
 }
 
+# ========================= HASH CALCULATION =========================
 function Get-FileHashSafe {
     param([string]$FilePath)
     
     if (-not (Test-Path $FilePath)) { return $null }
     
     try {
-        return (Get-FileHash -Path $FilePath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
+        $hash = (Get-FileHash -Path $FilePath -Algorithm SHA256 -ErrorAction Stop).Hash
+        return $hash.ToLower()
     } catch {
         return $null
     }
@@ -237,6 +332,7 @@ function Get-FileSignatureInfo {
     }
 }
 
+# ========================= HASH LOOKUP SERVICES =========================
 function Test-CirclHashLookup {
     param([string]$SHA256)
     
@@ -250,7 +346,9 @@ function Test-CirclHashLookup {
             Write-Log "CIRCL known-good match: $SHA256"
             return $true
         }
-    } catch {}
+    } catch {
+        # Not found or error - return false
+    }
     
     return $false
 }
@@ -268,7 +366,9 @@ function Test-CymruMalwareHash {
             Write-Log "CYMRU malware match: $SHA256 (detections: $($response.detections))"
             return $true
         }
-    } catch {}
+    } catch {
+        # Not found or error
+    }
     
     return $false
 }
@@ -294,41 +394,56 @@ function Test-MalwareBazaarHash {
             Write-Log "MalwareBazaar match: $SHA256"
             return $true
         }
-    } catch {}
+    } catch {
+        # Not found or error
+    }
     
     return $false
 }
 
+# ========================= SUSPICIOUS FILE DETECTION =========================
 function Test-SuspiciousUnsignedDll {
     param([string]$FilePath)
     
     $extension = [IO.Path]::GetExtension($FilePath).ToLower()
-    if ($extension -notin @('.dll', '.winmd')) { return $false }
+    if ($extension -notin @('.dll', '.winmd')) {
+        return $false
+    }
     
+    # Check if signed
     try {
         $signature = Get-AuthenticodeSignature -FilePath $FilePath -ErrorAction Stop
-        if ($signature.Status -eq 'Valid') { return $false }
-    } catch {}
+        if ($signature.Status -eq 'Valid') {
+            return $false
+        }
+    } catch {
+        # Assume unsigned if error
+    }
     
+    # Check file size and location
     $fileInfo = Get-Item $FilePath -ErrorAction SilentlyContinue
     if (-not $fileInfo) { return $false }
     
     $fileSizeKB = $fileInfo.Length / 1KB
     $pathLower = $FilePath.ToLower()
+    $fileName = $fileInfo.Name.ToLower()
     
+    # Check if in risky path and small size
     foreach ($riskyPath in $RiskyPaths) {
         if ($pathLower -like "*$riskyPath*" -and $fileSizeKB -lt $Config.SuspiciousFileSizeKB) {
             return $true
         }
     }
     
-    if ($pathLower -like '*\appdata\roaming\*' -and $fileSizeKB -lt 800 -and $fileInfo.Name -match '^[a-z0-9]{4,12}\.(dll|winmd)$') {
+    # Check for suspicious AppData roaming DLL
+    if ($pathLower -like '*\appdata\roaming\*' -and $fileSizeKB -lt 800 -and $fileName -match '^[a-z0-9]{4,12}\.(dll|winmd)$') {
         return $true
     }
     
     return $false
 }
 
+# ========================= FILE LOCKING UTILITIES =========================
 function Test-FileLocked {
     param([string]$FilePath)
     
@@ -359,6 +474,7 @@ function Stop-ProcessesUsingFile {
                 try {
                     $_.CloseMainWindow() | Out-Null
                     Start-Sleep -Milliseconds 500
+                    
                     if (-not $_.HasExited) {
                         Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
                     }
@@ -366,6 +482,7 @@ function Stop-ProcessesUsingFile {
             }
         }
     } catch {
+        # Try taskkill as fallback
         try {
             taskkill /F /FI "MODULES eq $fileName" 2>&1 | Out-Null
         } catch {}
@@ -387,6 +504,7 @@ function Set-FileOwnership {
     }
 }
 
+# ========================= QUARANTINE FUNCTIONS =========================
 function Move-ToQuarantine {
     param(
         [string]$FilePath,
@@ -398,6 +516,7 @@ function Move-ToQuarantine {
         return
     }
     
+    # Release file if locked
     if (Test-FileLocked -FilePath $FilePath) {
         Stop-ProcessesUsingFile -FilePath $FilePath
         Start-Sleep -Milliseconds 500
@@ -409,13 +528,18 @@ function Move-ToQuarantine {
     $quarantinePath = Join-Path $Config.QuarantineDirectory "${fileName}_${timestamp}"
     
     try {
+        # Create backup
         Copy-Item -Path $FilePath -Destination $backupPath -Force -ErrorAction Stop
+        
+        # Move to quarantine
         Move-Item -Path $FilePath -Destination $quarantinePath -Force -ErrorAction Stop
+        
         Write-Log "QUARANTINED [$Reason]: $FilePath -> $quarantinePath"
         Send-ThreatAlert -Severity "HIGH" -Message "File quarantined: $Reason" -Details $FilePath
     } catch {
         Write-Log "Quarantine failed for $FilePath : $_"
         
+        # Try with ownership change
         if (Set-FileOwnership -FilePath $FilePath) {
             try {
                 Copy-Item -Path $FilePath -Destination $backupPath -Force -ErrorAction Stop
@@ -444,6 +568,7 @@ function Block-FileExecution {
     
     Write-Log "BLOCKED $Type | $FilePath | PID $ProcessId"
     
+    # Kill the process
     try {
         $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
         if ($process -and ($ProtectedProcesses -notcontains $process.ProcessName)) {
@@ -452,11 +577,48 @@ function Block-FileExecution {
         }
     } catch {}
     
+    # Quarantine the file
     if (Test-Path $FilePath) {
         Move-ToQuarantine -FilePath $FilePath -Reason "Real-time $Type block"
     }
 }
 
+# ========================= THREAT PROCESS TERMINATION =========================
+function Stop-ThreatProcess {
+    param(
+        [int]$ProcessId,
+        [string]$ProcessName
+    )
+    
+    if ($ProtectedProcesses -contains $ProcessName) {
+        Write-Log "Cannot terminate protected process: $ProcessName (PID: $ProcessId)"
+        return $false
+    }
+    
+    try {
+        $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if ($process) {
+            Stop-Process -Id $ProcessId -Force -ErrorAction Stop
+            Write-Log "Terminated threat process: $ProcessName (PID: $ProcessId)"
+            return $true
+        }
+    } catch {
+        Write-Log "Failed to terminate process $ProcessName (PID: $ProcessId): $_"
+    }
+    
+    return $false
+}
+
+# ========================= CACHED PROCESS LIST =========================
+function Get-CachedProcessList {
+    try {
+        return Get-Process -ErrorAction SilentlyContinue
+    } catch {
+        return @()
+    }
+}
+
+# ========================= ALERTING SYSTEM =========================
 $global:EmailConfig = $null
 $global:WebhookUrl = $null
 
@@ -471,6 +633,7 @@ function Send-ThreatAlert {
     
     $severityUpper = $Severity.ToUpper()
     
+    # Determine event log entry type
     $entryType = switch ($severityUpper) {
         "CRITICAL" { [System.Diagnostics.EventLogEntryType]::Error }
         "HIGH"     { [System.Diagnostics.EventLogEntryType]::Warning }
@@ -478,6 +641,7 @@ function Send-ThreatAlert {
         default    { [System.Diagnostics.EventLogEntryType]::Information }
     }
     
+    # Write to Windows Event Log
     try {
         if (-not [System.Diagnostics.EventLog]::SourceExists("Antivirus")) {
             New-EventLog -LogName Application -Source "Antivirus" -ErrorAction SilentlyContinue
@@ -488,6 +652,7 @@ function Send-ThreatAlert {
             -EntryType $entryType -ErrorAction SilentlyContinue
     } catch {}
     
+    # Send email if configured
     if ($global:EmailConfig) {
         try {
             Send-MailMessage @global:EmailConfig `
@@ -499,6 +664,7 @@ function Send-ThreatAlert {
         }
     }
     
+    # Send webhook if configured
     if ($global:WebhookUrl) {
         try {
             $payload = @{
@@ -516,6 +682,7 @@ function Send-ThreatAlert {
     }
 }
 
+# ========================= THREAT INTELLIGENCE UPDATES =========================
 function Update-ThreatIntelligence {
     if (-not $Config.EnableThreatIntel) { return }
     
@@ -556,6 +723,7 @@ function Update-ThreatIntelligence {
     }
 }
 
+# ========================= MAIN THREAT ANALYSIS ENGINE =========================
 function Invoke-ThreatAnalysis {
     param([string]$FilePath)
     
@@ -563,42 +731,50 @@ function Invoke-ThreatAnalysis {
     if (Test-ShouldExclude -FilePath $FilePath) { return }
     
     $extension = [IO.Path]::GetExtension($FilePath).ToLower()
-    if ($MonitoredExtensions -notcontains $extension) { return }
+    if ($extension -notin $MonitoredExtensions) { return }
     
+    # Calculate hash
     $fileHash = Get-FileHashSafe -FilePath $FilePath
     if (-not $fileHash) { return }
     
+    # Check cache
     if ($KnownFilesCache.ContainsKey($fileHash)) {
         if (-not $KnownFilesCache[$fileHash]) {
+            # Known bad file
             Move-ToQuarantine -FilePath $FilePath -Reason "Previously identified threat"
         }
         return
     }
     
+    # Check CIRCL for known-good
     if (Test-CirclHashLookup -SHA256 $fileHash) {
         Save-ToDatabase -Hash $fileHash -IsSafe $true
         Write-Log "ALLOWED (CIRCL known-good): $FilePath"
         return
     }
     
+    # Check Cymru for known-bad
     if (Test-CymruMalwareHash -SHA256 $fileHash) {
         Save-ToDatabase -Hash $fileHash -IsSafe $false
         Move-ToQuarantine -FilePath $FilePath -Reason "Cymru MHR malware match (>=$($Config.CymruDetectionThreshold)% detection)"
         return
     }
     
+    # Check MalwareBazaar
     if (Test-MalwareBazaarHash -SHA256 $fileHash) {
         Save-ToDatabase -Hash $fileHash -IsSafe $false
         Move-ToQuarantine -FilePath $FilePath -Reason "MalwareBazaar malware match"
         return
     }
     
+    # Check for suspicious unsigned DLL
     if (Test-SuspiciousUnsignedDll -FilePath $FilePath) {
         Save-ToDatabase -Hash $fileHash -IsSafe $false
         Move-ToQuarantine -FilePath $FilePath -Reason "Suspicious unsigned DLL/WINMD in risky location"
         return
     }
     
+    # Check digital signature
     $signatureInfo = Get-FileSignatureInfo -FilePath $FilePath
     if ($signatureInfo) {
         $isSafe = ($signatureInfo.Status -eq 'Valid')
@@ -612,7 +788,95 @@ function Invoke-ThreatAnalysis {
     }
 }
 
-function Initialize-Yara {
+# ========================= MEMORY SCANNING =========================
+function Start-MemoryScanner {
+    if (-not $Config.EnableMemoryScanning) {
+        Write-Log "Memory scanning is disabled in configuration"
+        return
+    }
+    
+    Write-Log "Starting optimized memory scanner (interval: $($Config.MemoryScanIntervalSec)s, max size: $($Config.MemoryScanMaxSizeMB)MB)"
+    
+    Start-Job -ScriptBlock {
+        $config = $using:Config
+        $protected = $using:ProtectedProcesses
+        $evilStrings = $using:EvilStrings
+        $logFile = Join-Path $config.BaseDirectory "memory_hits.log"
+        
+        while ($true) {
+            Start-Sleep -Seconds $config.MemoryScanIntervalSec
+            
+            # Only scan small processes (potential malware)
+            $maxBytes = $config.MemoryScanMaxSizeMB * 1MB
+            
+            Get-Process | Where-Object {
+                $_.WorkingSet64 -lt $maxBytes -and $protected -notcontains $_.Name
+            } | ForEach-Object {
+                $process = $_
+                $suspicious = $false
+                $reasons = @()
+                
+                # Check for reflective loading / process hollowing
+                try {
+                    if (-not $process.Path -or $process.Path -eq '') {
+                        $suspicious = $true
+                        $reasons += "NoPath"
+                    }
+                } catch {}
+                
+                # Check for empty modules
+                try {
+                    $emptyModules = $process.Modules | Where-Object {
+                        $_.FileName -eq '' -or $_.ModuleName -eq ''
+                    }
+                    
+                    if ($emptyModules) {
+                        $suspicious = $true
+                        $reasons += "EmptyModule"
+                    }
+                } catch {}
+                
+                # Check for evil strings in module names
+                try {
+                    foreach ($module in $process.Modules) {
+                        foreach ($evilString in $evilStrings) {
+                            if ($module.ModuleName -match $evilString -or ($module.FileName -and $module.FileName -match $evilString)) {
+                                $suspicious = $true
+                                $reasons += "EvilString($evilString)"
+                                break
+                            }
+                        }
+                        if ($suspicious) { break }
+                    }
+                } catch {}
+                
+                # If suspicious, log and kill
+                if ($suspicious) {
+                    $reasonString = $reasons -join '; '
+                    $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | MEMORY HIT [$reasonString] -> $($process.Name) (PID: $($process.Id)) Path: '$($process.Path)' WS: $([math]::Round($process.WorkingSet64/1MB, 2))MB"
+                    
+                    try {
+                        $logEntry | Out-File -FilePath $logFile -Append -Encoding UTF8
+                    } catch {}
+                    
+                    # Kill the suspicious process
+                    try {
+                        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                    } catch {}
+                }
+            }
+            
+            # Periodic garbage collection to manage memory
+            if ((Get-Random -Minimum 1 -Maximum 10) -eq 1) {
+                [System.GC]::Collect()
+                [System.GC]::WaitForPendingFinalizers()
+            }
+        }
+    } | Out-Null
+}
+
+# ========================= YARA MEMORY SCANNER =========================
+function Start-YaraMemoryScanner {
     param(
         [string]$BaseDir = $Config.BaseDirectory
     )
@@ -702,6 +966,41 @@ function Initialize-Yara {
 
     if (Test-Path $yaraExe) {
         Write-Log "YARA setup complete - ready to use"
+        
+        Write-Log "Starting YARA memory scanner"
+        
+        Start-Job -ScriptBlock {
+            param($yaraExePath, $yaraRulePath, $protectedProcs, $configData)
+            
+            $logFile = Join-Path $configData.BaseDirectory "yara_memory_hits.log"
+            
+            while ($true) {
+                Start-Sleep -Seconds $configData.MemoryScanIntervalSec
+                
+                Get-Process | Where-Object {
+                    $_.WorkingSet64 -gt 100MB -or $_.Name -match 'powershell|wscript|cscript|mshta|rundll32|regsvr32|msbuild|cmstp'
+                } | ForEach-Object {
+                    $process = $_
+                    
+                    try {
+                        $result = & $yaraExePath -w $yaraRulePath -p $process.Id 2>$null
+                        
+                        if ($LASTEXITCODE -eq 0 -and $result) {
+                            $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | YARA HIT -> $($process.Name) (PID: $($process.Id))"
+                            
+                            try {
+                                $logEntry | Out-File -FilePath $logFile -Append -Encoding UTF8
+                            } catch {}
+                            
+                            if ($protectedProcs -notcontains $process.Name) {
+                                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                            }
+                        }
+                    } catch {}
+                }
+            }
+        } -ArgumentList $yaraExe, $yaraRuleMem, $ProtectedProcesses, $Config | Out-Null
+        
         return $true
     }
     else {
@@ -710,160 +1009,11 @@ function Initialize-Yara {
     }
 }
 
-$yaraReady = Initialize-Yara
-
-$Script:MemoryScanJob = $null
-$Script:MemoryScanScriptBlock = {
-    param($MaxBytes, $ProtectedProcs, $EvilStrs, $LogFile)
-    
-    $results = @()
-    Get-Process -EA 0 | Where-Object {
-        $_.WorkingSet64 -lt $MaxBytes -and $ProtectedProcs -notcontains $_.Name
-    } | ForEach-Object {
-        $process = $_
-        $suspicious = $false
-        $reasons = @()
-        
-        try {
-            if (-not $process.Path -or $process.Path -eq '') {
-                $suspicious = $true
-                $reasons += "NoPath"
-            }
-        } catch {}
-        
-        try {
-            $emptyModules = $process.Modules | Where-Object {
-                $_.FileName -eq '' -or $_.ModuleName -eq ''
-            }
-            if ($emptyModules) {
-                $suspicious = $true
-                $reasons += "EmptyModule"
-            }
-        } catch {}
-        
-        try {
-            foreach ($module in $process.Modules) {
-                foreach ($evilString in $EvilStrs) {
-                    if ($module.ModuleName -match $evilString -or ($module.FileName -and $module.FileName -match $evilString)) {
-                        $suspicious = $true
-                        $reasons += "EvilString($evilString)"
-                        break
-                    }
-                }
-                if ($suspicious) { break }
-            }
-        } catch {}
-        
-        if ($suspicious) {
-            $results += @{
-                ProcessName = $process.Name
-                ProcessId = $process.Id
-                Path = $process.Path
-                WorkingSet = $process.WorkingSet64
-                Reasons = ($reasons -join '; ')
-            }
-        }
-    }
-    return $results
-}
-
-function Invoke-MemoryScan {
-    if (-not $Config.EnableMemoryScanning) { return }
-    
-    # Clean up previous job if exists
-    if ($Script:MemoryScanJob) {
-        if ($Script:MemoryScanJob.State -eq 'Running') { return }
-        
-        # Process results from completed job
-        if ($Script:MemoryScanJob.State -eq 'Completed') {
-            $results = Receive-Job -Job $Script:MemoryScanJob -EA 0
-            $logFile = Join-Path $Config.BaseDirectory "memory_hits.log"
-            
-            foreach ($hit in $results) {
-                $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | MEMORY HIT [$($hit.Reasons)] -> $($hit.ProcessName) (PID: $($hit.ProcessId)) Path: '$($hit.Path)' WS: $([math]::Round($hit.WorkingSet/1MB, 2))MB"
-                Write-Log "MEMORY: $($hit.Reasons) -> $($hit.ProcessName) (PID: $($hit.ProcessId))"
-                try { $logEntry | Out-File -FilePath $logFile -Append -Encoding UTF8 } catch {}
-                try { Stop-Process -Id $hit.ProcessId -Force -EA 0 } catch {}
-            }
-        }
-        
-        Remove-Job -Job $Script:MemoryScanJob -Force -EA 0
-        $Script:MemoryScanJob = $null
-    }
-    
-    # Start new job
-    $maxBytes = $Config.MemoryScanMaxSizeMB * 1MB
-    $Script:MemoryScanJob = Start-Job -ScriptBlock $Script:MemoryScanScriptBlock -ArgumentList @(
-        $maxBytes, $ProtectedProcesses, $EvilStrings, (Join-Path $Config.BaseDirectory "memory_hits.log")
-    )
-}
-
-$Script:YaraScanJob = $null
-$Script:YaraScanScriptBlock = {
-    param($YaraExe, $YaraRule, $ProtectedProcs)
-    
-    if (-not (Test-Path $YaraExe) -or -not (Test-Path $YaraRule)) { return @() }
-    
-    $results = @()
-    Get-Process -EA 0 | Where-Object {
-        $_.WorkingSet64 -gt 100MB -or $_.Name -match 'powershell|wscript|cscript|mshta|rundll32|regsvr32|msbuild|cmstp'
-    } | ForEach-Object {
-        $process = $_
-        
-        try {
-            $result = & $YaraExe -w $YaraRule -p $process.Id 2>$null
-            
-            if ($LASTEXITCODE -eq 0 -and $result) {
-                $results += @{
-                    ProcessName = $process.Name
-                    ProcessId = $process.Id
-                    IsProtected = ($ProtectedProcs -contains $process.Name)
-                }
-            }
-        } catch {}
-    }
-    return $results
-}
-
-function Invoke-YaraMemoryScan {
-    $yaraExePath = Join-Path $Config.BaseDirectory "yara64.exe"
-    $yaraRulePath = Join-Path $Config.BaseDirectory "mem.yar"
-    
-    if (-not (Test-Path $yaraExePath) -or -not (Test-Path $yaraRulePath)) { return }
-    
-    # Clean up previous job if exists
-    if ($Script:YaraScanJob) {
-        if ($Script:YaraScanJob.State -eq 'Running') { return }
-        
-        # Process results from completed job
-        if ($Script:YaraScanJob.State -eq 'Completed') {
-            $results = Receive-Job -Job $Script:YaraScanJob -EA 0
-            $logFile = Join-Path $Config.BaseDirectory "yara_memory_hits.log"
-            
-            foreach ($hit in $results) {
-                $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | YARA HIT -> $($hit.ProcessName) (PID: $($hit.ProcessId))"
-                Write-Log "YARA: Hit on $($hit.ProcessName) (PID: $($hit.ProcessId))"
-                try { $logEntry | Out-File -FilePath $logFile -Append -Encoding UTF8 } catch {}
-                
-                if (-not $hit.IsProtected) {
-                    Stop-Process -Id $hit.ProcessId -Force -EA 0
-                }
-            }
-        }
-        
-        Remove-Job -Job $Script:YaraScanJob -Force -EA 0
-        $Script:YaraScanJob = $null
-    }
-    
-    # Start new job
-    $Script:YaraScanJob = Start-Job -ScriptBlock $Script:YaraScanScriptBlock -ArgumentList @(
-        $yaraExePath, $yaraRulePath, $ProtectedProcesses
-    )
-}
-
+# ========================= FILELESS MALWARE DETECTION =========================
 function Find-FilelessIndicators {
     $detections = @()
     
+    # Check for PowerShell without file
     try {
         $suspiciousPowerShell = Get-Process -Name powershell, pwsh -ErrorAction SilentlyContinue | Where-Object {
             $_.MainWindowTitle -match 'encodedcommand|enc|iex|invoke-expression'
@@ -878,6 +1028,7 @@ function Find-FilelessIndicators {
         }
     } catch {}
     
+    # Check WMI event subscriptions
     try {
         $wmiEvents = Get-WmiObject -Namespace root\Subscription -Class __EventFilter -ErrorAction SilentlyContinue |
             Where-Object { $_.Query -match 'powershell|vbscript|javascript' }
@@ -891,6 +1042,7 @@ function Find-FilelessIndicators {
         }
     } catch {}
     
+    # Check registry Run keys for scripts
     try {
         $registryKeys = @(
             'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
@@ -919,6 +1071,7 @@ function Find-FilelessIndicators {
     return $detections
 }
 
+# ========================= PERSISTENCE DETECTION =========================
 function Find-PersistenceMechanisms {
     $suspiciousItems = @()
     
@@ -936,6 +1089,7 @@ function Find-PersistenceMechanisms {
     foreach ($location in $locations) {
         try {
             if ($location -match '^HK') {
+                # Registry location
                 if (Test-Path $location) {
                     $props = Get-ItemProperty -Path $location -ErrorAction SilentlyContinue
                     
@@ -953,6 +1107,7 @@ function Find-PersistenceMechanisms {
                     }
                 }
             } else {
+                # File system location
                 if (Test-Path $location) {
                     Get-ChildItem -Path $location -Recurse -File -ErrorAction SilentlyContinue |
                         Where-Object { $_.Extension -match '\.(exe|dll|lnk|ps1|vbs|js|bat|cmd)$' } |
@@ -974,6 +1129,7 @@ function Find-PersistenceMechanisms {
     return $suspiciousItems
 }
 
+# ========================= BEHAVIOR ANALYSIS =========================
 function Test-ProcessHollowing {
     param($Process)
     
@@ -1047,10 +1203,13 @@ function Test-C2Communication {
     return $false
 }
 
+# ========================= PROCESS AND NETWORK SCANNING =========================
 function Invoke-ProcessAndNetworkScan {
+    # Scan running processes
     Get-Process | ForEach-Object {
         $process = $_
         
+        # Analyze executable if path exists
         try {
             $exePath = $process.MainModule.FileName
             if ($exePath -and (Test-Path $exePath)) {
@@ -1058,6 +1217,7 @@ function Invoke-ProcessAndNetworkScan {
             }
         } catch {}
         
+        # Behavior analysis
         if ($BehaviorConfig.EnableBehaviorKill -and ($ProtectedProcesses -notcontains $process.Name)) {
             try {
                 if (Test-ProcessHollowing -Process $process) {
@@ -1078,6 +1238,7 @@ function Invoke-ProcessAndNetworkScan {
         }
     }
     
+    # Scan network connections
     if ($BehaviorConfig.EnableAutoBlockC2) {
         Get-NetTCPConnection -ErrorAction SilentlyContinue | Where-Object {
             $_.State -in @('Established', 'Listen')
@@ -1095,6 +1256,7 @@ function Invoke-ProcessAndNetworkScan {
                         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
                     }
                     
+                    # Block the IP with firewall rule
                     try {
                         $ruleName = "Block_C2_$($connection.RemoteAddress)"
                         New-NetFirewallRule -DisplayName $ruleName `
@@ -1108,699 +1270,201 @@ function Invoke-ProcessAndNetworkScan {
                         Write-Log "Created firewall rule to block: $($connection.RemoteAddress)"
                     } catch {}
                 }
-            } catch {            }
-        }
-    }
-}
-
-# ===================== Additional Detection Functions =====================
-
-function Stop-ThreatProcess {
-    param([int]$ProcessId, [string]$ProcessName)
-    
-    if ($ProcessId -eq $PID) { return }
-    if ($ProtectedProcesses -contains $ProcessName -or $ProtectedProcesses -contains ($ProcessName -replace '\.exe$','')) { return }
-    
-    try {
-        $proc = Get-Process -Id $ProcessId -EA 0
-        if ($proc.Path -like 'C:\Windows\*' -or $proc.Path -like 'C:\Program Files*') { return }
-        
-        Stop-Process -Id $ProcessId -Force -EA 0
-        Write-Log "Terminated threat: $ProcessName (PID: $ProcessId)"
-    } catch {}
-}
-
-function Invoke-LOLBinDetection {
-    # Living Off the Land Binaries - legitimate Windows tools abused by attackers
-    # Extended patterns based on LOLBAS project (https://lolbas-project.github.io/)
-    $LOLBins = @{
-        "certutil"   = "-decode|-urlcache|-verifyctl|-encode|-ping|-f\s+http"
-        "bitsadmin"  = "transfer|addfile|/download|/create|/addfile|/SetNotifyCmdLine"
-        "mshta"      = "http://|https://|javascript:|vbscript:|about:"
-        "regsvr32"   = "scrobj\.dll|/s|/n|/u|/i:http|/i:ftp"
-        "rundll32"   = "javascript:|http://|shell32\.dll,Control_RunDLL|advpack\.dll|ieadvpack\.dll|zipfldr\.dll"
-        "wmic"       = "process call create|/node:|format:.*http|xsl:http|/format:"
-        "powershell" = "-enc\s|-encodedcommand|downloadstring|iex\s|invoke-expression|-nop|-w\s*hidden|bypass|-ep\s+bypass|webclient|Net\.WebClient|bitstransfer"
-        "msiexec"    = "/quiet|/q.*http|/i\s+http|/i\s+\\\\|/y\s+|/y.*\.dll|/z.*\.dll"
-        "cscript"    = "http://|https://|//e:jscript|//e:vbscript"
-        "wscript"    = "http://|https://|//e:jscript|//e:vbscript"
-        "cmd"        = "/c.*powershell.*-enc|/c.*certutil.*-urlcache|/c.*bitsadmin.*transfer"
-        "forfiles"   = "/c.*cmd|/c.*powershell"
-        "pcalua"     = "-a.*\.exe|-a.*\.dll|-a.*http"
-        "msconfig"   = "-5|/auto"
-        "msbuild"    = "\.csproj|\.xml|/p:.*http"
-        "installutil"= "/logfile=|/LogToConsole=false"
-        "regasm"     = "/u\s+"
-        "regsvcs"    = "/u\s+"
-        "cmstp"      = "/ni|/s|/au|\.inf"
-        "dnscmd"     = "/config|/enumrecords"
-        "eudcedit"   = ".*"
-        "eventvwr"   = ".*"
-        "expand"     = "-f:.*\.dll|-f:.*\.exe|http://|https://"
-        "extrac32"   = "/y|/c|\.cab"
-        "findstr"    = "/s.*password|/s.*credential"
-        "ftp"        = "-s:"
-        "gpscript"   = "/startup|/logon"
-        "hh"         = "http://|https://|\.chm"
-        "ieexec"     = "http://|https://"
-        "infdefaultinstall" = ".*\.inf"
-        "makecab"    = "/d.*cmd|/d.*powershell"
-        "mavinject"  = "/injectrunning"
-        "mftrace"    = ".*\.dll"
-        "microsoft.workflow.compiler" = ".*\.xml"
-        "mmc"        = "-a.*\.msc|\.msc.*http"
-        "msdeploy"   = "-source:.*-dest:"
-        "msdt"       = "PCWDiagnostic|/id"
-        "netsh"      = "add helper|trace start"
-        "odbcconf"   = "/a.*regsvr|/f.*\.rsp"
-        "pcwrun"     = ".*\.exe"
-        "presentationhost" = ".*\.xbap|.*\.xaml"
-        "print"      = "/d:.*\.exe|/d:.*\.dll"
-        "psr"        = "/start|/gui 0"
-        "rasautou"   = "-a.*-e"
-        "rdrleakdiag"= "/fullmemdmp"
-        "reg"        = "export.*sam|export.*security|save.*sam|save.*security|add.*Run"
-        "regedit"    = "/s.*\.reg|/e.*\.reg"
-        "replace"    = "/a.*\.exe|/a.*\.dll"
-        "rpcping"    = "-u.*-a.*-f"
-        "runscripthelper" = "surfacecheck"
-        "sc"         = "create.*binpath|config.*binpath"
-        "schtasks"   = "/create.*/tr.*powershell|/create.*/tr.*cmd|/create.*/tr.*http"
-        "scriptrunner" = "-appvscript"
-        "syncappvpublishingserver" = ".*powershell|.*\;"
-        "tttracer"   = "-dumpfull"
-        "verclsid"   = "/c|/s"
-        "wab"        = ".*"
-        "winrm"      = "invoke|create.*powershell"
-        "xwizard"    = "runwizard|/extract"
-    }
-    
-    foreach ($proc in Get-WmiObject Win32_Process -EA 0) {
-        if ($proc.ProcessId -eq $PID -or -not $proc.CommandLine) { continue }
-        
-        $name = $proc.Name -replace '\.exe$',''
-        $cmd = $proc.CommandLine.ToLower()
-        
-        foreach ($lolbin in $LOLBins.Keys) {
-            if ($name -eq $lolbin -and $cmd -match $LOLBins[$lolbin]) {
-                Write-Log "LOLBin attack: $($proc.Name) PID:$($proc.ProcessId)"
-                Stop-ThreatProcess -ProcessId $proc.ProcessId -ProcessName $proc.Name
-                break
-            }
-        }
-    }
-}
-
-function Invoke-ProcessAnomalyDetection {
-    $systemBinaries = @("svchost.exe", "lsass.exe", "csrss.exe", "smss.exe", "wininit.exe", "services.exe")
-    $officeApps = "winword|excel|powerpnt|outlook|msaccess"
-    $scriptEngines = "powershell|cmd|wscript|cscript|mshta"
-    
-    foreach ($proc in Get-WmiObject Win32_Process -EA 0) {
-        if ($proc.ProcessId -eq $PID) { continue }
-        
-        $cmd = $proc.CommandLine
-        $path = $proc.ExecutablePath
-        $parent = Get-WmiObject Win32_Process -Filter "ProcessId=$($proc.ParentProcessId)" -EA 0
-        
-        # Office apps spawning script engines (macro attack)
-        if ($parent.Name -match $officeApps -and $proc.Name -match $scriptEngines) {
-            Write-Log "Macro attack: $($parent.Name) spawned $($proc.Name)"
-            Stop-ThreatProcess -ProcessId $proc.ProcessId -ProcessName $proc.Name
-            continue
-        }
-        
-        # System binaries from wrong location
-        if ($proc.Name -in $systemBinaries -and $path -and $path -notmatch "Windows\\System32") {
-            Write-Log "Masquerading: Fake $($proc.Name) at $path"
-            Stop-ThreatProcess -ProcessId $proc.ProcessId -ProcessName $proc.Name
-            continue
-        }
-        
-        # Suspicious command line patterns
-        if ($cmd -and ($cmd -match "-enc\s.*bypass" -or $cmd -match "DownloadString|DownloadFile" -or $cmd -match "FromBase64String.*Invoke")) {
-            Write-Log "Suspicious process: $($proc.Name)"
-            Stop-ThreatProcess -ProcessId $proc.ProcessId -ProcessName $proc.Name
-        }
-    }
-}
-
-function Invoke-AMSIBypassDetection {
-    $pattern = "AmsiScanBuffer|amsiInitFailed|AmsiUtils|AmsiContext|Patch.*Amsi|Disable.*Amsi|bypass.*amsi"
-    
-    foreach ($proc in Get-CimInstance Win32_Process -EA 0) {
-        if ($proc.ProcessId -eq $PID -or $proc.Name -notmatch "powershell|pwsh|wscript|cscript") { continue }
-        
-        $cmd = $proc.CommandLine
-        if (-not $cmd) { continue }
-        
-        if ($cmd -match $pattern) {
-            Write-Log "AMSI bypass attempt: $($proc.Name) PID:$($proc.ProcessId)"
-            Stop-ThreatProcess -ProcessId $proc.ProcessId -ProcessName $proc.Name
-            continue
-        }
-        
-        # Check encoded commands
-        if ($cmd -match "-enc\s+([A-Za-z0-9+/=]+)") {
-            try {
-                $decoded = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches[1]))
-                if ($decoded -match $pattern) {
-                    Write-Log "Encoded AMSI bypass: $($proc.Name)"
-                    Stop-ThreatProcess -ProcessId $proc.ProcessId -ProcessName $proc.Name
-                }
             } catch {}
         }
     }
 }
 
-function Invoke-CredentialDumpDetection {
-    $toolPattern = "mimikatz|sekurlsa|pwdump|gsecdump|procdump|nanodump|lsassy|lazagne|hashdump"
-    $lsassProc = Get-Process lsass -EA 0
-    
-    foreach ($proc in Get-WmiObject Win32_Process -EA 0) {
-        if ($proc.ProcessId -eq $PID) { continue }
-        
-        $cmd = $proc.CommandLine
-        $name = $proc.Name
-        
-        # Known tools
-        if ($name -match $toolPattern -or $cmd -match $toolPattern) {
-            Write-Log "Credential tool: $name"
-            Stop-ThreatProcess -ProcessId $proc.ProcessId -ProcessName $name
-            continue
-        }
-        
-        # LSASS access
-        if ($lsassProc -and $cmd -match "lsass" -and $proc.ProcessId -ne $lsassProc.Id) {
-            Write-Log "LSASS access: $name"
-            Stop-ThreatProcess -ProcessId $proc.ProcessId -ProcessName $name
-            continue
-        }
-        
-        # Memory/registry dumps
-        if ($cmd -match "MiniDump|comsvcs\.dll.*#24|reg\s+(save|export).*(sam|security|system)") {
-            Write-Log "Credential dump: $name"
-            Stop-ThreatProcess -ProcessId $proc.ProcessId -ProcessName $name
+# ========================= INITIAL SCAN =========================
+Write-Log "Performing initial scan of high-risk folders"
+
+$highRiskFolders = @(
+    "$env:USERPROFILE\Downloads",
+    "$env:USERPROFILE\Desktop",
+    "$env:TEMP",
+    "$env:APPDATA",
+    "$env:LOCALAPPDATA\Temp"
+)
+
+foreach ($folder in $highRiskFolders) {
+    if (Test-Path $folder) {
+        Write-Log "Scanning: $folder"
+        Get-ChildItem -Path $folder -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+            Invoke-ThreatAnalysis -FilePath $_.FullName
         }
     }
 }
 
-function Invoke-WMIPersistenceDetection {
+# ========================= REAL-TIME FILE MONITORING =========================
+if ($Config.EnableRealtimeMonitor) {
+    Write-Log "Setting up real-time file monitoring"
+    
+    foreach ($folder in $highRiskFolders) {
+        if (-not (Test-Path $folder)) { continue }
+        
+        try {
+            $watcher = New-Object IO.FileSystemWatcher $folder, '*.*' -Property @{
+                IncludeSubdirectories = $true
+                NotifyFilter          = [IO.NotifyFilters]'FileName, LastWrite'
+            }
+            
+            Register-ObjectEvent $watcher Created -Action {
+                $filePath = $Event.SourceEventArgs.FullPath
+                $extension = [IO.Path]::GetExtension($filePath).ToLower()
+                
+                if ($MonitoredExtensions -contains $extension) {
+                    Start-Sleep -Milliseconds 800
+                    Invoke-ThreatAnalysis -FilePath $filePath
+                }
+            } | Out-Null
+            
+            $watcher.EnableRaisingEvents = $true
+            Write-Log "File watcher active for: $folder"
+        } catch {
+            Write-Log "Failed to create file watcher for $folder : $_"
+        }
+    }
+}
+
+# ========================= WMI REAL-TIME EXECUTION HOOKS =========================
+Write-Log "Registering WMI real-time execution monitors"
+
+try {
+    Register-WmiEvent -Query "SELECT * FROM Win32_ProcessStartTrace" -Action {
+        $event = $Event.SourceEventArgs.NewEvent
+        $filePath = $event.ProcessName
+        $processId = $event.ProcessId
+        
+        try {
+            $ownerSid = (Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction SilentlyContinue | 
+                Invoke-CimMethod -MethodName GetOwnerSid).Sid
+        } catch {
+            $ownerSid = "Unknown"
+        }
+        
+        # Quick allow for trusted SIDs with valid signatures
+        if ($AllowedSIDs -contains $ownerSid) {
+            try {
+                $signature = Get-AuthenticodeSignature -FilePath $filePath -ErrorAction Stop
+                if ($signature.Status -eq 'Valid') {
+                    return
+                }
+            } catch {}
+        }
+        
+        Block-FileExecution -FilePath $filePath -ProcessId $processId -Type "EXE"
+    } | Out-Null
+    
+    Write-Log "WMI process start monitor registered"
+} catch {
+    Write-Log "Failed to register WMI process start monitor: $_"
+}
+
+try {
+    Register-WmiEvent -Query "SELECT * FROM Win32_ModuleLoadTrace" -Action {
+        $event = $Event.SourceEventArgs.NewEvent
+        $filePath = $event.ImageName
+        $processId = $event.ProcessId
+        
+        if (-not (Test-Path $filePath)) { return }
+        
+        try {
+            $ownerSid = (Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction SilentlyContinue | 
+                Invoke-CimMethod -MethodName GetOwnerSid).Sid
+        } catch {
+            $ownerSid = "Unknown"
+        }
+        
+        # Quick allow for trusted SIDs with valid signatures
+        if ($AllowedSIDs -contains $ownerSid) {
+            try {
+                $signature = Get-AuthenticodeSignature -FilePath $filePath -ErrorAction Stop
+                if ($signature.Status -eq 'Valid') {
+                    return
+                }
+            } catch {}
+        }
+        
+        Block-FileExecution -FilePath $filePath -ProcessId $processId -Type "DLL"
+    } | Out-Null
+    
+    Write-Log "WMI module load monitor registered"
+} catch {
+    Write-Log "Failed to register WMI module load monitor: $_"
+}
+
+# ========================= START BACKGROUND TASKS =========================
+
+# Start memory scanner
+if ($Config.EnableMemoryScanning) {
+    Start-MemoryScanner
+    Start-YaraMemoryScanner
+}
+
+# Start threat intelligence updater and deep scanner
+if ($IsAdmin -and $Config.EnableThreatIntel) {
+    $lastUpdateFile = Join-Path $Config.BaseDirectory "last_update.txt"
+    $currentTime = Get-Date
+    $shouldUpdate = $false
+    
+    if (-not (Test-Path $lastUpdateFile)) {
+        $shouldUpdate = $true
+    } else {
+        try {
+            $lastUpdate = (Get-Item $lastUpdateFile).LastWriteTime
+            if ($lastUpdate -lt $currentTime.AddDays(-$BehaviorConfig.ThreatIntelUpdateDays)) {
+                $shouldUpdate = $true
+            }
+        } catch {
+            $shouldUpdate = $true
+        }
+    }
+    
+    if ($shouldUpdate) {
+        Update-ThreatIntelligence
+        $currentTime | Out-File -FilePath $lastUpdateFile
+    }
+    
+    # Start deep scan scheduled task (runs in main loop instead of separate job for function access)
+    $Script:LastDeepScan = Get-Date
+    $Script:DeepScanIntervalSeconds = 60 * 60 * $BehaviorConfig.DeepScanIntervalHours
+    
+    Write-Log "Deep scanner initialized (interval: $($BehaviorConfig.DeepScanIntervalHours) hours)"
+}
+
+function Invoke-ScheduledDeepScan {
+    if (-not $Script:LastDeepScan) { return }
+    
+    $timeSinceLastScan = (Get-Date) - $Script:LastDeepScan
+    if ($timeSinceLastScan.TotalSeconds -lt $Script:DeepScanIntervalSeconds) { return }
+    
+    $Script:LastDeepScan = Get-Date
+    Write-Log "Running scheduled deep scan..."
+    
+    # Persistence scan
     try {
-        $ns = "root\subscription"
-        $filters = Get-CimInstance -Namespace $ns -ClassName __EventFilter -EA 0
-        $consumers = Get-CimInstance -Namespace $ns -ClassName CommandLineEventConsumer -EA 0
-        $bindings = Get-CimInstance -Namespace $ns -ClassName __FilterToConsumerBinding -EA 0
-        
-        foreach ($filter in $filters) {
-            if ($filter.Name -match "microsoft|SCM Event") { continue }
-            if ($filter.Query -match "ProcessStartTrace|powershell|cmd") {
-                Write-Log "Malicious WMI filter: $($filter.Name)"
-                Send-ThreatAlert -Severity "HIGH" -Message "WMI persistence detected" -Details $filter.Name
-                $bindings | Where-Object { $_.Filter -like "*$($filter.Name)*" } | ForEach-Object { Remove-CimInstance $_ -EA 0 }
-                Remove-CimInstance $filter -EA 0
-            }
-        }
-        
-        foreach ($consumer in $consumers) {
-            if ($consumer.CommandLineTemplate -match "powershell|cmd|-enc|http") {
-                Write-Log "Malicious WMI consumer: $($consumer.Name)"
-                Send-ThreatAlert -Severity "HIGH" -Message "WMI persistence detected" -Details $consumer.Name
-                $bindings | Where-Object { $_.Consumer -like "*$($consumer.Name)*" } | ForEach-Object { Remove-CimInstance $_ -EA 0 }
-                Remove-CimInstance $consumer -EA 0
-            }
-        }
-    } catch {}
-}
-
-function Invoke-ScheduledTaskDetection {
-    $whitelist = @("Antivirus", "GoogleUpdate", "MicrosoftEdge", "OneDrive", "Adobe")
-    $badExes = "powershell|cmd\.exe|wscript|cscript|mshta|certutil|bitsadmin"
-    $badArgs = "-enc|http://|https://|bypass|hidden|downloadstring"
-    
-    try {
-        foreach ($task in Get-ScheduledTask -EA 0 | Where-Object { $_.State -eq "Ready" -and $_.TaskPath -notmatch "\\Microsoft\\" }) {
-            if ($whitelist | Where-Object { $task.TaskName -match $_ }) { continue }
-            
-            $exe = $task.Actions[0].Execute
-            $args = $task.Actions[0].Arguments
-            
-            if ($exe -match $badExes -and $args -match $badArgs) {
-                Write-Log "Malicious task: $($task.TaskName)"
-                Send-ThreatAlert -Severity "HIGH" -Message "Malicious scheduled task" -Details $task.TaskName
-                Unregister-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -Confirm:$false -EA 0
-            }
-        }
-    } catch {}
-}
-
-function Invoke-RegistryPersistenceDetection {
-    $runKeys = @(
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
-    )
-    $badPattern = "powershell.*-enc|cmd.*/c.*powershell|http://|https://|wscript|cscript|mshta"
-    
-    foreach ($key in $runKeys) {
-        if (-not (Test-Path $key)) { continue }
-        try {
-            $props = Get-ItemProperty -Path $key -EA 0
-            foreach ($prop in $props.PSObject.Properties) {
-                if ($prop.Name -match "^PS" -or -not $prop.Value) { continue }
-                
-                if ($prop.Value -match $badPattern) {
-                    Write-Log "Registry persistence: $key\$($prop.Name)"
-                    Send-ThreatAlert -Severity "HIGH" -Message "Registry persistence" -Details "$key\$($prop.Name)"
-                    
-                    # Try to quarantine the executable
-                    $exePath = ($prop.Value -split ' ')[0] -replace '"',''
-                    if ($exePath -and (Test-Path $exePath) -and $exePath -notmatch "Windows|Program Files") {
-                        Move-ToQuarantine -FilePath $exePath -Reason "Registry persistence executable"
-                    }
-                    
-                    if ($key -like "HKCU:*") {
-                        Remove-ItemProperty -Path $key -Name $prop.Name -EA 0
-                    }
-                }
-            }
-        } catch {}
-    }
-}
-
-function Invoke-DLLHijackingDetection {
-    $badLocations = "\\Temp\\|\\Downloads\\|\\Desktop\\|\\AppData\\"
-    
-    foreach ($proc in (Get-CachedProcessList)) {
-        if ($proc.Id -eq $PID) { continue }
-        try {
-            foreach ($mod in $proc.Modules) {
-                if ($mod.FileName -match $badLocations -and $mod.FileName -like "*.dll") {
-                    $sig = Get-AuthenticodeSignature $mod.FileName -EA 0
-                    if ($sig.Status -ne "Valid") {
-                        Write-Log "Suspicious DLL: $($proc.ProcessName) loaded $($mod.FileName)"
-                        Stop-ThreatProcess -ProcessId $proc.Id -ProcessName $proc.ProcessName
-                        break
-                    }
-                }
-            }
-        } catch {}
-    }
-}
-
-function Invoke-TokenManipulationDetection {
-    foreach ($proc in (Get-CachedProcessList) | Where-Object { $_.Path }) {
-        try {
-            $owner = (Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.Id)" -EA 0).GetOwner()
-            if ($owner.Domain -eq "NT AUTHORITY" -and $proc.Path -notmatch "^C:\\Windows") {
-                Write-Log "Token manipulation: $($proc.ProcessName) as SYSTEM from $($proc.Path)"
-                Stop-ThreatProcess -ProcessId $proc.Id -ProcessName $proc.ProcessName
-            }
-        } catch {}
-    }
-}
-
-function Invoke-ProcessHollowingDetection {
-    # System processes and their legitimate locations
-    $systemProcsSystem32 = @("svchost.exe", "lsass.exe", "csrss.exe", "services.exe", "smss.exe", "wininit.exe")
-    $systemProcsWindows = @("explorer.exe")  # explorer.exe is in C:\Windows, not System32
-    
-    foreach ($proc in Get-CimInstance Win32_Process -EA 0) {
-        if ($proc.ProcessId -eq $PID) { continue }
-        try {
-            $procObj = Get-Process -Id $proc.ProcessId -EA 0
-            
-            # Path mismatch
-            if ($procObj.Path -and $proc.ExecutablePath -and $procObj.Path -ne $proc.ExecutablePath) {
-                Write-Log "Process hollowing: $($proc.Name)"
-                Stop-ThreatProcess -ProcessId $proc.ProcessId -ProcessName $proc.Name
-                continue
-            }
-            
-            # System32 processes from wrong location
-            if ($proc.Name -in $systemProcsSystem32 -and $proc.ExecutablePath -and $proc.ExecutablePath -notmatch "Windows\\System32") {
-                Write-Log "Fake system process: $($proc.Name) at $($proc.ExecutablePath)"
-                Stop-ThreatProcess -ProcessId $proc.ProcessId -ProcessName $proc.Name
-            }
-            
-            # Windows folder processes from wrong location
-            if ($proc.Name -in $systemProcsWindows -and $proc.ExecutablePath -and $proc.ExecutablePath -notmatch "^C:\\Windows\\[^\\]+$") {
-                Write-Log "Fake system process: $($proc.Name) at $($proc.ExecutablePath)"
-                Stop-ThreatProcess -ProcessId $proc.ProcessId -ProcessName $proc.Name
-            }
-        } catch {}
-    }
-}
-
-function Invoke-RansomwareDetection {
-    $encryptedExts = @(".encrypted", ".locked", ".crypto", ".crypt", ".locky", ".cerber", ".zepto")
-    $shadowDelete = "vssadmin.*delete|wbadmin.*delete|shadowcopy.*delete|recoveryenabled.*no"
-    
-    # Check shadow deletion commands
-    foreach ($proc in Get-WmiObject Win32_Process -EA 0) {
-        if ($proc.ProcessId -eq $PID) { continue }
-        if ($proc.CommandLine -match $shadowDelete) {
-            Write-Log "Ransomware (shadow delete): $($proc.Name)"
-            Stop-ThreatProcess -ProcessId $proc.ProcessId -ProcessName $proc.Name
-        }
-    }
-    
-    # Check recently encrypted files
-    $userDirs = @("$env:USERPROFILE\Documents", "$env:USERPROFILE\Desktop")
-    $recentEncrypted = 0
-    
-    foreach ($dir in $userDirs) {
-        if (-not (Test-Path $dir)) { continue }
-        Get-ChildItem $dir -Recurse -File -EA 0 | Where-Object { (Get-Date) - $_.LastWriteTime -lt [TimeSpan]::FromMinutes(5) } | ForEach-Object {
-            if ($encryptedExts -contains $_.Extension.ToLower()) { $recentEncrypted++ }
-            if ($_.Name -match "readme|decrypt|how_to|ransom") { Write-Log "Ransom note: $($_.FullName)" }
-        }
-    }
-    
-    if ($recentEncrypted -gt 10) {
-        Write-Log "RANSOMWARE ALERT: $recentEncrypted files encrypted!"
-        Send-ThreatAlert -Severity "CRITICAL" -Message "Ransomware detected" -Details "$recentEncrypted files encrypted"
-    }
-}
-
-function Invoke-NetworkAnomalyDetection {
-    $badPorts = @(4444, 5555, 31337, 6666, 12345, 54321)
-    $scriptProcs = "cmd|powershell|wscript|cscript|mshta|rundll32"
-    
-    Get-NetTCPConnection -State Established -EA 0 | Where-Object { $_.RemoteAddress -notmatch "^(127\.|192\.168\.|10\.)" } | ForEach-Object {
-        $proc = Get-Process -Id $_.OwningProcess -EA 0
-        $ip = $_.RemoteAddress
-        $port = $_.RemotePort
-        
-        $isThreat = ($port -in $badPorts) -or ($proc.ProcessName -match $scriptProcs) -or ($proc.Path -and $proc.Path -notmatch "Windows|Program Files")
-        
-        if ($isThreat) {
-            Write-Log "Network threat: $($proc.ProcessName) -> $ip`:$port"
-            $ruleName = "AV_Block_$ip"
-            if (-not (Get-NetFirewallRule -DisplayName $ruleName -EA 0)) {
-                New-NetFirewallRule -DisplayName $ruleName -Direction Outbound -RemoteAddress $ip -Action Block -EA 0 | Out-Null
-            }
-            if ($proc.ProcessName -match $scriptProcs) {
-                Stop-ThreatProcess -ProcessId $proc.Id -ProcessName $proc.ProcessName
-            }
-        }
-    }
-}
-
-# ===================== Advanced Abuse Detection Functions =====================
-
-function Invoke-CameraMicAccessDetection {
-    # Detects suspicious processes accessing camera/microphone via Media Foundation
-    # MFCaptureEngine.dll is legitimately used by apps for camera/mic access
-    # But malware can abuse this for surveillance
-    
-    $whitelistedApps = @(
-        'brave', 'chrome', 'firefox', 'msedge', 'opera',  # Browsers
-        'teams', 'zoom', 'skype', 'discord', 'slack',     # Communication apps
-        'obs64', 'obs32', 'streamlabs',                   # Streaming
-        'WindowsCamera', 'Camera',                         # Windows Camera
-        'SecurityHealthService', 'MsMpEng'                # Windows Security
-    )
-    
-    foreach ($proc in (Get-CachedProcessList)) {
-        if ($proc.Id -eq $PID) { continue }
-        try {
-            $loadedMF = $proc.Modules | Where-Object { $_.ModuleName -match 'MFCaptureEngine|mfplat|mf\.dll' }
-            if (-not $loadedMF) { continue }
-            
-            $procName = $proc.ProcessName.ToLower()
-            $isWhitelisted = $whitelistedApps | Where-Object { $procName -like "*$_*" }
-            
-            if (-not $isWhitelisted) {
-                # Check if the process is signed
-                $sig = Get-AuthenticodeSignature $proc.Path -EA 0
-                $isSigned = $sig.Status -eq 'Valid'
-                
-                # Check if from suspicious location
-                $isSuspiciousPath = $proc.Path -match '\\Temp\\|\\Downloads\\|\\AppData\\Local\\Temp\\'
-                
-                # Check if has no visible window (hidden process)
-                $hasWindow = $proc.MainWindowHandle -ne [IntPtr]::Zero
-                
-                if (-not $isSigned -or $isSuspiciousPath -or -not $hasWindow) {
-                    Write-Log "CAMERA/MIC ACCESS ALERT: $($proc.ProcessName) (PID:$($proc.Id)) accessing media capture"
-                    Write-Log "  -> Path: $($proc.Path)"
-                    Write-Log "  -> Signed: $isSigned | SuspiciousPath: $isSuspiciousPath | HasWindow: $hasWindow"
-                    Send-ThreatAlert -Severity "HIGH" -Message "Suspicious camera/mic access" -Details "$($proc.ProcessName) at $($proc.Path)"
-                    
-                    if (-not $isSigned -and $isSuspiciousPath) {
-                        Stop-ThreatProcess -ProcessId $proc.Id -ProcessName $proc.ProcessName
-                    }
-                }
-            }
-        } catch {}
-    }
-}
-
-function Invoke-COMHijackingDetection {
-    # Detects COM object hijacking where malware registers fake COM objects in HKCU
-    # that shadow legitimate HKLM entries, causing legitimate processes to load malicious DLLs
-    
-    $suspiciousPaths = @('\\Temp\\', '\\Downloads\\', '\\AppData\\Local\\Temp\\', '\\Desktop\\', '\\Public\\')
-    
-    try {
-        # Get all HKCU COM registrations
-        $hkcuClsids = Get-ChildItem "HKCU:\Software\Classes\CLSID" -EA 0
-        
-        foreach ($clsid in $hkcuClsids) {
-            $clsidName = $clsid.PSChildName
-            $inprocServer = Get-ItemProperty "$($clsid.PSPath)\InprocServer32" -EA 0
-            
-            if (-not $inprocServer) { continue }
-            
-            $dllPath = $inprocServer.'(default)'
-            if (-not $dllPath) { continue }
-            
-            # Check if this CLSID also exists in HKLM (shadowing)
-            $hklmExists = Test-Path "HKLM:\Software\Classes\CLSID\$clsidName"
-            
-            # Check if DLL path is suspicious
-            $isSuspiciousPath = $false
-            foreach ($badPath in $suspiciousPaths) {
-                if ($dllPath -match [regex]::Escape($badPath)) {
-                    $isSuspiciousPath = $true
-                    break
-                }
-            }
-            
-            # Check if DLL is signed
-            $isSigned = $false
-            if (Test-Path $dllPath) {
-                $sig = Get-AuthenticodeSignature $dllPath -EA 0
-                $isSigned = $sig.Status -eq 'Valid'
-            }
-            
-            if ($hklmExists -and ($isSuspiciousPath -or -not $isSigned)) {
-                Write-Log "COM HIJACKING DETECTED: $clsidName"
-                Write-Log "  -> DLL: $dllPath"
-                Write-Log "  -> Shadows HKLM: $hklmExists | Suspicious Path: $isSuspiciousPath | Signed: $isSigned"
-                Send-ThreatAlert -Severity "CRITICAL" -Message "COM hijacking detected" -Details "CLSID: $clsidName -> $dllPath"
-                
-                # Quarantine the malicious DLL
-                if (Test-Path $dllPath) {
-                    Move-ToQuarantine -FilePath $dllPath -Reason "COM hijacking payload"
-                }
-                
-                # Remove the HKCU registration
-                Remove-Item -Path $clsid.PSPath -Recurse -Force -EA 0
-                Write-Log "  -> Removed malicious HKCU COM registration"
-            }
+        $persistence = Find-PersistenceMechanisms
+        if ($persistence -and $persistence.Count -gt 0) {
+            $outputFile = Join-Path $Config.BaseDirectory "persistence_scan.csv"
+            $persistence | Export-Csv -Path $outputFile -NoTypeInformation
+            Write-Log "Persistence scan found $($persistence.Count) items -> $outputFile"
+            Send-ThreatAlert -Severity "MEDIUM" -Message "Persistence mechanisms detected" -Details "Found $($persistence.Count) items"
         }
     } catch {
-        Write-Log "COM hijacking detection error: $_"
-    }
-}
-
-function Invoke-ProxySettingsAbuseDetection {
-    # Detects malware modifying proxy settings to intercept browser traffic (MITM)
-    # Monitors Internet Settings registry keys for unauthorized changes
-    
-    $proxyKeys = @{
-        'ProxyEnable' = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
-        'ProxyServer' = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
-        'AutoConfigURL' = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'  # WPAD
+        Write-Log "Persistence scan error: $_"
     }
     
-    # Known legitimate proxy patterns (corporate, VPN, etc.)
-    $legitimateProxies = @(
-        'localhost', '127.0.0.1', '*.internal', '*.corp'
-    )
-    
+    # Fileless malware scan
     try {
-        $settings = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -EA 0
-        
-        # Check if proxy is enabled
-        if ($settings.ProxyEnable -eq 1) {
-            $proxyServer = $settings.ProxyServer
-            $autoConfigUrl = $settings.AutoConfigURL
-            
-            $isLegitimate = $false
-            foreach ($legit in $legitimateProxies) {
-                if ($proxyServer -like $legit) {
-                    $isLegitimate = $true
-                    break
-                }
-            }
-            
-            # Suspicious indicators
-            $isSuspicious = $false
-            $reason = ""
-            
-            # Check for external proxy pointing to unknown addresses
-            if ($proxyServer -and -not $isLegitimate) {
-                if ($proxyServer -match '^\d+\.\d+\.\d+\.\d+:\d+$') {
-                    # Raw IP address proxy - suspicious
-                    $isSuspicious = $true
-                    $reason = "Raw IP proxy: $proxyServer"
-                }
-            }
-            
-            # Check for WPAD pointing to suspicious URLs
-            if ($autoConfigUrl) {
-                if ($autoConfigUrl -match 'http://' -and $autoConfigUrl -notmatch 'wpad\.|\.internal|\.corp|\.local') {
-                    $isSuspicious = $true
-                    $reason = "Suspicious WPAD URL: $autoConfigUrl"
-                }
-            }
-            
-            if ($isSuspicious) {
-                Write-Log "PROXY ABUSE DETECTED: $reason"
-                Send-ThreatAlert -Severity "HIGH" -Message "Proxy settings tampered" -Details $reason
-                
-                # Log but don't auto-remediate (might break legitimate corporate setups)
-                Write-Log "  -> Review manually: HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"
-            }
-        }
-        
-        # Also check for WinHTTP proxy (system-wide)
-        $winhttp = netsh winhttp show proxy 2>$null
-        if ($winhttp -match 'Proxy Server.*:\s+(\S+)') {
-            $systemProxy = $Matches[1]
-            if ($systemProxy -ne 'Direct access' -and $systemProxy -match '^\d+\.\d+\.\d+\.\d+:\d+$') {
-                Write-Log "SYSTEM PROXY DETECTED: $systemProxy (WinHTTP)"
-                Write-Log "  -> May be legitimate corporate proxy, review manually"
-            }
+        $fileless = Find-FilelessIndicators
+        if ($fileless -and $fileless.Count -gt 0) {
+            $outputFile = Join-Path $Config.BaseDirectory "fileless_detections.xml"
+            $fileless | Export-Clixml -Path $outputFile
+            Write-Log "Fileless indicators found: $($fileless.Count) -> $outputFile"
+            Send-ThreatAlert -Severity "HIGH" -Message "Fileless malware indicators" -Details "Found $($fileless.Count) indicators"
         }
     } catch {
-        Write-Log "Proxy detection error: $_"
-    }
-}
-
-function Invoke-DLLSearchOrderHijacking {
-    # Detects DLL search order hijacking where known Windows DLL names
-    # are placed in application directories to be loaded instead of System32 versions
-    
-    # Common DLLs that are targets for search order hijacking
-    $targetDLLs = @(
-        'version.dll', 'winmm.dll', 'dwmapi.dll', 'uxtheme.dll', 'samcli.dll',
-        'propsys.dll', 'ntmarta.dll', 'secur32.dll', 'userenv.dll', 'profapi.dll',
-        'cryptsp.dll', 'rsaenh.dll', 'gpapi.dll', 'dpapi.dll', 'mpr.dll',
-        'shfolder.dll', 'cabinet.dll', 'linkinfo.dll', 'ntshrui.dll', 'srvcli.dll',
-        'cscapi.dll', 'netutils.dll', 'dbghelp.dll', 'dbgcore.dll', 'fltlib.dll',
-        'wldap32.dll', 'crypt32.dll', 'msasn1.dll', 'imagehlp.dll', 'wintrust.dll'
-    )
-    
-    foreach ($proc in (Get-CachedProcessList)) {
-        if ($proc.Id -eq $PID) { continue }
-        try {
-            foreach ($mod in $proc.Modules) {
-                $modName = $mod.ModuleName.ToLower()
-                $modPath = $mod.FileName.ToLower()
-                
-                # Check if this is a known target DLL
-                if ($modName -in $targetDLLs) {
-                    # Check if it's loaded from non-System32 location
-                    $isFromSystem32 = $modPath -match 'windows\\system32\\' -or $modPath -match 'windows\\syswow64\\'
-                    
-                    if (-not $isFromSystem32) {
-                        # Verify signature
-                        $sig = Get-AuthenticodeSignature $mod.FileName -EA 0
-                        $isSigned = $sig.Status -eq 'Valid'
-                        $isMicrosoft = $sig.SignerCertificate.Subject -match 'Microsoft'
-                        
-                        if (-not $isSigned -or -not $isMicrosoft) {
-                            Write-Log "DLL SEARCH ORDER HIJACK: $($proc.ProcessName) loaded $modName from $($mod.FileName)"
-                            Write-Log "  -> Expected: C:\\Windows\\System32\\$modName"
-                            Write-Log "  -> Signed: $isSigned | Microsoft: $isMicrosoft"
-                            Send-ThreatAlert -Severity "CRITICAL" -Message "DLL hijacking detected" -Details "$($proc.ProcessName) loaded fake $modName"
-                            
-                            # Stop the affected process
-                            Stop-ThreatProcess -ProcessId $proc.Id -ProcessName $proc.ProcessName
-                            
-                            # Quarantine the malicious DLL
-                            Move-ToQuarantine -FilePath $mod.FileName -Reason "DLL search order hijack"
-                            break
-                        }
-                    }
-                }
-            }
-        } catch {}
-    }
-}
-
-function Invoke-ProxywareDetection {
-    # Detects proxyware/bandwidth hijacking malware like Honeygain, Peer2Profit, etc.
-    # These monetize victim's internet connection without consent
-    
-    $proxywareIndicators = @{
-        Processes = @('honeygain', 'peer2profit', 'packetstream', 'traffmonetizer', 'iproyal', 'pawns', 'earnapp', 'nanowire', 'spider')
-        Domains = @('honeygain.com', 'peer2profit.com', 'packetstream.io', 'traffmonetizer.com', 'iproyal.com', 'pawns.app', 'earnapp.com')
-        Services = @('HoneygainService', 'Peer2ProfitService', 'PacketStreamService')
-    }
-    
-    # Check running processes
-    foreach ($indicator in $proxywareIndicators.Processes) {
-        $found = Get-Process -EA 0 | Where-Object { $_.ProcessName -like "*$indicator*" }
-        if ($found) {
-            foreach ($proc in $found) {
-                Write-Log "PROXYWARE DETECTED: $($proc.ProcessName) (PID: $($proc.Id))"
-                Send-ThreatAlert -Severity "HIGH" -Message "Proxyware detected" -Details $proc.ProcessName
-                Stop-ThreatProcess -ProcessId $proc.Id -ProcessName $proc.ProcessName
-            }
-        }
-    }
-    
-    # Check services
-    foreach ($svcName in $proxywareIndicators.Services) {
-        $svc = Get-Service -Name $svcName -EA 0
-        if ($svc) {
-            Write-Log "PROXYWARE SERVICE: $($svc.Name) ($($svc.Status))"
-            Stop-Service -Name $svcName -Force -EA 0
-            Set-Service -Name $svcName -StartupType Disabled -EA 0
-        }
-    }
-    
-    # Check installed programs
-    $installed = Get-ItemProperty "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*", "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*" -EA 0
-    foreach ($indicator in $proxywareIndicators.Processes) {
-        $found = $installed | Where-Object { $_.DisplayName -like "*$indicator*" }
-        if ($found) {
-            Write-Log "PROXYWARE INSTALLED: $($found.DisplayName)"
-            Send-ThreatAlert -Severity "HIGH" -Message "Proxyware installed" -Details $found.DisplayName
-        }
-    }
-    
-    # Check startup entries
-    $startupPaths = @(
-        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run",
-        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run"
-    )
-    foreach ($path in $startupPaths) {
-        if (-not (Test-Path $path)) { continue }
-        $props = Get-ItemProperty -Path $path -EA 0
-        foreach ($indicator in $proxywareIndicators.Processes) {
-            foreach ($prop in $props.PSObject.Properties) {
-                if ($prop.Value -like "*$indicator*") {
-                    Write-Log "PROXYWARE STARTUP: $($prop.Name) -> $($prop.Value)"
-                    Remove-ItemProperty -Path $path -Name $prop.Name -EA 0
-                }
-            }
-        }
+        Write-Log "Fileless scan error: $_"
     }
 }
 
@@ -2316,924 +1980,25 @@ function Invoke-PrivacyForgeSpoofing {
     } catch {}
 }
 
-# ELF DLL Unloader
-$Script:ElfDLLProcessed = @{}
 
-function Invoke-ElfDLLUnloader {
-    try {
-        if (-not ([System.Management.Automation.PSTypeName]'DLLUnloaderLite').Type) {
-            Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class DLLUnloaderLite {
-    [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(int access, bool inherit, int pid);
-    [DllImport("kernel32.dll")] public static extern IntPtr GetProcAddress(IntPtr mod, string name);
-    [DllImport("kernel32.dll")] public static extern IntPtr GetModuleHandle(string name);
-    [DllImport("kernel32.dll")] public static extern IntPtr CreateRemoteThread(IntPtr proc, IntPtr attr, uint stack, IntPtr start, IntPtr param, uint flags, IntPtr id);
-    [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr handle, uint ms);
-    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
-}
-"@ -EA 0
-        }
-        
-        # This function was intended to detect malicious ELF binaries loaded as DLLs
-        # but the pattern '*_elf.dll' incorrectly matches legitimate browser DLLs like chrome_elf.dll
-        # DISABLED: This function causes browser instability by unloading chrome_elf.dll
-        # TODO: Rewrite to detect actual Linux ELF binaries, not DLLs with 'elf' in the name
-        return
-    } catch {}
-}
-
-# Rootkit Detection (simplified)
-function Invoke-RootkitDetection {
-    try {
-        # Hidden process detection
-        $procList = Get-Process | Select-Object -ExpandProperty Id
-        $perfProcs = Get-Counter "\Process(*)\ID Process" -EA 0 | Select-Object -ExpandProperty CounterSamples | 
-            Where-Object { $_.CookedValue -gt 0 } | ForEach-Object { [int]$_.CookedValue }
-        
-        $hidden = $perfProcs | Where-Object { $_ -notin $procList }
-        foreach ($pid in $hidden) {
-            Write-Log "ROOTKIT: Hidden process PID $pid"
-            Send-ThreatAlert -Severity "CRITICAL" -Message "Hidden process detected" -Details "PID: $pid"
-        }
-        
-        # Suspicious drivers
-        Get-WindowsDriver -Online -EA 0 | Where-Object { $_.ProviderName -notmatch "Microsoft" -and $_.ClassName -eq "System" } | ForEach-Object {
-            $driverPath = $_.OriginalFileName
-            if ($driverPath -and (Test-Path $driverPath)) {
-                $sig = Get-AuthenticodeSignature $driverPath -EA 0
-                if ($sig.Status -ne "Valid") {
-                    Write-Log "ROOTKIT: Unsigned driver $($_.DriverName)"
-                    Send-ThreatAlert -Severity "HIGH" -Message "Suspicious driver" -Details $_.DriverName
-                }
-            }
-        }
-        
-        # Suspicious modules in system processes
-        @("lsass", "csrss", "winlogon", "services") | ForEach-Object {
-            $proc = Get-Process -Name $_ -EA 0
-            if ($proc) {
-                $proc.Modules | Where-Object { $_.FileName -notmatch "^C:\\Windows" } | ForEach-Object {
-                    Write-Log "ROOTKIT: Suspicious module $($_.ModuleName) in $($proc.ProcessName)"
-                }
-            }
-        }
-    } catch {}
-}
-
-# Attack Tools Detection
-function Invoke-AttackToolsDetection {
-    $attackTools = @(
-        "mimikatz", "sekurlsa", "lazagne", "procdump", "pwdump", "gsecdump",
-        "hydra", "hashcat", "john", "ncrack", "medusa",
-        "metasploit", "msfconsole", "msfvenom", "cobaltstrike", "beacon",
-        "bloodhound", "sharphound", "empire", "powersploit",
-        "nmap", "masscan", "sqlmap", "burpsuite",
-        "xmrig", "ccminer", "minerd"
-    )
-    $pattern = $attackTools -join "|"
-    
-    foreach ($proc in Get-WmiObject Win32_Process -EA 0) {
-        $name = $proc.Name.ToLower()
-        $cmd = if ($proc.CommandLine) { $proc.CommandLine.ToLower() } else { "" }
-        $path = if ($proc.ExecutablePath) { $proc.ExecutablePath.ToLower() } else { "" }
-        
-        if ($name -match $pattern -or $cmd -match $pattern -or $path -match $pattern) {
-            Write-Log "Attack tool: $($proc.Name)"
-            Send-ThreatAlert -Severity "CRITICAL" -Message "Attack tool detected" -Details $proc.Name
-            Stop-ThreatProcess -ProcessId $proc.ProcessId -ProcessName $proc.Name
-            
-            if ($proc.ExecutablePath -and (Test-Path $proc.ExecutablePath)) {
-                Move-ToQuarantine -FilePath $proc.ExecutablePath -Reason "Attack tool"
-            }
-        }
-    }
-}
-
-# Beacon Detection
-function Invoke-BeaconDetection {
-    $connections = Get-NetTCPConnection -State Established -EA 0 | Where-Object { 
-        $_.RemoteAddress -notmatch "^(127\.|192\.168\.|10\.)" 
-    } | Select-Object -First 200
-    
-    $groups = $connections | Group-Object OwningProcess, RemoteAddress
-    
-    foreach ($g in $groups) {
-        if ($g.Count -lt 3) { continue }
-        
-        $procId = ($g.Name -split ',')[0].Trim()
-        $ip = ($g.Name -split ',')[1].Trim()
-        $proc = Get-Process -Id $procId -EA 0
-        
-        if ($proc -and $g.Count -gt 5) {
-            Write-Log "Beacon pattern: $($proc.ProcessName) -> $ip ($($g.Count) connections)"
-            Send-ThreatAlert -Severity "HIGH" -Message "Beacon detected" -Details "$($proc.ProcessName) -> $ip"
-            
-            # Block IP
-            $rule = "AV_Beacon_$ip"
-            if (-not (Get-NetFirewallRule -DisplayName $rule -EA 0)) {
-                New-NetFirewallRule -DisplayName $rule -Direction Outbound -RemoteAddress $ip -Action Block -EA 0 | Out-Null
-            }
-            
-            Stop-ThreatProcess -ProcessId $proc.Id -ProcessName $proc.ProcessName
-        }
-    }
-}
-
-# USB Monitoring
-$Script:KnownUSBDevices = @{}
-
-function Invoke-USBMonitoring {
-    try {
-        $drives = Get-WmiObject Win32_LogicalDisk -Filter "DriveType=2" -EA 0
-        
-        foreach ($drive in $drives) {
-            $id = $drive.DeviceID
-            if ($Script:KnownUSBDevices.ContainsKey($id)) { continue }
-            
-            $Script:KnownUSBDevices[$id] = Get-Date
-            Write-Log "USB: New device $id"
-            
-            # Scan for autorun and suspicious files
-            $autorun = Join-Path $id "autorun.inf"
-            if (Test-Path $autorun) {
-                Write-Log "USB: Autorun detected on $id"
-                Remove-Item $autorun -Force -EA 0
-            }
-            
-            Get-ChildItem "$id\" -Include *.exe,*.dll,*.scr,*.bat,*.vbs,*.ps1 -Recurse -EA 0 | ForEach-Object {
-                $sig = Get-AuthenticodeSignature $_.FullName -EA 0
-                if ($sig.Status -ne "Valid") {
-                    Write-Log "USB: Unsigned executable $($_.FullName)"
-                    Move-ToQuarantine -FilePath $_.FullName -Reason "Unsigned USB executable"
-                }
-            }
-        }
-    } catch {}
-}
-
-# GFocus - User-initiated connection whitelist firewall
-# Browsers: whitelist based on address bar + 30 sec grace for dependencies
-# Other apps: only allowed connections when they have foreground focus
-
-$Script:GFocus_BrowserAllowedIPs = @{}      # IP -> expiry time (browser whitelist)
-$Script:GFocus_BrowserBlockedIPs = @{}      # IP -> rule name (browser blocks)
-$Script:GFocus_AppBlockedProcs = @{}        # ProcessId -> @{RuleName; IPs} (app blocks)
-$Script:GFocus_LastAddressBar = ""
-$Script:GFocus_LastForegroundPid = 0
-$Script:GFocus_GracePeriod = 30
-$Script:GFocus_Browsers = "chrome|msedge|firefox|brave|opera|iexplore|vivaldi|waterfox"
-$Script:GFocus_ControlledApps = "powershell|pwsh|cmd|WindowsTerminal|python|node|curl|wget|git|ssh|telnet|ftp|wscript|cscript|mshta"
-
-function Invoke-GFocus {
-    try {
-        if (-not ([System.Management.Automation.PSTypeName]'GFocusUI').Type) {
-            Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-using System.Text;
-public class GFocusUI {
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
-    [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
-}
-"@ -EA 0
-        }
-        
-        Add-Type -AssemblyName UIAutomationClient -EA 0
-        Add-Type -AssemblyName UIAutomationTypes -EA 0
-        
-        $hWnd = [GFocusUI]::GetForegroundWindow()
-        $fgPid = 0
-        [GFocusUI]::GetWindowThreadProcessId($hWnd, [ref]$fgPid) | Out-Null
-        if ($fgPid -eq 0) { return }
-        
-        $fgProc = Get-Process -Id $fgPid -EA 0
-        if (-not $fgProc) { return }
-        
-        $now = Get-Date
-        $isBrowser = $fgProc.ProcessName -match $Script:GFocus_Browsers
-        $isControlledApp = $fgProc.ProcessName -match $Script:GFocus_ControlledApps
-        
-        # ==================== BROWSER ADDRESS BAR DETECTION ====================
-        # Only read address bar when browser is in foreground
-        if ($isBrowser) {
-            # Detect if browser just regained focus (was doing something else before)
-            $lastWasBrowser = $false
-            try {
-                $lastProc = Get-Process -Id $Script:GFocus_LastForegroundPid -EA 0
-                if ($lastProc -and $lastProc.ProcessName -match $Script:GFocus_Browsers) {
-                    $lastWasBrowser = $true
-                }
-            } catch {}
-            $browserRegainedFocus = (-not $lastWasBrowser -and $Script:GFocus_LastForegroundPid -ne 0)
-            
-            $userInput = $null
-            
-            # Get address bar content
-            try {
-                $auto = [System.Windows.Automation.AutomationElement]::FromHandle($hWnd)
-                $editCondition = [System.Windows.Automation.PropertyCondition]::new(
-                    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-                    [System.Windows.Automation.ControlType]::Edit
-                )
-                $edits = $auto.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCondition)
-                
-                foreach ($edit in $edits) {
-                    try {
-                        $valuePattern = $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
-                        $value = $valuePattern.Current.Value
-                        if ($value -match "^https?://|^www\.|^\w+\.\w+") {
-                            $userInput = $value
-                            break
-                        }
-                    } catch {}
-                }
-            } catch {}
-            
-            # When browser regains focus, unblock ALL previously blocked browser IPs
-            # (Discord/etc use many IPs - CDNs, APIs, WebSockets - not just the main hostname)
-            if ($browserRegainedFocus -and $Script:GFocus_BrowserBlockedIPs.Count -gt 0) {
-                Write-Log "GFocus: Browser regained focus - unblocking all $($Script:GFocus_BrowserBlockedIPs.Count) blocked IPs"
-                foreach ($ip in @($Script:GFocus_BrowserBlockedIPs.Keys)) {
-                    $ruleName = $Script:GFocus_BrowserBlockedIPs[$ip]
-                    Remove-NetFirewallRule -DisplayName $ruleName -EA 0
-                    $Script:GFocus_BrowserAllowedIPs[$ip] = $now.AddSeconds($Script:GFocus_GracePeriod)
-                    Write-Log "GFocus: Unblocked $ip (browser regained focus)"
-                }
-                $Script:GFocus_BrowserBlockedIPs.Clear()
-            }
-            
-            # Process new navigation (URL changed)
-            $shouldProcess = $userInput -and ($userInput -ne $Script:GFocus_LastAddressBar)
-            
-            if ($shouldProcess) {
-                $Script:GFocus_LastAddressBar = $userInput
-                
-                $hostname = $null
-                if ($userInput -match "https?://([^/:]+)") { $hostname = $Matches[1] }
-                elseif ($userInput -match "^www\.([^/:]+)") { $hostname = "www." + $Matches[1] }
-                elseif ($userInput -match "^([a-zA-Z0-9][-a-zA-Z0-9]*\.)+[a-zA-Z]{2,}") { $hostname = $Matches[0] }
-                
-                if ($hostname) {
-                    Write-Log "GFocus: Browser navigated to $hostname"
-                    
-                    try {
-                        $ips = [System.Net.Dns]::GetHostAddresses($hostname) | ForEach-Object { $_.IPAddressToString }
-                        $expiry = $now.AddSeconds($Script:GFocus_GracePeriod)
-                        
-                        foreach ($ip in $ips) {
-                            $Script:GFocus_BrowserAllowedIPs[$ip] = $expiry
-                        }
-                    } catch {}
-                }
-            }
-        }
-        
-        # ==================== BROWSER CONNECTION MONITORING ====================
-        # Always monitor ALL browser processes (they spawn multiple child processes)
-        $browserProcs = Get-Process -EA 0 | Where-Object { $_.ProcessName -match $Script:GFocus_Browsers } | Select-Object -ExpandProperty Id
-        $browserConns = Get-NetTCPConnection -State Established -EA 0 | Where-Object { $_.OwningProcess -in $browserProcs }
-        
-        foreach ($conn in $browserConns) {
-            $ip = $conn.RemoteAddress
-            if ($ip -match "^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|::1|fe80)") { continue }
-            
-            if ($Script:GFocus_BrowserAllowedIPs.ContainsKey($ip)) {
-                $Script:GFocus_BrowserAllowedIPs[$ip] = $now.AddSeconds($Script:GFocus_GracePeriod)
-            } elseif (-not $Script:GFocus_BrowserBlockedIPs.ContainsKey($ip)) {
-                # Block non-user-initiated browser connection
-                $ruleName = "GFocus_Browser_$($ip -replace '[.:]','_')"
-                New-NetFirewallRule -DisplayName $ruleName -Direction Outbound -RemoteAddress $ip -Action Block -EA 0 | Out-Null
-                $Script:GFocus_BrowserBlockedIPs[$ip] = $ruleName
-                Write-Log "GFocus: Blocked browser connection to $ip (not user-initiated)"
-            }
-        }
-        
-        # Cleanup expired browser IPs
-        $expired = @($Script:GFocus_BrowserAllowedIPs.Keys | Where-Object { $Script:GFocus_BrowserAllowedIPs[$_] -lt $now })
-        foreach ($ip in $expired) { $Script:GFocus_BrowserAllowedIPs.Remove($ip) }
-        
-        # ==================== CONTROLLED APP HANDLING ====================
-        # Apps like PowerShell only get network access when in foreground
-        
-        # Get all controlled app processes
-        $controlledProcs = Get-Process -EA 0 | Where-Object { $_.ProcessName -match $Script:GFocus_ControlledApps }
-        
-        foreach ($appProc in $controlledProcs) {
-            $appPid = $appProc.Id
-            $appName = $appProc.ProcessName
-            $hasForeground = ($appPid -eq $fgPid)
-            
-            # Get this app's connections
-            $appConns = Get-NetTCPConnection -State Established -EA 0 | Where-Object { $_.OwningProcess -eq $appPid }
-            $appIPs = @($appConns | ForEach-Object { $_.RemoteAddress } | Where-Object { $_ -notmatch "^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|::1|fe80)" } | Select-Object -Unique)
-            
-            if ($hasForeground) {
-                # App has foreground - allow its connections, remove any blocks
-                if ($Script:GFocus_AppBlockedProcs.ContainsKey($appPid)) {
-                    $blockInfo = $Script:GFocus_AppBlockedProcs[$appPid]
-                    foreach ($ruleName in $blockInfo.RuleNames) {
-                        Remove-NetFirewallRule -DisplayName $ruleName -EA 0
-                    }
-                    $Script:GFocus_AppBlockedProcs.Remove($appPid)
-                    Write-Log "GFocus: $appName gained foreground - unblocked connections"
-                }
-            } else {
-                # App lost foreground - block its external connections
-                if ($appIPs.Count -gt 0 -and -not $Script:GFocus_AppBlockedProcs.ContainsKey($appPid)) {
-                    $ruleNames = @()
-                    foreach ($ip in $appIPs) {
-                        $ruleName = "GFocus_App_${appName}_$($ip -replace '[.:]','_')"
-                        New-NetFirewallRule -DisplayName $ruleName -Direction Outbound -RemoteAddress $ip -Action Block -EA 0 | Out-Null
-                        $ruleNames += $ruleName
-                    }
-                    $Script:GFocus_AppBlockedProcs[$appPid] = @{ RuleNames = $ruleNames; IPs = $appIPs }
-                    Write-Log "GFocus: $appName lost foreground - blocked $($appIPs.Count) connection(s)"
-                }
-            }
-        }
-        
-        # Cleanup rules for processes that no longer exist
-        $deadPids = @($Script:GFocus_AppBlockedProcs.Keys | Where-Object { -not (Get-Process -Id $_ -EA 0) })
-        foreach ($deadPid in $deadPids) {
-            $blockInfo = $Script:GFocus_AppBlockedProcs[$deadPid]
-            foreach ($ruleName in $blockInfo.RuleNames) {
-                Remove-NetFirewallRule -DisplayName $ruleName -EA 0
-            }
-            $Script:GFocus_AppBlockedProcs.Remove($deadPid)
-        }
-        
-        $Script:GFocus_LastForegroundPid = $fgPid
-        
-    } catch {}
-}
-
-# Script Content Scanner
-function Invoke-ScriptContentScan {
-    $badPatterns = @(
-        "Invoke-Mimikatz", "Invoke-BloodHound", "Invoke-Kerberoast",
-        "AmsiScanBuffer", "amsiInitFailed", "VirtualAlloc.*PAGE_EXECUTE",
-        "CreateRemoteThread", "WriteProcessMemory", "ReflectiveLoader"
-    )
-    $pattern = $badPatterns -join "|"
-    
-    $scriptDirs = @("$env:TEMP", "$env:APPDATA", "$env:USERPROFILE\Downloads")
-    
-    foreach ($dir in $scriptDirs) {
-        if (-not (Test-Path $dir)) { continue }
-        
-        Get-ChildItem $dir -Include *.ps1,*.vbs,*.js,*.bat,*.cmd -Recurse -EA 0 | ForEach-Object {
-            try {
-                $content = Get-Content $_.FullName -Raw -EA 0
-                if ($content -match $pattern) {
-                    Write-Log "Malicious script: $($_.FullName)"
-                    Move-ToQuarantine -FilePath $_.FullName -Reason "Malicious script content"
-                }
-            } catch {}
-        }
-    }
-}
-
-# Startup Persistence Detection
-function Invoke-StartupPersistenceDetection {
-    $startupPaths = @(
-        "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup",
-        "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
-    )
-    
-    foreach ($path in $startupPaths) {
-        if (-not (Test-Path $path)) { continue }
-        
-        Get-ChildItem $path -EA 0 | ForEach-Object {
-            $file = $_
-            if ($file.Extension -match "\.(exe|dll|vbs|js|bat|cmd|ps1|scr)$") {
-                $targetPath = if ($file.Extension -eq ".lnk") {
-                    $shell = New-Object -ComObject WScript.Shell
-                    $shell.CreateShortcut($file.FullName).TargetPath
-                } else { $file.FullName }
-                
-                if ($targetPath -and (Test-Path $targetPath)) {
-                    $sig = Get-AuthenticodeSignature $targetPath -EA 0
-                    if ($sig.Status -ne "Valid") {
-                        Write-Log "Startup persistence: Unsigned $($file.Name)"
-                        Move-ToQuarantine -FilePath $file.FullName -Reason "Unsigned startup item"
-                    }
-                }
-            }
-        }
-    }
-}
-
-# Driver Watcher
-function Invoke-DriverWatcher {
-    $badDriverNames = @("bfs", "unionfs", "rootkit", "stealth", "hide")
-    $pattern = $badDriverNames -join "|"
-    
-    Get-WindowsDriver -Online -EA 0 | Where-Object { $_.DriverName -match $pattern } | ForEach-Object {
-        Write-Log "Suspicious driver: $($_.DriverName)"
-        Send-ThreatAlert -Severity "HIGH" -Message "Suspicious driver" -Details $_.DriverName
-        
-        # Try to stop and disable
-        try {
-            Stop-Service -Name $_.DriverName -Force -EA 0
-            Set-Service -Name $_.DriverName -StartupType Disabled -EA 0
-            Write-Log "Driver disabled: $($_.DriverName)"
-        } catch {}
-    }
-}
-
-Write-Log "Performing full system scan - all drives, all folders, monitored extensions only"
-
-# Suspicious extensions (subset for double-extension detection)
-$suspiciousExtensions = @('.com', '.exe', '.exif', '.dll', '.winmd')
-
-# Function to detect multiple/suspicious extensions (e.g., file.pdf.exe, file.dll.exe.dll)
-function Test-SuspiciousExtension {
-    param([string]$FileName)
-    
-    # Check for multiple extensions
-    $parts = $FileName -split '\.'
-    if ($parts.Count -gt 2) {
-        # Has multiple extensions - check if any are executable
-        for ($i = 1; $i -lt $parts.Count - 1; $i++) {
-            $ext = ".$($parts[$i])".ToLower()
-            if ($suspiciousExtensions -contains $ext) {
-                return $true  # Hidden executable extension
-            }
-        }
-    }
-    
-    # Check for unicode tricks or excessive spaces
-    if ($FileName -match '\s{2,}\.' -or $FileName -match '[\u200B-\u200D\uFEFF]') {
-        return $true
-    }
-    
-    return $false
-}
-
-# Get ALL drives - local, removable, and network
-$allDrives = Get-WmiObject Win32_LogicalDisk -ErrorAction SilentlyContinue | Where-Object {
-    $_.DriveType -in @(2, 3, 4)  # 2=Removable, 3=Local, 4=Network
-} | Select-Object -ExpandProperty DeviceID
-
-Write-Log "Found drives to scan: $($allDrives -join ', ')"
-
-foreach ($drive in $allDrives) {
-    Write-Log "Scanning drive: $drive"
-    
-    try {
-        # Scan only files with monitored extensions
-        Get-ChildItem -Path "$drive\" -Recurse -File -ErrorAction SilentlyContinue | 
-            Where-Object { $MonitoredExtensions -contains $_.Extension.ToLower() } | ForEach-Object {
-            $file = $_
-            $fileName = $file.Name
-            $filePath = $file.FullName
-            $ext = $file.Extension.ToLower()
-            
-            # Skip Windows core system files to avoid breaking the OS
-            if ($filePath -match "\\Windows\\System32\\|\\Windows\\SysWOW64\\|\\Windows\\WinSxS\\|\\Windows\\assembly\\") {
-                # But still check for suspicious names even in system folders
-                if (Test-SuspiciousExtension -FileName $fileName) {
-                    Write-Log "SUSPICIOUS: Multiple extension in system folder: $filePath"
-                    Send-ThreatAlert -Severity "CRITICAL" -Message "Suspicious file in system folder" -Details $filePath
-                }
-                return
-            }
-            
-            # Check for multiple/suspicious extensions (e.g., pdf.exe, doc.scr)
-            if (Test-SuspiciousExtension -FileName $fileName) {
-                Write-Log "THREAT: Multiple/suspicious extension detected: $filePath"
-                Send-ThreatAlert -Severity "HIGH" -Message "Suspicious multiple extension" -Details $filePath
-                Move-ToQuarantine -FilePath $filePath -Reason "Multiple/suspicious extension: $fileName"
-                return
-            }
-            
-            # Full threat analysis for ALL files
-            Invoke-ThreatAnalysis -FilePath $filePath
-            
-            # Check for unsigned DLLs
-            if ($ext -in @('.dll', '.winmd')) {
-                try {
-                    $sig = Get-AuthenticodeSignature $filePath -ErrorAction SilentlyContinue
-                    if ($sig.Status -ne 'Valid') {
-                        Write-Log "Unsigned DLL: $filePath"
-                        Move-ToQuarantine -FilePath $filePath -Reason "Unsigned DLL"
-                    }
-                } catch {}
-            }
-        }
-    } catch {
-        Write-Log "Error scanning drive $drive : $_"
-    }
-}
-
-Write-Log "Full system scan completed"
-
-# Monitor ALL accessible drives for real-time protection
-$monitorFolders = @()
-foreach ($drive in $allDrives) {
-    $monitorFolders += "$drive\"
-}
-
-if ($Config.EnableRealtimeMonitor) {
-    Write-Log "Setting up real-time file monitoring"
-    
-    foreach ($folder in $monitorFolders) {
-        if (-not (Test-Path $folder)) { continue }
-        
-        try {
-            $watcher = New-Object IO.FileSystemWatcher $folder, '*.*' -Property @{
-                IncludeSubdirectories = $true
-                NotifyFilter          = [IO.NotifyFilters]'FileName, LastWrite'
-            }
-            
-            Register-ObjectEvent $watcher Created -Action {
-                $filePath = $Event.SourceEventArgs.FullPath
-                $ext = [IO.Path]::GetExtension($filePath).ToLower()
-                if ($using:MonitoredExtensions -contains $ext) {
-                    Start-Sleep -Milliseconds 800
-                    Invoke-ThreatAnalysis -FilePath $filePath
-                }
-            } | Out-Null
-            
-            $watcher.EnableRaisingEvents = $true
-            Write-Log "File watcher active for: $folder"
-        } catch {
-            Write-Log "Failed to create file watcher for $folder : $_"
-        }
-    }
-}
-
-Write-Log "Registering WMI real-time execution monitors"
-
-try {
-    Register-WmiEvent -Query "SELECT * FROM Win32_ProcessStartTrace" -Action {
-        $event = $Event.SourceEventArgs.NewEvent
-        $filePath = $event.ProcessName
-        $processId = $event.ProcessId
-        
-        try {
-            $ownerSid = (Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction SilentlyContinue | 
-                Invoke-CimMethod -MethodName GetOwnerSid).Sid
-        } catch {
-            $ownerSid = "Unknown"
-        }
-        
-        if ($AllowedSIDs -contains $ownerSid) {
-            try {
-                $signature = Get-AuthenticodeSignature -FilePath $filePath -ErrorAction Stop
-                if ($signature.Status -eq 'Valid') {
-                    return
-                }
-            } catch {}
-        }
-        
-        Block-FileExecution -FilePath $filePath -ProcessId $processId -Type "EXE"
-    } | Out-Null
-    
-    Write-Log "WMI process start monitor registered"
-} catch {
-    Write-Log "Failed to register WMI process start monitor: $_"
-}
-
-try {
-    Register-WmiEvent -Query "SELECT * FROM Win32_ModuleLoadTrace" -Action {
-        $event = $Event.SourceEventArgs.NewEvent
-        $filePath = $event.ImageName
-        $processId = $event.ProcessId
-        
-        if (-not (Test-Path $filePath)) { return }
-        
-        try {
-            $ownerSid = (Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction SilentlyContinue | 
-                Invoke-CimMethod -MethodName GetOwnerSid).Sid
-        } catch {
-            $ownerSid = "Unknown"
-        }
-        
-        if ($AllowedSIDs -contains $ownerSid) {
-            try {
-                $signature = Get-AuthenticodeSignature -FilePath $filePath -ErrorAction Stop
-                if ($signature.Status -eq 'Valid') {
-                    return
-                }
-            } catch {}
-        }
-        
-        Block-FileExecution -FilePath $filePath -ProcessId $processId -Type "DLL"
-    } | Out-Null
-    
-    Write-Log "WMI module load monitor registered"
-} catch {
-    Write-Log "Failed to register WMI module load monitor: $_"
-}
-
-if ($Config.EnableMemoryScanning) {
-    Write-Log "Memory scanning enabled (runs as background jobs)"
-}
-
-if ($KeyScramblerConfig.EnableKeyScrambler) {
-    Start-KeyScrambler
-}
-
-$Script:LastDeepScan = [DateTime]::MinValue
-$Script:DeepScanJob = $null
-$Script:DeepScanScriptBlock = {
-    param($BaseDir)
-    
-    $results = @{
-        Persistence = @()
-        Fileless = @()
-        Errors = @()
-    }
-    
-    # Persistence scan
-    try {
-        $registryKeys = @(
-            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
-            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
-            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
-            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
-        )
-        
-        foreach ($key in $registryKeys) {
-            if (Test-Path $key) {
-                $props = Get-ItemProperty -Path $key -EA 0
-                foreach ($prop in $props.PSObject.Properties) {
-                    if ($prop.Name -notmatch '^PS') {
-                        $results.Persistence += @{
-                            Type = "Registry"
-                            Location = $key
-                            Name = $prop.Name
-                            Value = $prop.Value
-                        }
-                    }
-                }
-            }
-        }
-        
-        # Scheduled tasks
-        $tasks = Get-ScheduledTask -EA 0 | Where-Object { $_.State -ne 'Disabled' }
-        foreach ($task in $tasks) {
-            $results.Persistence += @{
-                Type = "ScheduledTask"
-                Location = $task.TaskPath
-                Name = $task.TaskName
-                Value = $task.State
-            }
-        }
-    } catch {
-        $results.Errors += "Persistence: $_"
-    }
-    
-    # Fileless scan
-    try {
-        $suspiciousPowerShell = Get-Process -Name powershell, pwsh -EA 0 | Where-Object {
-            $_.MainWindowTitle -match 'encodedcommand|enc|iex|invoke-expression'
-        }
-        foreach ($proc in $suspiciousPowerShell) {
-            $results.Fileless += @{
-                Type = "FilelessPowerShell"
-                ProcessName = $proc.Name
-                ProcessId = $proc.Id
-            }
-        }
-        
-        $wmiEvents = Get-WmiObject -Namespace root\Subscription -Class __EventFilter -EA 0 |
-            Where-Object { $_.Query -match 'powershell|vbscript|javascript' }
-        foreach ($evt in $wmiEvents) {
-            $results.Fileless += @{
-                Type = "WMIEventSubscription"
-                Name = $evt.Name
-                Query = $evt.Query
-            }
-        }
-    } catch {
-        $results.Errors += "Fileless: $_"
-    }
-    
-    return $results
-}
-
-function Invoke-DeepScan {
-    if (-not $IsAdmin -or -not $Config.EnableThreatIntel) { return }
-    
-    $now = Get-Date
-    $intervalSeconds = 60 * 60 * $BehaviorConfig.DeepScanIntervalHours
-    
-    # Clean up previous job if exists
-    if ($Script:DeepScanJob) {
-        if ($Script:DeepScanJob.State -eq 'Running') { return }
-        
-        # Process results from completed job
-        if ($Script:DeepScanJob.State -eq 'Completed') {
-            $results = Receive-Job -Job $Script:DeepScanJob -EA 0
-            
-            if ($results.Persistence -and $results.Persistence.Count -gt 0) {
-                $outputFile = Join-Path $Config.BaseDirectory "persistence_scan.csv"
-                $results.Persistence | ForEach-Object { [PSCustomObject]$_ } | Export-Csv -Path $outputFile -NoTypeInformation
-                Write-Log "Persistence scan found $($results.Persistence.Count) items -> $outputFile"
-            }
-            
-            if ($results.Fileless -and $results.Fileless.Count -gt 0) {
-                $outputFile = Join-Path $Config.BaseDirectory "fileless_detections.xml"
-                $results.Fileless | ForEach-Object { [PSCustomObject]$_ } | Export-Clixml -Path $outputFile
-                Write-Log "Fileless indicators found: $($results.Fileless.Count) -> $outputFile"
-                Send-ThreatAlert -Severity "HIGH" -Message "Fileless malware indicators" -Details "Found $($results.Fileless.Count) indicators"
-            }
-            
-            foreach ($err in $results.Errors) {
-                Write-Log "Deep scan error: $err"
-            }
-        }
-        
-        Remove-Job -Job $Script:DeepScanJob -Force -EA 0
-        $Script:DeepScanJob = $null
-    }
-    
-    # Check if it's time for a new scan
-    if ($Script:LastDeepScan -ne [DateTime]::MinValue -and ($now - $Script:LastDeepScan).TotalSeconds -lt $intervalSeconds) {
-        return
-    }
-    
-    $Script:LastDeepScan = $now
-    Write-Log "Starting deep scan job..."
-    
-    # Start new job
-    $Script:DeepScanJob = Start-Job -ScriptBlock $Script:DeepScanScriptBlock -ArgumentList @(
-        $Config.BaseDirectory
-    )
-}
-
-if ($IsAdmin -and $Config.EnableThreatIntel) {
-    $lastUpdateFile = Join-Path $Config.BaseDirectory "last_update.txt"
-    $currentTime = Get-Date
-    $shouldUpdate = $false
-    
-    if (-not (Test-Path $lastUpdateFile)) {
-        $shouldUpdate = $true
-    } else {
-        try {
-            $lastUpdate = (Get-Item $lastUpdateFile).LastWriteTime
-            if ($lastUpdate -lt $currentTime.AddDays(-$BehaviorConfig.ThreatIntelUpdateDays)) {
-                $shouldUpdate = $true
-            }
-        } catch {
-            $shouldUpdate = $true
-        }
-    }
-    
-    if ($shouldUpdate) {
-        Update-ThreatIntelligence
-        $currentTime | Out-File -FilePath $lastUpdateFile
-    }
-    
-    Write-Log "Deep scanner initialized (runs every $($BehaviorConfig.DeepScanIntervalHours) hours)"
-}
-
+# ========================= MAIN MONITORING LOOP =========================
 Write-Log "All monitoring systems active"
-Write-Host "`nAntivirus is now running" -ForegroundColor Green
+Write-Host "`n========================================" -ForegroundColor Green
+Write-Host "Clean Antivirus is now running" -ForegroundColor Green
 Write-Host "Press [Ctrl+C] to stop" -ForegroundColor Yellow
-
-$Script:ProcessCache = $null
-$Script:ProcessCacheTime = [DateTime]::MinValue
-
-function Get-CachedProcessList {
-    $now = Get-Date
-    # Refresh cache every 30 seconds max
-    if (-not $Script:ProcessCache -or ($now - $Script:ProcessCacheTime).TotalSeconds -gt 30) {
-        $Script:ProcessCache = @(Get-Process -EA 0)
-        $Script:ProcessCacheTime = $now
-    }
-    return $Script:ProcessCache
-}
+Write-Host "========================================`n" -ForegroundColor Green
 
 try {
     while ($true) {
         try {
-            # Refresh process cache once per cycle (reduces 36 Get-Process calls to 1)
-            $Script:ProcessCache = @(Get-Process -EA 0)
-            $Script:ProcessCacheTime = Get-Date
-            
-            # Cleanup unbounded hashtables (keep last 1000 entries max)
-            if ($Script:NBM_FocusHistory.Count -gt 1000) { $Script:NBM_FocusHistory.Clear() }
-            if ($Script:NBM_Reported.Count -gt 1000) { $Script:NBM_Reported.Clear() }
-            if ($Script:ElfDLLProcessed.Count -gt 1000) { $Script:ElfDLLProcessed.Clear() }
-            
-            # Core threat detection
             Invoke-ProcessAndNetworkScan
-            Start-Sleep -Seconds 5
-            
-            Invoke-LOLBinDetection
-            Start-Sleep -Seconds 5
-            
-            Invoke-ProcessAnomalyDetection
-            Start-Sleep -Seconds 5
-            
-            Invoke-AMSIBypassDetection
-            Start-Sleep -Seconds 5
-            
-            Invoke-CredentialDumpDetection
-            Start-Sleep -Seconds 5
-            
-            Invoke-RansomwareDetection
-            Start-Sleep -Seconds 5
-            
-            Invoke-ProcessHollowingDetection
-            Start-Sleep -Seconds 5
-            
-            Invoke-NetworkAnomalyDetection
-            Start-Sleep -Seconds 5
-            
-            Invoke-DLLHijackingDetection
-            Start-Sleep -Seconds 5
-            
-            Invoke-TokenManipulationDetection
-            Start-Sleep -Seconds 5
-            
-            Invoke-WMIPersistenceDetection
-            Start-Sleep -Seconds 5
-            
-            Invoke-ScheduledTaskDetection
-            Start-Sleep -Seconds 5
-            
-            Invoke-RegistryPersistenceDetection
-            Start-Sleep -Seconds 5
-            
-            # Niche/specialized detections
-            Invoke-NeuroBehaviorMonitor
-            Start-Sleep -Seconds 5
-            
-            Invoke-PrivacyForgeSpoofing
-            Start-Sleep -Seconds 5
-            
-            Invoke-ElfDLLUnloader
-            Start-Sleep -Seconds 5
-            
-            Invoke-RootkitDetection
-            Start-Sleep -Seconds 5
-            
-            Invoke-AttackToolsDetection
-            Start-Sleep -Seconds 5
-            
-            Invoke-BeaconDetection
-            Start-Sleep -Seconds 5
-            
-            Invoke-USBMonitoring
-            Start-Sleep -Seconds 5
-            
-            Invoke-GFocus
-            Start-Sleep -Seconds 5
-            
-            Invoke-ScriptContentScan
-            Start-Sleep -Seconds 5
-            
-            Invoke-StartupPersistenceDetection
-            Start-Sleep -Seconds 5
-            
-            Invoke-DriverWatcher
-            Start-Sleep -Seconds 5
-            
-            # Advanced abuse detection (new)
-            Invoke-CameraMicAccessDetection
-            Start-Sleep -Seconds 5
-            
-            Invoke-COMHijackingDetection
-            Start-Sleep -Seconds 5
-            
-            Invoke-ProxySettingsAbuseDetection
-            Start-Sleep -Seconds 5
-            
-            Invoke-DLLSearchOrderHijacking
-            Start-Sleep -Seconds 5
-            
-            Invoke-ProxywareDetection
-            Start-Sleep -Seconds 5
-            
-            Invoke-ShadowProxyCaptureDetection
-            Start-Sleep -Seconds 5
-            
-            # Memory scanning (background jobs - low RAM footprint)
-            Invoke-MemoryScan
-            Start-Sleep -Seconds 5
-            
-            Invoke-YaraMemoryScan
-            Start-Sleep -Seconds 5
-            
-            # Deep scan (runs periodically based on interval)
-            Invoke-DeepScan
-            Start-Sleep -Seconds 5
-            
-            # Force garbage collection to prevent memory bloat from Get-Process/Modules accumulation
-            [System.GC]::Collect()
-            [System.GC]::WaitForPendingFinalizers()
-            
-            Write-Log "Scan cycle completed"
+            Invoke-ScheduledDeepScan
+            Write-Log "Periodic scan cycle completed"
         } catch {
             Write-Log "Scan cycle error: $_"
         }
+        
+        Start-Sleep -Seconds 30
     }
 } catch {
     Write-Log "Main loop terminated: $($_.Exception.Message)"
