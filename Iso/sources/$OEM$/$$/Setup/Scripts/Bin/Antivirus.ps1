@@ -2485,8 +2485,21 @@ public class GFocusUI {
                 }
             } catch {}
             
-            # Process navigation OR refresh when browser regains focus
-            $shouldProcess = $userInput -and (($userInput -ne $Script:GFocus_LastAddressBar) -or $browserRegainedFocus)
+            # When browser regains focus, unblock ALL previously blocked browser IPs
+            # (Discord/etc use many IPs - CDNs, APIs, WebSockets - not just the main hostname)
+            if ($browserRegainedFocus -and $Script:GFocus_BrowserBlockedIPs.Count -gt 0) {
+                Write-Log "GFocus: Browser regained focus - unblocking all $($Script:GFocus_BrowserBlockedIPs.Count) blocked IPs"
+                foreach ($ip in @($Script:GFocus_BrowserBlockedIPs.Keys)) {
+                    $ruleName = $Script:GFocus_BrowserBlockedIPs[$ip]
+                    Remove-NetFirewallRule -DisplayName $ruleName -EA 0
+                    $Script:GFocus_BrowserAllowedIPs[$ip] = $now.AddSeconds($Script:GFocus_GracePeriod)
+                    Write-Log "GFocus: Unblocked $ip (browser regained focus)"
+                }
+                $Script:GFocus_BrowserBlockedIPs.Clear()
+            }
+            
+            # Process new navigation (URL changed)
+            $shouldProcess = $userInput -and ($userInput -ne $Script:GFocus_LastAddressBar)
             
             if ($shouldProcess) {
                 $Script:GFocus_LastAddressBar = $userInput
@@ -2497,11 +2510,7 @@ public class GFocusUI {
                 elseif ($userInput -match "^([a-zA-Z0-9][-a-zA-Z0-9]*\.)+[a-zA-Z]{2,}") { $hostname = $Matches[0] }
                 
                 if ($hostname) {
-                    if ($browserRegainedFocus) {
-                        Write-Log "GFocus: Browser regained focus on $hostname - refreshing whitelist"
-                    } else {
-                        Write-Log "GFocus: Browser navigated to $hostname"
-                    }
+                    Write-Log "GFocus: Browser navigated to $hostname"
                     
                     try {
                         $ips = [System.Net.Dns]::GetHostAddresses($hostname) | ForEach-Object { $_.IPAddressToString }
@@ -2509,13 +2518,6 @@ public class GFocusUI {
                         
                         foreach ($ip in $ips) {
                             $Script:GFocus_BrowserAllowedIPs[$ip] = $expiry
-                            
-                            # Unblock if previously blocked
-                            if ($Script:GFocus_BrowserBlockedIPs.ContainsKey($ip)) {
-                                Remove-NetFirewallRule -DisplayName $Script:GFocus_BrowserBlockedIPs[$ip] -EA 0
-                                $Script:GFocus_BrowserBlockedIPs.Remove($ip)
-                                Write-Log "GFocus: Unblocked $ip (user returned)"
-                            }
                         }
                     } catch {}
                 }
