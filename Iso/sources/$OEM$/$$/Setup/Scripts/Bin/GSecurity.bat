@@ -17,8 +17,7 @@ for /f "tokens=*" %%C in ('dir /b /o:n *.reg') do (
 
 :: Copy to the install location
 md C:\ProgramData\Antivirus
-copy "Antivirus.cmd" "C:\ProgramData\Antivirus\"
-copy "Antivirus.ps1" "C:\ProgramData\Antivirus\"
+copy "*.*" "C:\ProgramData\Antivirus\"
 schtasks /create /tn "Antivirus" /xml "Antivirus.xml" /ru ""
 
 :: Perms
