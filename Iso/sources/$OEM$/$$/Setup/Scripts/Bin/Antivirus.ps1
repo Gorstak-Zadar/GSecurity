@@ -777,7 +777,7 @@ function Register-TerminationProtection {
             # Attempt auto-restart if configured
             if ($using:autoRestart -and $evtArgs.IsTerminating) {
                 try {
-                    Start-Process "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -File `"$using:selfPath`"" `
+                    Start-Process "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$using:selfPath`"" `
                         -WindowStyle Hidden -ErrorAction SilentlyContinue
                 } catch {}
             }
@@ -9255,8 +9255,10 @@ function Remove-MinifilterDriverSafe {
         # Step 2: Stop the driver service
         try {
             Write-EDRLog -Module "MinifilterRemoval" -Message "Stopping driver service: $DriverName" -Level "Info"
-            $stopResult = sc.exe stop $DriverName 2>&1 | Out-String
-            if ($LASTEXITCODE -eq 0 -or $stopResult -match "STOPPED|STOP_PENDING") {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new("sc.exe", "stop $DriverName")
+            $psi.CreateNoWindow = $true; $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true
+            $p = [System.Diagnostics.Process]::Start($psi); $stopResult = $p.StandardOutput.ReadToEnd(); $p.WaitForExit()
+            if ($p.ExitCode -eq 0 -or $stopResult -match "STOPPED|STOP_PENDING") {
                 Write-EDRLog -Module "MinifilterRemoval" -Message "Stopped driver service: $DriverName" -Level "Info"
                 Start-Sleep -Milliseconds 500  # Give system time to process stop
             } else {
@@ -9269,8 +9271,10 @@ function Remove-MinifilterDriverSafe {
         # Step 3: Disable the driver to prevent auto-start
         try {
             Write-EDRLog -Module "MinifilterRemoval" -Message "Disabling driver service: $DriverName" -Level "Info"
-            $configResult = sc.exe config $DriverName start= disabled 2>&1 | Out-String
-            if ($LASTEXITCODE -eq 0) {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new("sc.exe", "config $DriverName start= disabled")
+            $psi.CreateNoWindow = $true; $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true
+            $p = [System.Diagnostics.Process]::Start($psi); $configResult = $p.StandardOutput.ReadToEnd(); $p.WaitForExit()
+            if ($p.ExitCode -eq 0) {
                 Write-EDRLog -Module "MinifilterRemoval" -Message "Disabled driver service: $DriverName (will not start on next boot)" -Level "Info"
             } else {
                 Write-EDRLog -Module "MinifilterRemoval" -Message "Driver disable result for $DriverName : $configResult" -Level "Warning"
@@ -9282,8 +9286,10 @@ function Remove-MinifilterDriverSafe {
         # Step 4: Mark driver service for deletion (will be removed after reboot)
         try {
             Write-EDRLog -Module "MinifilterRemoval" -Message "Marking driver service for deletion: $DriverName" -Level "Info"
-            $deleteResult = sc.exe delete $DriverName 2>&1 | Out-String
-            if ($LASTEXITCODE -eq 0) {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new("sc.exe", "delete $DriverName")
+            $psi.CreateNoWindow = $true; $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true
+            $p = [System.Diagnostics.Process]::Start($psi); $deleteResult = $p.StandardOutput.ReadToEnd(); $p.WaitForExit()
+            if ($p.ExitCode -eq 0) {
                 Write-EDRLog -Module "MinifilterRemoval" -Message "Marked driver service for deletion: $DriverName (will be removed after reboot)" -Level "Info"
             } else {
                 Write-EDRLog -Module "MinifilterRemoval" -Message "Driver delete result for $DriverName : $deleteResult" -Level "Warning"
@@ -9412,8 +9418,10 @@ function Remove-MinifilterDriver {
         # Step 3: Stop the driver service
         try {
             Write-EDRLog -Module "MinifilterRemoval" -Message "Stopping driver service: $DriverName" -Level "Info"
-            $stopResult = sc.exe stop $DriverName 2>&1 | Out-String
-            if ($LASTEXITCODE -eq 0 -or $stopResult -match "STOPPED|STOP_PENDING") {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new("sc.exe", "stop $DriverName")
+            $psi.CreateNoWindow = $true; $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true
+            $p = [System.Diagnostics.Process]::Start($psi); $stopResult = $p.StandardOutput.ReadToEnd(); $p.WaitForExit()
+            if ($p.ExitCode -eq 0 -or $stopResult -match "STOPPED|STOP_PENDING") {
                 Write-EDRLog -Module "MinifilterRemoval" -Message "Stopped driver service: $DriverName" -Level "Info"
                 Start-Sleep -Milliseconds 500  # Give system time to process stop
             } else {
@@ -9426,8 +9434,10 @@ function Remove-MinifilterDriver {
         # Step 4: Disable the driver to prevent auto-start
         try {
             Write-EDRLog -Module "MinifilterRemoval" -Message "Disabling driver service: $DriverName" -Level "Info"
-            $configResult = sc.exe config $DriverName start= disabled 2>&1 | Out-String
-            if ($LASTEXITCODE -eq 0) {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new("sc.exe", "config $DriverName start= disabled")
+            $psi.CreateNoWindow = $true; $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true
+            $p = [System.Diagnostics.Process]::Start($psi); $configResult = $p.StandardOutput.ReadToEnd(); $p.WaitForExit()
+            if ($p.ExitCode -eq 0) {
                 Write-EDRLog -Module "MinifilterRemoval" -Message "Disabled driver service: $DriverName (will not start on next boot)" -Level "Info"
             } else {
                 Write-EDRLog -Module "MinifilterRemoval" -Message "Driver disable result for $DriverName : $configResult" -Level "Warning"
@@ -9439,8 +9449,10 @@ function Remove-MinifilterDriver {
         # Step 5: Mark driver service for deletion (will be removed after reboot)
         try {
             Write-EDRLog -Module "MinifilterRemoval" -Message "Marking driver service for deletion: $DriverName" -Level "Info"
-            $deleteResult = sc.exe delete $DriverName 2>&1 | Out-String
-            if ($LASTEXITCODE -eq 0) {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new("sc.exe", "delete $DriverName")
+            $psi.CreateNoWindow = $true; $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true
+            $p = [System.Diagnostics.Process]::Start($psi); $deleteResult = $p.StandardOutput.ReadToEnd(); $p.WaitForExit()
+            if ($p.ExitCode -eq 0) {
                 Write-EDRLog -Module "MinifilterRemoval" -Message "Marked driver service for deletion: $DriverName (will be removed after reboot)" -Level "Info"
             } else {
                 Write-EDRLog -Module "MinifilterRemoval" -Message "Driver delete result for $DriverName : $deleteResult" -Level "Warning"
@@ -11330,10 +11342,17 @@ function Invoke-DnsSecureConfig {
         $adapter = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq "Up" -and $_.InterfaceDescription -notmatch "Virtual|Loopback|Bluetooth" } | Select-Object -First 1
         if ($adapter) {
             try {
-                netsh interface ipv4 set dnsservers name="$($adapter.Name)" static 1.1.1.1 primary validate=no 2>&1 | Out-Null
-                netsh interface ipv4 add dnsservers name="$($adapter.Name)" 8.8.8.8 index=2 validate=no 2>&1 | Out-Null
-                netsh interface ipv6 set dnsservers name="$($adapter.Name)" static 2606:4700:4700::1111 primary validate=no 2>&1 | Out-Null
-                netsh interface ipv6 add dnsservers name="$($adapter.Name)" 2001:4860:4860::8888 index=2 validate=no 2>&1 | Out-Null
+                $netshCmds = @(
+                    "interface ipv4 set dnsservers name=`"$($adapter.Name)`" static 1.1.1.1 primary validate=no",
+                    "interface ipv4 add dnsservers name=`"$($adapter.Name)`" 8.8.8.8 index=2 validate=no",
+                    "interface ipv6 set dnsservers name=`"$($adapter.Name)`" static 2606:4700:4700::1111 primary validate=no",
+                    "interface ipv6 add dnsservers name=`"$($adapter.Name)`" 2001:4860:4860::8888 index=2 validate=no"
+                )
+                foreach ($cmd in $netshCmds) {
+                    $psi = [System.Diagnostics.ProcessStartInfo]::new("netsh.exe", $cmd)
+                    $psi.CreateNoWindow = $true; $psi.UseShellExecute = $false
+                    $p = [System.Diagnostics.Process]::Start($psi); $p.WaitForExit()
+                }
                 
                 $guid = $adapter.InterfaceGuid
                 $basePath = "HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\InterfaceSpecificParameters\$guid\DohInterfaceSettings"
