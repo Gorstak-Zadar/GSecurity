@@ -1391,7 +1391,7 @@ function Invoke-RegistryPersistenceDetection {
 function Invoke-DLLHijackingDetection {
     $badLocations = "\\Temp\\|\\Downloads\\|\\Desktop\\|\\AppData\\"
     
-    foreach ($proc in Get-Process -EA 0) {
+    foreach ($proc in (Get-CachedProcessList)) {
         if ($proc.Id -eq $PID) { continue }
         try {
             foreach ($mod in $proc.Modules) {
@@ -1409,7 +1409,7 @@ function Invoke-DLLHijackingDetection {
 }
 
 function Invoke-TokenManipulationDetection {
-    foreach ($proc in Get-Process -EA 0 | Where-Object { $_.Path }) {
+    foreach ($proc in (Get-CachedProcessList) | Where-Object { $_.Path }) {
         try {
             $owner = (Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.Id)" -EA 0).GetOwner()
             if ($owner.Domain -eq "NT AUTHORITY" -and $proc.Path -notmatch "^C:\\Windows") {
@@ -1522,7 +1522,7 @@ function Invoke-CameraMicAccessDetection {
         'SecurityHealthService', 'MsMpEng'                # Windows Security
     )
     
-    foreach ($proc in Get-Process -EA 0) {
+    foreach ($proc in (Get-CachedProcessList)) {
         if ($proc.Id -eq $PID) { continue }
         try {
             $loadedMF = $proc.Modules | Where-Object { $_.ModuleName -match 'MFCaptureEngine|mfplat|mf\.dll' }
@@ -1705,7 +1705,7 @@ function Invoke-DLLSearchOrderHijacking {
         'wldap32.dll', 'crypt32.dll', 'msasn1.dll', 'imagehlp.dll', 'wintrust.dll'
     )
     
-    foreach ($proc in Get-Process -EA 0) {
+    foreach ($proc in (Get-CachedProcessList)) {
         if ($proc.Id -eq $PID) { continue }
         try {
             foreach ($mod in $proc.Modules) {
@@ -1836,7 +1836,7 @@ function Invoke-ShadowProxyCaptureDetection {
         'brave', 'chrome', 'firefox', 'msedge', 'opera'  # Browsers
     )
     
-    foreach ($proc in Get-Process -EA 0) {
+    foreach ($proc in (Get-CachedProcessList)) {
         if ($proc.Id -eq $PID) { continue }
         
         $procNameLower = $proc.ProcessName.ToLower()
@@ -3097,9 +3097,31 @@ Write-Log "All monitoring systems active"
 Write-Host "`nAntivirus is now running" -ForegroundColor Green
 Write-Host "Press [Ctrl+C] to stop" -ForegroundColor Yellow
 
+$Script:ProcessCache = $null
+$Script:ProcessCacheTime = [DateTime]::MinValue
+
+function Get-CachedProcessList {
+    $now = Get-Date
+    # Refresh cache every 30 seconds max
+    if (-not $Script:ProcessCache -or ($now - $Script:ProcessCacheTime).TotalSeconds -gt 30) {
+        $Script:ProcessCache = @(Get-Process -EA 0)
+        $Script:ProcessCacheTime = $now
+    }
+    return $Script:ProcessCache
+}
+
 try {
     while ($true) {
         try {
+            # Refresh process cache once per cycle (reduces 36 Get-Process calls to 1)
+            $Script:ProcessCache = @(Get-Process -EA 0)
+            $Script:ProcessCacheTime = Get-Date
+            
+            # Cleanup unbounded hashtables (keep last 1000 entries max)
+            if ($Script:NBM_FocusHistory.Count -gt 1000) { $Script:NBM_FocusHistory.Clear() }
+            if ($Script:NBM_Reported.Count -gt 1000) { $Script:NBM_Reported.Clear() }
+            if ($Script:ElfDLLProcessed.Count -gt 1000) { $Script:ElfDLLProcessed.Clear() }
+            
             # Core threat detection
             Invoke-ProcessAndNetworkScan
             Start-Sleep -Seconds 5
@@ -3203,6 +3225,10 @@ try {
             # Deep scan (runs periodically based on interval)
             Invoke-DeepScan
             Start-Sleep -Seconds 5
+            
+            # Force garbage collection to prevent memory bloat from Get-Process/Modules accumulation
+            [System.GC]::Collect()
+            [System.GC]::WaitForPendingFinalizers()
             
             Write-Log "Scan cycle completed"
         } catch {
