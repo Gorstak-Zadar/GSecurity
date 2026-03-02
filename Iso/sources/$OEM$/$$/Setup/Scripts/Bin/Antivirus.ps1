@@ -711,129 +711,86 @@ function Initialize-Yara {
 
 $yaraReady = Initialize-Yara
 
-function Start-MemoryScanner {
-    if (-not $Config.EnableMemoryScanning) {
-        Write-Log "Memory scanning is disabled in configuration"
-        return
-    }
+function Invoke-MemoryScan {
+    if (-not $Config.EnableMemoryScanning) { return }
     
-    Write-Log "Starting optimized memory scanner (interval: $($Config.MemoryScanIntervalSec)s, max size: $($Config.MemoryScanMaxSizeMB)MB)"
+    $maxBytes = $Config.MemoryScanMaxSizeMB * 1MB
+    $logFile = Join-Path $Config.BaseDirectory "memory_hits.log"
     
-    Start-Job -ScriptBlock {
-        $config = $using:Config
-        $protected = $using:ProtectedProcesses
-        $evilStrings = $using:EvilStrings
-        $logFile = Join-Path $config.BaseDirectory "memory_hits.log"
+    Get-Process -EA 0 | Where-Object {
+        $_.WorkingSet64 -lt $maxBytes -and $ProtectedProcesses -notcontains $_.Name
+    } | ForEach-Object {
+        $process = $_
+        $suspicious = $false
+        $reasons = @()
         
-        while ($true) {
-            Start-Sleep -Seconds $config.MemoryScanIntervalSec
-            
-            $maxBytes = $config.MemoryScanMaxSizeMB * 1MB
-            
-            Get-Process | Where-Object {
-                $_.WorkingSet64 -lt $maxBytes -and $protected -notcontains $_.Name
-            } | ForEach-Object {
-                $process = $_
-                $suspicious = $false
-                $reasons = @()
-                
-                try {
-                    if (-not $process.Path -or $process.Path -eq '') {
+        try {
+            if (-not $process.Path -or $process.Path -eq '') {
+                $suspicious = $true
+                $reasons += "NoPath"
+            }
+        } catch {}
+        
+        try {
+            $emptyModules = $process.Modules | Where-Object {
+                $_.FileName -eq '' -or $_.ModuleName -eq ''
+            }
+            if ($emptyModules) {
+                $suspicious = $true
+                $reasons += "EmptyModule"
+            }
+        } catch {}
+        
+        try {
+            foreach ($module in $process.Modules) {
+                foreach ($evilString in $EvilStrings) {
+                    if ($module.ModuleName -match $evilString -or ($module.FileName -and $module.FileName -match $evilString)) {
                         $suspicious = $true
-                        $reasons += "NoPath"
+                        $reasons += "EvilString($evilString)"
+                        break
                     }
-                } catch {}
-                
-                try {
-                    $emptyModules = $process.Modules | Where-Object {
-                        $_.FileName -eq '' -or $_.ModuleName -eq ''
-                    }
-                    
-                    if ($emptyModules) {
-                        $suspicious = $true
-                        $reasons += "EmptyModule"
-                    }
-                } catch {}
-                
-                try {
-                    foreach ($module in $process.Modules) {
-                        foreach ($evilString in $evilStrings) {
-                            if ($module.ModuleName -match $evilString -or ($module.FileName -and $module.FileName -match $evilString)) {
-                                $suspicious = $true
-                                $reasons += "EvilString($evilString)"
-                                break
-                            }
-                        }
-                        if ($suspicious) { break }
-                    }
-                } catch {}
-                
-                if ($suspicious) {
-                    $reasonString = $reasons -join '; '
-                    $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | MEMORY HIT [$reasonString] -> $($process.Name) (PID: $($process.Id)) Path: '$($process.Path)' WS: $([math]::Round($process.WorkingSet64/1MB, 2))MB"
-                    
-                    try {
-                        $logEntry | Out-File -FilePath $logFile -Append -Encoding UTF8
-                    } catch {}
-                    
-                    try {
-                        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-                    } catch {}
                 }
+                if ($suspicious) { break }
             }
-            
-            if ((Get-Random -Minimum 1 -Maximum 10) -eq 1) {
-                [System.GC]::Collect()
-                [System.GC]::WaitForPendingFinalizers()
-            }
+        } catch {}
+        
+        if ($suspicious) {
+            $reasonString = $reasons -join '; '
+            $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | MEMORY HIT [$reasonString] -> $($process.Name) (PID: $($process.Id)) Path: '$($process.Path)' WS: $([math]::Round($process.WorkingSet64/1MB, 2))MB"
+            Write-Log "MEMORY: $reasonString -> $($process.Name) (PID: $($process.Id))"
+            try { $logEntry | Out-File -FilePath $logFile -Append -Encoding UTF8 } catch {}
+            try { Stop-Process -Id $process.Id -Force -EA 0 } catch {}
         }
-    } | Out-Null
+    }
 }
 
-function Start-YaraMemoryScanner {
+function Invoke-YaraMemoryScan {
     $yaraExePath = Join-Path $Config.BaseDirectory "yara64.exe"
     $yaraRulePath = Join-Path $Config.BaseDirectory "mem.yar"
     
-    if (-not (Test-Path $yaraExePath) -or -not (Test-Path $yaraRulePath)) {
-        Write-Log "YARA executable or rule file missing - skipping YARA memory scanner"
-        return
-    }
+    if (-not (Test-Path $yaraExePath) -or -not (Test-Path $yaraRulePath)) { return }
     
-    Write-Log "Starting YARA memory scanner"
+    $logFile = Join-Path $Config.BaseDirectory "yara_memory_hits.log"
     
-    Start-Job -ScriptBlock {
-        $yaraExe = $using:yaraExePath
-        $yaraRule = $using:yaraRulePath
-        $protected = $using:ProtectedProcesses
-        $config = $using:Config
-        $logFile = Join-Path $config.BaseDirectory "yara_memory_hits.log"
+    Get-Process -EA 0 | Where-Object {
+        $_.WorkingSet64 -gt 100MB -or $_.Name -match 'powershell|wscript|cscript|mshta|rundll32|regsvr32|msbuild|cmstp'
+    } | ForEach-Object {
+        $process = $_
         
-        while ($true) {
-            Start-Sleep -Seconds $config.MemoryScanIntervalSec
+        try {
+            $result = & $yaraExePath -w $yaraRulePath -p $process.Id 2>$null
             
-            Get-Process | Where-Object {
-                $_.WorkingSet64 -gt 100MB -or $_.Name -match 'powershell|wscript|cscript|mshta|rundll32|regsvr32|msbuild|cmstp'
-            } | ForEach-Object {
-                $process = $_
+            if ($LASTEXITCODE -eq 0 -and $result) {
+                $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | YARA HIT -> $($process.Name) (PID: $($process.Id))"
+                Write-Log "YARA: Hit on $($process.Name) (PID: $($process.Id))"
+                try { $logEntry | Out-File -FilePath $logFile -Append -Encoding UTF8 } catch {}
                 
-                try {
-                    $result = & $yaraExe -w $yaraRule -p $process.Id 2>$null
-                    
-                    if ($LASTEXITCODE -eq 0 -and $result) {
-                        $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | YARA HIT -> $($process.Name) (PID: $($process.Id))"
-                        
-                        try {
-                            $logEntry | Out-File -FilePath $logFile -Append -Encoding UTF8
-                        } catch {}
-                        
-                        if ($protected -notcontains $process.Name) {
-                            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-                        }
-                    }
-                } catch {}
+                if ($ProtectedProcesses -notcontains $process.Name) {
+                    Stop-Process -Id $process.Id -Force -EA 0
+                }
             }
-        }
-    } | Out-Null
+        } catch {}
+    }
 }
 
 function Find-FilelessIndicators {
@@ -1598,7 +1555,8 @@ public class KeyScrambler
 }
 "@
 
-$Script:KeyScramblerJob = $null
+$Script:KeyScramblerRunspace = $null
+$Script:KeyScramblerPowerShell = $null
 
 function Start-KeyScrambler {
     if (-not $KeyScramblerConfig.EnableKeyScrambler) {
@@ -1622,16 +1580,25 @@ function Start-KeyScrambler {
             $KeyScramblerConfig.MaxFakeChars
         )
         
-        $Script:KeyScramblerJob = Start-Job -ScriptBlock {
+        # Use runspace (thread) instead of job (separate process)
+        $Script:KeyScramblerRunspace = [runspacefactory]::CreateRunspace()
+        $Script:KeyScramblerRunspace.ApartmentState = "STA"
+        $Script:KeyScramblerRunspace.ThreadOptions = "ReuseThread"
+        $Script:KeyScramblerRunspace.Open()
+        
+        $Script:KeyScramblerPowerShell = [powershell]::Create()
+        $Script:KeyScramblerPowerShell.Runspace = $Script:KeyScramblerRunspace
+        
+        $null = $Script:KeyScramblerPowerShell.AddScript({
             param($Source, $FloodChance, $BeforeChance, $AfterChance, $MinChars, $MaxChars)
-            
             Add-Type -TypeDefinition $Source -Language CSharp -ErrorAction Stop
-            
             [KeyScrambler]::Configure($FloodChance, $BeforeChance, $AfterChance, $MinChars, $MaxChars)
             [KeyScrambler]::Start()
-        } -ArgumentList $KeyScramblerSource, $KeyScramblerConfig.FloodChance, $KeyScramblerConfig.BeforeKeyChance, $KeyScramblerConfig.AfterKeyChance, $KeyScramblerConfig.MinFakeChars, $KeyScramblerConfig.MaxFakeChars
+        }).AddArgument($KeyScramblerSource).AddArgument($KeyScramblerConfig.FloodChance).AddArgument($KeyScramblerConfig.BeforeKeyChance).AddArgument($KeyScramblerConfig.AfterKeyChance).AddArgument($KeyScramblerConfig.MinFakeChars).AddArgument($KeyScramblerConfig.MaxFakeChars)
         
-        Write-Log "KeyScrambler ACTIVE - anti-keylogger protection enabled"
+        $null = $Script:KeyScramblerPowerShell.BeginInvoke()
+        
+        Write-Log "KeyScrambler ACTIVE - anti-keylogger protection enabled (runspace thread)"
         Write-Log "  -> You see only your real typing"
         Write-Log "  -> Keyloggers receive garbage mixed with your keystrokes"
     }
@@ -1641,12 +1608,19 @@ function Start-KeyScrambler {
 }
 
 function Stop-KeyScrambler {
-    if ($Script:KeyScramblerJob) {
-        Stop-Job -Job $Script:KeyScramblerJob -ErrorAction SilentlyContinue
-        Remove-Job -Job $Script:KeyScramblerJob -Force -ErrorAction SilentlyContinue
-        $Script:KeyScramblerJob = $null
+    try {
+        if ($Script:KeyScramblerPowerShell) {
+            $Script:KeyScramblerPowerShell.Stop()
+            $Script:KeyScramblerPowerShell.Dispose()
+            $Script:KeyScramblerPowerShell = $null
+        }
+        if ($Script:KeyScramblerRunspace) {
+            $Script:KeyScramblerRunspace.Close()
+            $Script:KeyScramblerRunspace.Dispose()
+            $Script:KeyScramblerRunspace = $null
+        }
         Write-Log "KeyScrambler stopped"
-    }
+    } catch {}
 }
 
 # ===================== Niche/Specialized Detection Functions =====================
@@ -2446,12 +2420,51 @@ try {
 }
 
 if ($Config.EnableMemoryScanning) {
-    Start-MemoryScanner
-    Start-YaraMemoryScanner
+    Write-Log "Memory scanning enabled (runs in main loop)"
 }
 
 if ($KeyScramblerConfig.EnableKeyScrambler) {
     Start-KeyScrambler
+}
+
+$Script:LastDeepScan = [DateTime]::MinValue
+
+function Invoke-DeepScan {
+    if (-not $IsAdmin -or -not $Config.EnableThreatIntel) { return }
+    
+    $now = Get-Date
+    $intervalSeconds = 60 * 60 * $BehaviorConfig.DeepScanIntervalHours
+    
+    if ($Script:LastDeepScan -ne [DateTime]::MinValue -and ($now - $Script:LastDeepScan).TotalSeconds -lt $intervalSeconds) {
+        return
+    }
+    
+    $Script:LastDeepScan = $now
+    Write-Log "Running deep scan..."
+    
+    try {
+        $persistence = Find-PersistenceMechanisms
+        if ($persistence -and $persistence.Count -gt 0) {
+            $outputFile = Join-Path $Config.BaseDirectory "persistence_scan.csv"
+            $persistence | Export-Csv -Path $outputFile -NoTypeInformation
+            Write-Log "Persistence scan found $($persistence.Count) items -> $outputFile"
+            Send-ThreatAlert -Severity "MEDIUM" -Message "Persistence mechanisms detected" -Details "Found $($persistence.Count) items"
+        }
+    } catch {
+        Write-Log "Persistence scan error: $_"
+    }
+    
+    try {
+        $fileless = Find-FilelessIndicators
+        if ($fileless -and $fileless.Count -gt 0) {
+            $outputFile = Join-Path $Config.BaseDirectory "fileless_detections.xml"
+            $fileless | Export-Clixml -Path $outputFile
+            Write-Log "Fileless indicators found: $($fileless.Count) -> $outputFile"
+            Send-ThreatAlert -Severity "HIGH" -Message "Fileless malware indicators" -Details "Found $($fileless.Count) indicators"
+        }
+    } catch {
+        Write-Log "Fileless scan error: $_"
+    }
 }
 
 if ($IsAdmin -and $Config.EnableThreatIntel) {
@@ -2477,40 +2490,7 @@ if ($IsAdmin -and $Config.EnableThreatIntel) {
         $currentTime | Out-File -FilePath $lastUpdateFile
     }
     
-    Start-Job -ScriptBlock {
-        $config = $using:Config
-        $behaviorConfig = $using:BehaviorConfig
-        
-        while ($true) {
-            Start-Sleep -Seconds (60 * 60 * $behaviorConfig.DeepScanIntervalHours)
-            
-            try {
-                $persistence = Find-PersistenceMechanisms
-                if ($persistence -and $persistence.Count -gt 0) {
-                    $outputFile = Join-Path $config.BaseDirectory "persistence_scan.csv"
-                    $persistence | Export-Csv -Path $outputFile -NoTypeInformation
-                    Write-Log "Persistence scan found $($persistence.Count) items -> $outputFile"
-                    Send-ThreatAlert -Severity "MEDIUM" -Message "Persistence mechanisms detected" -Details "Found $($persistence.Count) items"
-                }
-            } catch {
-                Write-Log "Persistence scan error: $_"
-            }
-            
-            try {
-                $fileless = Find-FilelessIndicators
-                if ($fileless -and $fileless.Count -gt 0) {
-                    $outputFile = Join-Path $config.BaseDirectory "fileless_detections.xml"
-                    $fileless | Export-Clixml -Path $outputFile
-                    Write-Log "Fileless indicators found: $($fileless.Count) -> $outputFile"
-                    Send-ThreatAlert -Severity "HIGH" -Message "Fileless malware indicators" -Details "Found $($fileless.Count) indicators"
-                }
-            } catch {
-                Write-Log "Fileless scan error: $_"
-            }
-        }
-    } | Out-Null
-    
-    Write-Log "Deep scanner job started"
+    Write-Log "Deep scanner initialized (runs every $($BehaviorConfig.DeepScanIntervalHours) hours)"
 }
 
 Write-Log "All monitoring systems active"
@@ -2592,6 +2572,17 @@ try {
             Start-Sleep -Seconds 5
             
             Invoke-DriverWatcher
+            Start-Sleep -Seconds 5
+            
+            # Memory scanning (previously in separate jobs)
+            Invoke-MemoryScan
+            Start-Sleep -Seconds 5
+            
+            Invoke-YaraMemoryScan
+            Start-Sleep -Seconds 5
+            
+            # Deep scan (runs periodically based on interval)
+            Invoke-DeepScan
             Start-Sleep -Seconds 5
             
             Write-Log "Scan cycle completed"
