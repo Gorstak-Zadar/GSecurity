@@ -10,7 +10,9 @@ param([switch]$Uninstall)
 # Unique script identifier (GUID) - used for process identification and mutex naming
 $Script:ScriptGUID = "539EF6B5-578B-4AF3-A5C7-FD564CB9C8FB"
 
-$Script:InstallPath = "C:\ProgramData\AntivirusProtection"
+# Portable mode: Use script's directory as base path
+$Script:ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $PSCommandPath }
+$Script:InstallPath = $Script:ScriptDir
 $Script:ScriptName = Split-Path -Leaf $PSCommandPath
 $Script:MaxRestartAttempts = 3
 $Script:StabilityLogPath = "$Script:InstallPath\Logs\stability_log.txt"
@@ -202,7 +204,7 @@ function Write-AVLog {
     # Check if Config exists and LogPath is not null
     if ($null -eq $configVar -or $null -eq $configVar.LogPath -or [string]::IsNullOrWhiteSpace($configVar.LogPath)) {
         # Fallback to default log path if Config is not available
-        $logPath = if ($Script:InstallPath) { "$Script:InstallPath\Logs" } else { "C:\ProgramData\AntivirusProtection\Logs" }
+        $logPath = if ($Script:InstallPath) { "$Script:InstallPath\Logs" } else { "$PSScriptRoot\Logs" }
         $logFilePath = Join-Path $logPath $LogFile
         
         if (!(Test-Path $logPath)) {
@@ -277,23 +279,12 @@ function Register-ExitCleanup {
 }
 
 function Install-Antivirus {
-    $targetScript = Join-Path $Script:InstallPath $Script:ScriptName
-    $currentPath = $PSCommandPath
+    # Portable mode: Run from current location, no copying needed
+    $Script:SelfPath = $PSCommandPath
 
-    # Set SelfPath to the installed script location (used by auto-restart and watchdog)
-    $Script:SelfPath = $targetScript
+    Write-Host "[+] Running in portable mode from: $Script:ScriptDir" -ForegroundColor Green
 
-    if ($currentPath -eq $targetScript) {
-        Write-Host "[+] Running from install location" -ForegroundColor Green
-        $Global:AntivirusState.Installed = $true
-        # Initialize mutex BEFORE creating persistence to prevent race conditions during setup
-        Initialize-Mutex
-        Install-Persistence
-        return $true
-    }
-
-    Write-Host "`n=== Installing Antivirus ===`n" -ForegroundColor Cyan
-
+    # Create subfolders in current directory if needed
     @("Data","Logs","Quarantine","Reports") | ForEach-Object {
         $p = Join-Path $Script:InstallPath $_
         if (!(Test-Path $p)) {
@@ -302,15 +293,10 @@ function Install-Antivirus {
         }
     }
 
-    Copy-Item -Path $PSCommandPath -Destination $targetScript -Force
-    Write-Host "[+] Copied main script to $targetScript"
-
-    # Initialize mutex BEFORE creating persistence to prevent race conditions during setupcomplete.cmd
-    # This ensures only one instance can acquire the mutex before scheduled tasks are created
+    # Initialize mutex BEFORE creating persistence to prevent race conditions
     Initialize-Mutex
     Install-Persistence
 
-    Write-Host "`n[+] Installation complete. Continuing in this instance...`n" -ForegroundColor Green
     $Global:AntivirusState.Installed = $true
     return $true
 }
@@ -333,11 +319,13 @@ function Install-Persistence {
             Remove-Item $shortcutPath -Force -ErrorAction SilentlyContinue
         }
 
-        # Add to HKCU Run key
-        $runCommand = "powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$($Script:InstallPath)\$($Script:ScriptName)`""
+        # Add to HKCU Run key - use actual script path (portable mode)
+        $scriptFullPath = Join-Path $Script:ScriptDir $Script:ScriptName
+        $runCommand = "powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptFullPath`""
         Set-ItemProperty -Path $runKeyPath -Name $runKeyName -Value $runCommand -ErrorAction Stop
 
         Write-Host "[+] Registry Run key entry created for automatic startup" -ForegroundColor Green
+        Write-Host "    Script path: $scriptFullPath" -ForegroundColor Gray
         Write-StabilityLog "Persistence setup completed - HKCU Run key created"
     }
     catch {
@@ -720,13 +708,18 @@ function Select-BoundConfig {
 
 function Register-TerminationProtection {
     try {
+        # Define paths for the event handler
+        $logsFolder = "$Script:InstallPath\Logs"
+        $selfPath = $Script:SelfPath
+        $autoRestart = $Script:AutoRestart
+        
         # Monitor for unexpected termination attempts
         $Script:UnhandledExceptionHandler = Register-ObjectEvent -InputObject ([AppDomain]::CurrentDomain) `
             -EventName UnhandledException -Action {
             param($src, $evtArgs)
             
             $errorMsg = "Unhandled exception: $($evtArgs.Exception.ToString())"
-            $errorMsg | Out-File "$using:quarantineFolder\crash_log.txt" -Append
+            $errorMsg | Out-File "$using:logsFolder\crash_log.txt" -Append
             
             try {
                 # Log to security events
@@ -737,13 +730,13 @@ function Register-TerminationProtection {
                     Exception = $evtArgs.Exception.ToString()
                     IsTerminating = $evtArgs.IsTerminating
                 }
-                $securityEvent | ConvertTo-Json -Compress | Out-File "$using:quarantineFolder\security_events.jsonl" -Append
+                $securityEvent | ConvertTo-Json -Compress | Out-File "$using:logsFolder\security_events.jsonl" -Append
             } catch {}
             
             # Attempt auto-restart if configured
-            if ($using:Script:AutoRestart -and $evtArgs.IsTerminating) {
+            if ($using:autoRestart -and $evtArgs.IsTerminating) {
                 try {
-                    Start-Process "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -File `"$using:Script:SelfPath`"" `
+                    Start-Process "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -File `"$using:selfPath`"" `
                         -WindowStyle Hidden -ErrorAction SilentlyContinue
                 } catch {}
             }
@@ -1667,7 +1660,7 @@ function Invoke-SystemWideAdvancedThreatDetection {
             }
             
             # Write detailed log
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\AdvancedThreatDetection_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\AdvancedThreatDetection_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force -ErrorAction SilentlyContinue | Out-Null
@@ -2013,7 +2006,7 @@ function Invoke-AMSIBypassDetection {
                 }
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\AMSIBypass_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\AMSIBypass_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -2282,7 +2275,7 @@ function Invoke-RegistryPersistenceDetection {
                 $Global:AntivirusState.ThreatCount++
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\RegistryPersistence_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\RegistryPersistence_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -2420,7 +2413,7 @@ function Invoke-DLLHijackingDetection {
                 }
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\DLLHijacking_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\DLLHijacking_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -2629,7 +2622,7 @@ function Invoke-ProcessHollowingDetection {
                 }
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\ProcessHollowing_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\ProcessHollowing_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -2812,7 +2805,7 @@ function Invoke-KeystrokeInjectionDetection {
                 }
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\KeystrokeInjection_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\KeystrokeInjection_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
             $detections | ForEach-Object {
@@ -3034,7 +3027,7 @@ function Invoke-RansomwareDetection {
                 }
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\Ransomware_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\Ransomware_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -4083,7 +4076,7 @@ function Invoke-BrowserExtensionMonitoring {
                 $Global:AntivirusState.ThreatCount++
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\BrowserExtension_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\BrowserExtension_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -4232,7 +4225,7 @@ function Invoke-USBMonitoring {
                 $Global:AntivirusState.ThreatCount++
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\USBMonitoring_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\USBMonitoring_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -4883,7 +4876,7 @@ function Invoke-MobileDeviceMonitoring {
             }
             
             # Write detailed log
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\MobileDeviceMonitoring_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\MobileDeviceMonitoring_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -5699,7 +5692,7 @@ function Invoke-AttackToolsDetection {
             }
             
             # Write detailed log
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\AttackToolsDetection_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\AttackToolsDetection_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -7901,7 +7894,7 @@ function Invoke-BeaconDetection {
                 }
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\BeaconDetection_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\BeaconDetection_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -8129,7 +8122,7 @@ function Invoke-CodeInjectionDetection {
                 }
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\CodeInjection_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\CodeInjection_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -8341,7 +8334,7 @@ function Invoke-ElfCatcher {
         }
         
         if ($detections.Count -gt 0) {
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\ElfCatcher_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\ElfCatcher_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -8474,7 +8467,7 @@ function Invoke-FileEntropyDetection {
         }
         
         if ($detections.Count -gt 0) {
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\FileEntropy_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\FileEntropy_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -8752,7 +8745,7 @@ function Invoke-ProcessCreationDetection {
                 }
             }
             
-            $logPath = "$env:ProgramData\AntivirusProtection\Logs\ProcessCreation_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\ProcessCreation_$(Get-Date -Format 'yyyy-MM-dd').log"
             $logDir = Split-Path $logPath -Parent
             if (!(Test-Path $logDir)) {
                 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -10232,7 +10225,7 @@ function Invoke-UnsignedDLLRemover {
 
 # --- YaraDetection ---
 $Script:YaraPaths = @("$env:ProgramFiles\Yara\yara64.exe", "$env:ProgramFiles (x86)\Yara\yara.exe", "yara.exe", "yara64.exe")
-$Script:YaraRulesPaths = @("$env:ProgramData\Antivirus\Yara", "$env:ProgramData\Antivirus\Rules", "$PSScriptRoot\YaraRules")
+$Script:YaraRulesPaths = @("$Script:InstallPath\Yara", "$Script:InstallPath\Rules", "$Script:InstallPath\YaraRules")
 $Script:YaraScanPaths = @("$env:Temp", "$env:TEMP", "$env:SystemRoot\Temp")
 
 function Get-YaraExe {
@@ -10279,7 +10272,7 @@ function Invoke-YaraDetection {
         foreach ($d in $detections) {
             Write-EventLog -LogName Application -Source "AntivirusEDR" -EntryType Warning -EventId 2096 -Message "YARA: $($d.File) - $($d.Match)" -ErrorAction SilentlyContinue
         }
-        $logPath = "$env:ProgramData\Antivirus\Logs\yara_detection_$(Get-Date -Format 'yyyy-MM-dd').log"
+        $logPath = "$Script:InstallPath\Logs\yara_detection_$(Get-Date -Format 'yyyy-MM-dd').log"
         $detections | ForEach-Object { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|$($_.File)|$($_.Match)" | Add-Content -Path $logPath }
         Write-AVLog "YaraDetection: Found $($detections.Count) YARA matches" "THREAT"
     }
@@ -10333,7 +10326,7 @@ function Invoke-IdsDetection {
             foreach ($d in $detections) {
                 Write-EventLog -LogName Application -Source "AntivirusEDR" -EntryType Warning -EventId 2095 -Message "IDS: $($d.Description) - $($d.ProcessName) PID:$($d.ProcessId)" -ErrorAction SilentlyContinue
             }
-            $logPath = "$env:ProgramData\Antivirus\Logs\ids_detection_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\ids_detection_$(Get-Date -Format 'yyyy-MM-dd').log"
             $detections | ForEach-Object { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|$($_.Description)|$($_.ProcessName)|PID:$($_.ProcessId)" | Add-Content -Path $logPath }
             Write-AVLog "IdsDetection: Found $($detections.Count) IDS matches" "THREAT"
         }
@@ -10384,7 +10377,7 @@ function Invoke-MemoryAcquisitionDetection {
             foreach ($d in $detections) {
                 Write-EventLog -LogName Application -Source "AntivirusEDR" -EntryType Error -EventId 2093 -Message "MEMORY ACQUISITION: $($d.Pattern) - $($d.ProcessName) (PID: $($d.ProcessId))" -ErrorAction SilentlyContinue
             }
-            $logPath = "$env:ProgramData\Antivirus\Logs\memory_acquisition_detections_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\memory_acquisition_detections_$(Get-Date -Format 'yyyy-MM-dd').log"
             $detections | ForEach-Object { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|$($_.Type)|$($_.ProcessName)|PID:$($_.ProcessId)" | Add-Content -Path $logPath }
             Write-AVLog "MemoryAcquisitionDetection: Found $($detections.Count) memory acquisition indicators" "THREAT"
         }
@@ -10444,7 +10437,7 @@ function Invoke-BCDSecurity {
             foreach ($d in $detections) {
                 Write-EventLog -LogName Application -Source "AntivirusEDR" -EntryType Warning -EventId 2091 -Message "BCDSecurity: $($d.Type) - $($d.Detail)" -ErrorAction SilentlyContinue
             }
-            $logPath = "$env:ProgramData\Antivirus\Logs\BCDSecurity_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\BCDSecurity_$(Get-Date -Format 'yyyy-MM-dd').log"
             $detections | ForEach-Object {
                 "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|$($_.Type)|$($_.Risk)|$($_.Detail)" | Add-Content -Path $logPath -ErrorAction SilentlyContinue
             }
@@ -10521,7 +10514,7 @@ function Invoke-CredentialProtection {
                 $msg = "CredentialProtection: $($d.Type) - $($d.ProcessName -or $d.TaskName -or $d.Detail)"
                 Write-EventLog -LogName Application -Source "AntivirusEDR" -EntryType Warning -EventId 2092 -Message $msg -ErrorAction SilentlyContinue
             }
-            $logPath = "$env:ProgramData\Antivirus\Logs\CredentialProtection_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\CredentialProtection_$(Get-Date -Format 'yyyy-MM-dd').log"
             $detections | ForEach-Object {
                 "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|$($_.Type)|$($_.Risk)|$($_.ProcessName -or $_.TaskName -or $_.Detail)" | Add-Content -Path $logPath -ErrorAction SilentlyContinue
             }
@@ -10612,7 +10605,7 @@ function Invoke-HidMacroGuard {
                 $msg = "HidMacroGuard: $($d.Type) - $($d.Description -or $d.Service -or $d.ProcessName -or $d.Filters)"
                 Write-EventLog -LogName Application -Source "AntivirusEDR" -EntryType Warning -EventId 2093 -Message $msg -ErrorAction SilentlyContinue
             }
-            $logPath = "$env:ProgramData\Antivirus\Logs\HidMacroGuard_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\HidMacroGuard_$(Get-Date -Format 'yyyy-MM-dd').log"
             $detections | ForEach-Object {
                 "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|$($_.Type)|$($_.Risk)|$($_.Description -or $_.Service -or $_.ProcessName)" | Add-Content -Path $logPath -ErrorAction SilentlyContinue
             }
@@ -10680,7 +10673,7 @@ function Invoke-LocalProxyDetection {
                 $msg = "LocalProxyDetection: $($d.Type) - $($d.ProcessName -or $d.Variable -or 'Registry')"
                 Write-EventLog -LogName Application -Source "AntivirusEDR" -EntryType Warning -EventId 2094 -Message $msg -ErrorAction SilentlyContinue
             }
-            $logPath = "$env:ProgramData\Antivirus\Logs\LocalProxyDetection_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\LocalProxyDetection_$(Get-Date -Format 'yyyy-MM-dd').log"
             $detections | ForEach-Object {
                 "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|$($_.Type)|$($_.Risk)|$($_.ProcessName -or $_.Variable -or $_.ProxyServer)" | Add-Content -Path $logPath -ErrorAction SilentlyContinue
             }
@@ -10769,7 +10762,7 @@ function Invoke-ScriptContentScan {
             foreach ($d in $detections) {
                 Write-EventLog -LogName Application -Source "AntivirusEDR" -EntryType Warning -EventId 2095 -Message "ScriptContentScan: Suspicious script $($d.Path)" -ErrorAction SilentlyContinue
             }
-            $logPath = "$env:ProgramData\Antivirus\Logs\ScriptContentScan_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\ScriptContentScan_$(Get-Date -Format 'yyyy-MM-dd').log"
             $detections | ForEach-Object {
                 "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|$($_.Path)|$($_.Risk)" | Add-Content -Path $logPath -ErrorAction SilentlyContinue
             }
@@ -10860,7 +10853,7 @@ function Invoke-ScriptHostDetection {
                 $msg = "ScriptHostDetection: $($d.ProcessName -or 'Task') - $short"
                 Write-EventLog -LogName Application -Source "AntivirusEDR" -EntryType Warning -EventId 2096 -Message $msg -ErrorAction SilentlyContinue
             }
-            $logPath = "$env:ProgramData\Antivirus\Logs\ScriptHostDetection_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\ScriptHostDetection_$(Get-Date -Format 'yyyy-MM-dd').log"
             $detections | ForEach-Object {
                 "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|$($_.ProcessName -or 'Task')|$($_.Risk)|$($_.CommandLine -or $_.Arguments)" | Add-Content -Path $logPath -ErrorAction SilentlyContinue
             }
@@ -11154,7 +11147,7 @@ function Invoke-ScriptBlockLoggingCheck {
             }
         }
         if ($detections.Count -gt 0) {
-            $logPath = "$env:ProgramData\Antivirus\Logs\ScriptBlockLoggingCheck_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\ScriptBlockLoggingCheck_$(Get-Date -Format 'yyyy-MM-dd').log"
             foreach ($d in $detections) {
                 "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|$($d.Type)|$($d.Risk)" | Add-Content -Path $logPath -ErrorAction SilentlyContinue
             }
@@ -11377,7 +11370,7 @@ $Script:MitreTechniqueMap = @{
 function Invoke-MitreMapping {
     $mapped = 0
     try {
-        $logPath = "$env:ProgramData\Antivirus\Logs"
+        $logPath = "$Script:InstallPath\Logs"
         if (-not (Test-Path $logPath)) { return 0 }
         $today = Get-Date -Format 'yyyy-MM-dd'
         $logFiles = Get-ChildItem -Path $logPath -Filter "*_$today.log" -File -ErrorAction SilentlyContinue |
@@ -11424,7 +11417,7 @@ function Start-RealtimeFileMonitor {
                     if (Test-Path $path) {
                         try {
                             $hash = (Get-FileHash -Path $path -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
-                            $logPath = "$env:ProgramData\Antivirus\Logs\realtime_monitor_$(Get-Date -Format 'yyyy-MM-dd').log"
+                            $logPath = "$Script:InstallPath\Logs\realtime_monitor_$(Get-Date -Format 'yyyy-MM-dd').log"
                             "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|Created/Changed|$path|$hash" | Add-Content -Path $logPath -ErrorAction SilentlyContinue
                             Write-EventLog -LogName Application -Source "AntivirusEDR" -EntryType Warning -EventId 2090 -Message "REAL-TIME: $path" -ErrorAction SilentlyContinue
                         } catch { }
@@ -11463,7 +11456,7 @@ function Invoke-DriverWatcher {
             }
         }
         if ($detections -gt 0) {
-            $logPath = "$env:ProgramData\Antivirus\Logs\DriverWatcher_$(Get-Date -Format 'yyyy-MM-dd').log"
+            $logPath = "$Script:InstallPath\Logs\DriverWatcher_$(Get-Date -Format 'yyyy-MM-dd').log"
             "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|Found $detections non-whitelisted drivers" | Add-Content -Path $logPath -ErrorAction SilentlyContinue
             Write-AVLog "DriverWatcher: Found $detections non-whitelisted driver(s)" "WARNING"
         }
@@ -11730,7 +11723,7 @@ try {
     Write-StabilityLog "Executing script path: $PSCommandPath" "INFO"
 
     # <CHANGE> Clean up elevation flag on exit
-$flagFile = "$env:ProgramData\AntivirusProtection\.elevated"
+$flagFile = "$Script:InstallPath\Data\.elevated"
 Register-EngineEvent PowerShell.Exiting -Action { Remove-Item $flagFile -Force -ErrorAction SilentlyContinue } | Out-Null
     Register-ExitCleanup
     
