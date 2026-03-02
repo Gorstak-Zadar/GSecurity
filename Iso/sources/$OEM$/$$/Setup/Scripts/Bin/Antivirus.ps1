@@ -2026,6 +2026,16 @@ public class GFocusUI {
         # ==================== BROWSER ADDRESS BAR DETECTION ====================
         # Only read address bar when browser is in foreground
         if ($isBrowser) {
+            # Detect if browser just regained focus (was doing something else before)
+            $lastWasBrowser = $false
+            try {
+                $lastProc = Get-Process -Id $Script:GFocus_LastForegroundPid -EA 0
+                if ($lastProc -and $lastProc.ProcessName -match $Script:GFocus_Browsers) {
+                    $lastWasBrowser = $true
+                }
+            } catch {}
+            $browserRegainedFocus = (-not $lastWasBrowser -and $Script:GFocus_LastForegroundPid -ne 0)
+            
             $userInput = $null
             
             # Get address bar content
@@ -2049,8 +2059,10 @@ public class GFocusUI {
                 }
             } catch {}
             
-            # Process new navigation
-            if ($userInput -and $userInput -ne $Script:GFocus_LastAddressBar) {
+            # Process navigation OR refresh when browser regains focus
+            $shouldProcess = $userInput -and (($userInput -ne $Script:GFocus_LastAddressBar) -or $browserRegainedFocus)
+            
+            if ($shouldProcess) {
                 $Script:GFocus_LastAddressBar = $userInput
                 
                 $hostname = $null
@@ -2059,7 +2071,11 @@ public class GFocusUI {
                 elseif ($userInput -match "^([a-zA-Z0-9][-a-zA-Z0-9]*\.)+[a-zA-Z]{2,}") { $hostname = $Matches[0] }
                 
                 if ($hostname) {
-                    Write-Log "GFocus: Browser navigated to $hostname"
+                    if ($browserRegainedFocus) {
+                        Write-Log "GFocus: Browser regained focus on $hostname - refreshing whitelist"
+                    } else {
+                        Write-Log "GFocus: Browser navigated to $hostname"
+                    }
                     
                     try {
                         $ips = [System.Net.Dns]::GetHostAddresses($hostname) | ForEach-Object { $_.IPAddressToString }
@@ -2072,7 +2088,7 @@ public class GFocusUI {
                             if ($Script:GFocus_BrowserBlockedIPs.ContainsKey($ip)) {
                                 Remove-NetFirewallRule -DisplayName $Script:GFocus_BrowserBlockedIPs[$ip] -EA 0
                                 $Script:GFocus_BrowserBlockedIPs.Remove($ip)
-                                Write-Log "GFocus: Unblocked $ip (user navigated)"
+                                Write-Log "GFocus: Unblocked $ip (user returned)"
                             }
                         }
                     } catch {}
