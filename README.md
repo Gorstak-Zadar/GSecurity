@@ -56,9 +56,9 @@ GSecurity uses a modular architecture where all security features are integrated
 | Component | Description |
 |-----------|-------------|
 | 🦠 **Antivirus.ps1** | The main EDR engine with 95+ integrated security modules |
-| 🛡️ **GSecurity.bat** | Orchestrator that applies registry hardening and triggers setup |
+| 🛡️ **GSecurity.bat** | Full suite installer — registry hardening, deployment, system hardening, and restart |
 | 📝 **GSecurity.reg** | Comprehensive registry security tweaks |
-| ⚙️ **Antivirus.cmd** | Installer that deploys files and creates scheduled tasks |
+| ⚙️ **Antivirus.cmd** | Launcher for Antivirus.ps1 (used by scheduled task) |
 | 📋 **Antivirus.xml** | Scheduled task configuration for persistence |
 
 ---
@@ -236,7 +236,7 @@ GSecurity includes 95+ integrated security modules organized by category:
 
 ```powershell
 # Clone or download the repository
-git clone https://github.com/YourUsername/GSecurity.git
+git clone https://github.com/Gorstak/GSecurity.git
 cd GSecurity
 
 # Navigate to scripts directory
@@ -249,9 +249,9 @@ powershell -ExecutionPolicy Bypass -File .\Antivirus.ps1
 ### Method 2: Full Suite Installation (Recommended)
 
 ```cmd
-# Navigate to the Scripts folder and run as Administrator
+# Navigate to the Bin folder and run as Administrator
 cd Iso\sources\$OEM$\$$\Setup\Scripts\Bin
-Antivirus.cmd
+GSecurity.bat
 ```
 
 This will:
@@ -279,6 +279,8 @@ See [Windows ISO Integration](#-windows-iso-integration) for automated deploymen
 ```powershell
 # Run the EDR engine (starts all security modules)
 powershell -ExecutionPolicy Bypass -File .\Antivirus.ps1
+
+# CLI Parameters: -Uninstall (remove task, stop instances) | -ChaosMode (test with EICAR) | -LearningMode (log-only)
 
 # View main logs
 Get-Content "C:\ProgramData\Antivirus\Logs\av.log" -Tail 100
@@ -364,29 +366,14 @@ All 95+ modules run on configurable intervals. Key intervals include:
 
 ---
 
-### 🛡️ GSecurity.bat — Registry Hardening
+### 🛡️ GSecurity.bat — Full Suite Installer
 
-**Applies comprehensive registry security tweaks**
+**Complete deployment with registry hardening, scheduled task, and system hardening**
 
 ```cmd
-# Navigate to Scripts folder
-cd Iso\sources\$OEM$\$$\Setup\Scripts
-
-# Run registry hardening (requires Admin)
+# Navigate to Bin folder and run as Administrator
+cd Iso\sources\$OEM$\$$\Setup\Scripts\Bin
 GSecurity.bat
-```
-
-This imports all `.reg` files from the `Bin` folder to apply security tweaks.
-
----
-
-### ⚙️ Antivirus.cmd — Full Installation
-
-**Complete deployment with scheduled task and system hardening**
-
-```cmd
-# Run as Administrator
-Antivirus.cmd
 ```
 
 **What it does:**
@@ -417,6 +404,17 @@ Antivirus.cmd
 6. **Enables DEP** — `bcdedit /set nx AlwaysOn`
 7. **Cleanup** — Removes `defaultuser0` account
 8. **Restarts** — Applies changes with system restart
+
+---
+
+### ⚙️ Antivirus.cmd — EDR Launcher
+
+**Launches the Antivirus.ps1 engine** (run automatically via scheduled task after installation, or manually from `C:\ProgramData\Antivirus\`)
+
+```cmd
+# Run from installation directory (typically via scheduled task)
+C:\ProgramData\Antivirus\Antivirus.cmd
+```
 
 ---
 
@@ -537,7 +535,7 @@ GSecurity/
             │   ├── 📄 SetupComplete.cmd    # Post-install trigger
             │   └── 📁 Bin/
             │       ├── 🦠 Antivirus.ps1    # Main EDR engine (95+ modules)
-            │       ├── 🛡️ GSecurity.bat    # Registry hardening orchestrator
+            │       ├── 🛡️ GSecurity.bat    # Full suite installer
             │       ├── ⚙️ Antivirus.cmd    # Installer & system hardening
             │       ├── 📝 GSecurity.reg    # Security registry tweaks
             │       └── 📋 Antivirus.xml    # Scheduled task definition
