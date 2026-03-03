@@ -3,9 +3,8 @@ param([switch]$Uninstall)
 #Requires -Version 5.1
 
 # ============================================================================
-# Antivirus & EDR
+# Antivirus.ps1
 # Author: Gorstak
-# ============================================================================
 
 # Unique script identifier (GUID) - used for process identification and mutex naming
 $Script:ScriptGUID = "539EF6B5-578B-4AF3-A5C7-FD564CB9C8FB"
@@ -18,6 +17,9 @@ $Script:MaxRestartAttempts = 3
 $Script:StabilityLogPath = "$Script:InstallPath\Logs\stability_log.txt"
 
 $Script:ManagedJobConfig = @{
+    TinyThreatScanIntervalSeconds = 20
+    SecureDnsMonitoringIntervalSeconds = 300
+    DnsSecureConfigIntervalSeconds = 86400
     HashDetectionIntervalSeconds = 15
     LOLBinDetectionIntervalSeconds = 15
     ProcessAnomalyDetectionIntervalSeconds = 15
@@ -50,7 +52,6 @@ $Script:ManagedJobConfig = @{
     NamedPipeMonitoringIntervalSeconds = 45
     DNSExfiltrationDetectionIntervalSeconds = 30
     PasswordManagementIntervalSeconds = 120
-    WebcamGuardianIntervalSeconds = 5
     BeaconDetectionIntervalSeconds = 60
     CodeInjectionDetectionIntervalSeconds = 30
     DataExfiltrationDetectionIntervalSeconds = 30
@@ -83,9 +84,11 @@ $Script:ManagedJobConfig = @{
     RealTimeFileMonitorIntervalSeconds = 60
     DriverWatcherIntervalSeconds = 60
     CrudePayloadGuardIntervalSeconds = 60
-    DnsSecureConfigIntervalSeconds = 86400
     SecpolHardeningIntervalSeconds = 86400
     ShadowProxyCaptureDetectionIntervalSeconds = 60
+    ElfCatcherIntervalSeconds = 30
+    ElfDLLUnloaderIntervalSeconds = 10
+    NeuroBehaviorMonitorIntervalSeconds = 15
 }
 
 $Config = @{
@@ -116,6 +119,11 @@ $Config = @{
     AutoKillThreats = $true
     AutoQuarantine = $true
     MaxMemoryUsageMB = 500
+
+    HashDatabaseFile = "$Script:InstallPath\Data\known_files.db"
+    MaxDatabaseEntries = 50000
+    DatabaseCleanupDays = 30
+    CymruDetectionThreshold = 60
 }
 
 $Script:MonitoredExtensions = @(
@@ -147,7 +155,7 @@ $Script:MonitoredExtensions = @(
     '.lha','.ldb','.laccdb','.ksh','.job','.jnlp','.jar','.its','.isp','.iso',
     '.iqy','.ins','.ini','.inf','.img','.ime','.ie','.hwp','.htt','.htm',
     '.htc','.hpj','.hlp','.hex','.gz','.grp','.glk','.gadget',
-    '.fxp','.fon','.fat','.elf','.ecf','.dqy','.dotx','.dotm',
+    '.fxp','.fon','.fat','.exif','.elf','.ecf','.dqy','.dotx','.dotm',
     '.dot','.docm','.docb','.doc','.dmg','.dir','.dif','.diagcab',
     '.desktop','.desklink','.der','.dcr','.db','.csv','.csh','.crx','.crt',
     '.crazy','.cpx','.command','.cnt','.cnv','.clb',
@@ -206,6 +214,54 @@ function Request-Elevation {
     exit
 }
 
+function Load-HashDatabase {
+    if (-not $Config.HashDatabaseFile) { return }
+    if (-not (Test-Path $Config.HashDatabaseFile)) {
+        New-Item -Path $Config.HashDatabaseFile -ItemType File -Force -ErrorAction SilentlyContinue | Out-Null
+        Write-AVLog "Created new hash database file" "INFO"
+        return
+    }
+    try {
+        $lines = Get-Content $Config.HashDatabaseFile -ErrorAction Stop
+        $count = 0
+        foreach ($line in $lines) {
+            if ($line -match '^([0-9a-f]{64}),(true|false),(.+)$') {
+                $hash = $matches[1]
+                $safe = [bool]::Parse($matches[2])
+                $timestamp = $matches[3]
+                try {
+                    $entryDate = [datetime]::Parse($timestamp)
+                    if ($entryDate -lt (Get-Date).AddDays(-$Config.DatabaseCleanupDays)) { continue }
+                } catch {}
+                $Script:KnownFilesCache[$hash] = $safe
+                $count++
+                if ($count -ge $Config.MaxDatabaseEntries) { break }
+            }
+        }
+        Write-AVLog "Loaded $count entries from hash database" "INFO"
+    } catch {
+        Write-AVLog "Failed to load hash database: $_" "WARN"
+        $Script:KnownFilesCache.Clear()
+    }
+}
+
+function Save-ToHashDatabase {
+    param([string]$Hash, [bool]$IsSafe)
+    if (-not $Hash -or -not $Config.HashDatabaseFile) { return }
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $entry = "$Hash,$IsSafe,$timestamp"
+    try {
+        $entry | Out-File -FilePath $Config.HashDatabaseFile -Append -Encoding UTF8
+        $Script:KnownFilesCache[$Hash] = $IsSafe
+    } catch {
+        Write-AVLog "Failed to save to hash database: $_" "WARN"
+    }
+}
+
+function Test-CirclKnownGood { param([string]$SHA256); if (-not $SHA256) { return $false }; try { $url = "$($Config.CirclHashLookupUrl)/$SHA256"; $response = Invoke-RestMethod -Uri $url -TimeoutSec 8 -ErrorAction Stop; if ($response) { Write-AVLog "CIRCL known-good match: $SHA256" "INFO"; return $true } } catch {}; return $false }
+function Test-CymruMalware { param([string]$SHA256); if (-not $SHA256) { return $false }; try { $url = "$($Config.CymruApiUrl)/$SHA256"; $response = Invoke-RestMethod -Uri $url -TimeoutSec 8 -ErrorAction Stop; if ($response.detections -ge $Config.CymruDetectionThreshold) { Write-AVLog "CYMRU malware match: $SHA256 (detections: $($response.detections))" "THREAT"; return $true } } catch {}; return $false }
+function Test-MalwareBazaar { param([string]$SHA256); if (-not $SHA256) { return $false }; try { $body = @{ query = 'get_info'; hash = $SHA256 }; $response = Invoke-RestMethod -Uri $Config.MalwareBazaarApiUrl -Method Post -Body $body -TimeoutSec 10 -ErrorAction Stop; if ($response.query_status -eq 'ok' -or ($response.data -and $response.data.Count -gt 0)) { Write-AVLog "MalwareBazaar match: $SHA256" "THREAT"; return $true } } catch {}; return $false }
+
 $Global:AntivirusState = @{
     Running = $false
     Installed = $false
@@ -219,6 +275,7 @@ $Global:AntivirusState = @{
 
 $Script:LoopCounter = 0
 $script:ManagedJobs = @{}
+$Script:KnownFilesCache = @{}
 
 # Termination protection variables
 $Script:TerminationAttempts = 0
@@ -1345,6 +1402,9 @@ function Invoke-HashDetection {
                 
                 # Add to cache as known-bad for future hard deletion
                 $Script:KnownFilesCache[$Hash] = $false
+                if (Get-Command Save-ToHashDatabase -ErrorAction SilentlyContinue) {
+                    Save-ToHashDatabase -Hash $Hash -IsSafe $false
+                }
 
                 if ($AutoQuarantine) {
                     $quarantined = Move-ToQuarantine -Path $File.FullName -Reason "HashDetection: $($Reputation.Sources -join ', ')"
@@ -1396,6 +1456,95 @@ function Measure-FileEntropy {
     } catch {
         return 0
     }
+}
+
+# ===================== TinyThreatScan + SecureDNS (from AV2) =====================
+$Script:RiskyPaths = @('\temp\', '\downloads\', '\appdata\local\temp\', '\public\', '\windows\temp\', '\appdata\roaming\', '\desktop\')
+
+function Test-TinyShouldExclude {
+    param([string]$FilePath)
+    $lower = $FilePath.ToLower()
+    if ($lower -like '*\assembly\*') { return $true }; if ($lower -like '*\winsxs\*') { return $true }; if ($lower -like '*\microsoft.net\*') { return $true }; if ($lower -like '*\windows\system32\config\*') { return $true }; if ($lower -like '*ctfmon*' -or $lower -like '*msctf.dll' -or $lower -like '*msutb.dll') { return $true }
+    foreach ($exclusion in $Config.ExclusionPaths) { if ($lower -like "*$($exclusion.ToLower())*") { return $true } }
+    return $false
+}
+
+function Test-SuspiciousUnsignedDll {
+    param([string]$FilePath)
+    $extension = [IO.Path]::GetExtension($FilePath).ToLower()
+    if ($extension -notin @('.dll', '.winmd')) { return $false }
+    try { $signature = Get-AuthenticodeSignature -FilePath $FilePath -ErrorAction Stop; if ($signature.Status -eq 'Valid') { return $false } } catch {}
+    $fileInfo = Get-Item $FilePath -ErrorAction SilentlyContinue
+    if (-not $fileInfo) { return $false }
+    $fileSizeKB = $fileInfo.Length / 1KB; $pathLower = $FilePath.ToLower()
+    foreach ($riskyPath in $Script:RiskyPaths) { if ($pathLower -like "*$riskyPath*" -and $fileSizeKB -lt 3072) { return $true } }
+    if ($pathLower -like '*\appdata\roaming\*' -and $fileSizeKB -lt 800 -and $fileInfo.Name -match '^[a-z0-9]{4,12}\.(dll|winmd)$') { return $true }
+    return $false
+}
+
+function Invoke-TinyThreatAnalysis {
+    param([string]$FilePath)
+    if (-not (Test-Path $FilePath -PathType Leaf)) { return }; if (Test-TinyShouldExclude -FilePath $FilePath) { return }
+    $extension = [IO.Path]::GetExtension($FilePath).ToLower(); if ($extension -notin $Script:MonitoredExtensions) { return }
+    try { $fileHash = (Get-FileHash -Path $FilePath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower() } catch { return }
+    if (-not $fileHash) { return }
+    if ($Script:KnownFilesCache.ContainsKey($fileHash)) { if (-not $Script:KnownFilesCache[$fileHash]) { if (Test-Path $FilePath) { Write-AVLog "Known-bad file re-detected - quarantining: $FilePath" "THREAT"; Move-ToQuarantine -Path $FilePath -Reason "Known threat (cached)" } }; return }
+    if (Test-CirclKnownGood -SHA256 $fileHash) { Save-ToHashDatabase -Hash $fileHash -IsSafe $true; return }
+    if (Test-CymruMalware -SHA256 $fileHash) { Save-ToHashDatabase -Hash $fileHash -IsSafe $false; Move-ToQuarantine -Path $FilePath -Reason "Cymru malware match"; return }
+    if (Test-MalwareBazaar -SHA256 $fileHash) { Save-ToHashDatabase -Hash $fileHash -IsSafe $false; Move-ToQuarantine -Path $FilePath -Reason "MalwareBazaar malware match"; return }
+    if (Test-SuspiciousUnsignedDll -FilePath $FilePath) { Save-ToHashDatabase -Hash $fileHash -IsSafe $false; Move-ToQuarantine -Path $FilePath -Reason "Suspicious unsigned DLL in risky location"; return }
+    $executableExtensions = @('.exe', '.dll', '.sys', '.ocx', '.scr', '.msi', '.drv')
+    if ($extension -in $executableExtensions) { try { $signature = Get-AuthenticodeSignature -FilePath $FilePath -ErrorAction Stop; $isSafe = ($signature.Status -eq 'Valid'); Save-ToHashDatabase -Hash $fileHash -IsSafe $isSafe } catch { Save-ToHashDatabase -Hash $fileHash -IsSafe $true } } else { Save-ToHashDatabase -Hash $fileHash -IsSafe $true }
+    $Global:AntivirusState.FilesScanned++
+}
+
+function Invoke-TinyThreatScan {
+    $highRiskFolders = @("$env:USERPROFILE\Downloads", "$env:USERPROFILE\Desktop", "$env:TEMP", "$env:APPDATA", "$env:LOCALAPPDATA\Temp")
+    foreach ($folder in $highRiskFolders) { if (Test-Path $folder) { Get-ChildItem -Path $folder -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { Invoke-TinyThreatAnalysis -FilePath $_.FullName } } }
+    Write-Output "[TinyThreatScan] Scan cycle completed. Files in cache: $($Script:KnownFilesCache.Count)"
+}
+
+$Script:SecureDnsServers = @(
+    @{ IP = "1.1.1.1"; DohTemplate = "https://cloudflare-dns.com/dns-query"; DotHost = "cloudflare-dns.com"; Type = "IPv4" },
+    @{ IP = "1.0.0.1"; DohTemplate = "https://cloudflare-dns.com/dns-query"; DotHost = "cloudflare-dns.com"; Type = "IPv4" },
+    @{ IP = "8.8.8.8"; DohTemplate = "https://dns.google/dns-query"; DotHost = "dns.google"; Type = "IPv4" },
+    @{ IP = "8.8.4.4"; DohTemplate = "https://dns.google/dns-query"; DotHost = "dns.google"; Type = "IPv4" },
+    @{ IP = "2606:4700:4700::1111"; DohTemplate = "https://cloudflare-dns.com/dns-query"; DotHost = "cloudflare-dns.com"; Type = "IPv6" },
+    @{ IP = "2606:4700:4700::1001"; DohTemplate = "https://cloudflare-dns.com/dns-query"; DotHost = "cloudflare-dns.com"; Type = "IPv6" },
+    @{ IP = "2001:4860:4860::8888"; DohTemplate = "https://dns.google/dns-query"; DotHost = "dns.google"; Type = "IPv6" },
+    @{ IP = "2001:4860:4860::8844"; DohTemplate = "https://dns.google/dns-query"; DotHost = "dns.google"; Type = "IPv6" }
+)
+
+function Invoke-SecureDnsConfiguration {
+    if (-not (Test-IsAdmin)) { Write-Output "[SecureDNS] Requires administrator privileges - skipping"; return }
+    Write-Output "[SecureDNS] Configuring encrypted DNS (DoH/DoT)..."
+    foreach ($server in $Script:SecureDnsServers) { try { Add-DnsClientDohServerAddress -ServerAddress $server.IP -DohTemplate $server.DohTemplate -AllowFallbackToUdp $false -AutoUpgrade $true -ErrorAction Stop; Write-Output "[SecureDNS] Registered DoH template: $($server.IP)" } catch { try { Set-DnsClientDohServerAddress -ServerAddress $server.IP -DohTemplate $server.DohTemplate -AllowFallbackToUdp $false -AutoUpgrade $true -ErrorAction SilentlyContinue } catch {} } }
+    $adapter = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.InterfaceDescription -notmatch "Virtual|Loopback|Bluetooth" } | Select-Object -First 1
+    if (-not $adapter) { Write-Output "[SecureDNS] No active network adapter found"; return }
+    Write-Output "[SecureDNS] Configuring adapter: $($adapter.Name)"
+    try { netsh interface ipv4 set dnsservers name="$($adapter.Name)" static 1.1.1.1 primary validate=no 2>&1 | Out-Null; netsh interface ipv4 add dnsservers name="$($adapter.Name)" 8.8.8.8 index=2 validate=no 2>&1 | Out-Null; netsh interface ipv6 set dnsservers name="$($adapter.Name)" static 2606:4700:4700::1111 primary validate=no 2>&1 | Out-Null; netsh interface ipv6 add dnsservers name="$($adapter.Name)" 2001:4860:4860::8888 index=2 validate=no 2>&1 | Out-Null } catch {}
+    $guid = $adapter.InterfaceGuid; $dohBasePath = "HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\InterfaceSpecificParameters\$guid\DohInterfaceSettings"; $dotBasePath = "HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\InterfaceSpecificParameters\$guid\DotInterfaceSettings"
+    $dohServers = @( @{ IP = "1.1.1.1"; Template = "https://cloudflare-dns.com/dns-query"; Path = "Doh" }, @{ IP = "8.8.8.8"; Template = "https://dns.google/dns-query"; Path = "Doh" }, @{ IP = "2606:4700:4700::1111"; Template = "https://cloudflare-dns.com/dns-query"; Path = "Doh6" }, @{ IP = "2001:4860:4860::8888"; Template = "https://dns.google/dns-query"; Path = "Doh6" } )
+    foreach ($doh in $dohServers) { try { $dohPath = "$dohBasePath\$($doh.Path)\$($doh.IP)"; New-Item -Path $dohPath -Force -ErrorAction SilentlyContinue | Out-Null; Set-ItemProperty -Path $dohPath -Name "DohFlags" -Value 0x11 -Type QWord -ErrorAction SilentlyContinue; Set-ItemProperty -Path $dohPath -Name "DohTemplate" -Value $doh.Template -Type String -ErrorAction SilentlyContinue } catch {} }
+    $dotServers = @( @{ IP = "1.1.1.1"; Host = "cloudflare-dns.com"; Path = "Dot" }, @{ IP = "8.8.8.8"; Host = "dns.google"; Path = "Dot" }, @{ IP = "2606:4700:4700::1111"; Host = "cloudflare-dns.com"; Path = "Dot6" }, @{ IP = "2001:4860:4860::8888"; Host = "dns.google"; Path = "Dot6" } )
+    foreach ($dot in $dotServers) { try { $serverPath = "$dotBasePath\$($dot.Path)\$($dot.IP)"; New-Item -Path $serverPath -Force -ErrorAction SilentlyContinue | Out-Null; Set-ItemProperty -Path $serverPath -Name "DotFlags" -Value 0x11 -Type QWord -ErrorAction SilentlyContinue; Set-ItemProperty -Path $serverPath -Name "DotHost" -Value $dot.Host -Type String -ErrorAction SilentlyContinue } catch {} }
+    try { Clear-DnsClientCache; Restart-Service -Name Dnscache -Force -ErrorAction SilentlyContinue } catch {}
+    Write-Output "[SecureDNS] Configuration complete - DoH/DoT enabled"
+}
+
+function Invoke-SecureDnsMonitoring {
+    if (-not (Test-IsAdmin)) { return }
+    $detections = @(); $adapter = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.InterfaceDescription -notmatch "Virtual|Loopback|Bluetooth" } | Select-Object -First 1
+    if (-not $adapter) { return }
+    $dnsServers = Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ErrorAction SilentlyContinue
+    $ipv4Dns = ($dnsServers | Where-Object { $_.AddressFamily -eq 2 }).ServerAddresses; $ipv6Dns = ($dnsServers | Where-Object { $_.AddressFamily -eq 23 }).ServerAddresses
+    $trustedDns = @("1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "2606:4700:4700::1111", "2606:4700:4700::1001", "2001:4860:4860::8888", "2001:4860:4860::8844")
+    foreach ($dns in $ipv4Dns) { if ($dns -and $trustedDns -notcontains $dns) { $detections += @{ Type = "DNS_HIJACK"; Details = "Untrusted IPv4 DNS: $dns"; Risk = "High" }; Write-Output "[SecureDNS] WARNING: Untrusted DNS: $dns" } }
+    foreach ($dns in $ipv6Dns) { if ($dns -and $trustedDns -notcontains $dns) { $detections += @{ Type = "DNS_HIJACK"; Details = "Untrusted IPv6 DNS: $dns"; Risk = "High" }; Write-Output "[SecureDNS] WARNING: Untrusted DNS: $dns" } }
+    $guid = $adapter.InterfaceGuid; $dohPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\InterfaceSpecificParameters\$guid\DohInterfaceSettings\Doh\1.1.1.1"
+    if (-not (Test-Path $dohPath)) { $detections += @{ Type = "DOH_DISABLED"; Details = "DoH missing - reapplying"; Risk = "Medium" }; Invoke-SecureDnsConfiguration } else { try { $dohFlags = Get-ItemProperty -Path $dohPath -Name "DohFlags" -ErrorAction SilentlyContinue; if ($dohFlags.DohFlags -ne 0x11) { Invoke-SecureDnsConfiguration } } catch {} }
+    if ($detections.Count -gt 0) { foreach ($d in $detections) { Write-AVLog "SecureDNS: $($d.Type) - $($d.Details)" "THREAT" } }
+    Write-Output "[SecureDNS] Monitoring check completed"
 }
 
 # ===================== Advanced Multi-Layered Threat Detection Framework =====================
@@ -2557,7 +2706,7 @@ function Invoke-TokenManipulationDetection {
         try {
             $Owner = (Get-CimInstance Win32_Process -Filter "ProcessId = $($Process.Id)" -ErrorAction Stop).GetOwner()
             if ($Owner.Domain -eq "NT AUTHORITY" -and $Process.Path -notmatch "^C:\\Windows") {
-                Write-AVLog "[TokenManip] SUSPICIOUS: Non-system binary running as SYSTEM | Process: $($Process.ProcessName) | Path: $($Process.Path)" "WARN"
+                Write-AVLog "[TokenManip] SUSPICIOUS: Non-system binary running as SYSTEM | Process: $($Process.ProcessName) | Path: $($Process.Path)"
             }
         } catch {}
     }
@@ -2744,10 +2893,6 @@ function Invoke-ProcessHollowingDetection {
         
         if ($detections.Count -gt 0) {
             foreach ($detection in $detections) {
-                # Skip if process is whitelisted
-                $detProcClean = $detection.ProcessName -replace '\.exe$', ''
-                if ($WhitelistedProcesses -contains $detProcClean) { continue }
-                
                 Write-AVLog "PROCESS HOLLOWING: $($detection.Type) - $($detection.ProcessName) (PID: $($detection.ProcessId))" "THREAT" "process_hollowing_detections.log"
                 $Global:AntivirusState.ThreatCount++
                 
@@ -7205,350 +7350,6 @@ function Invoke-PasswordManagement {
     }
 }
 
-function Invoke-WebcamGuardian {
-    <#
-    .SYNOPSIS
-    Monitors and controls webcam access with explicit user permission.
-    
-    .DESCRIPTION
-    Keeps webcam disabled by default. When any application tries to access it,
-    shows a permission popup. Only enables webcam after explicit user approval.
-    Automatically disables webcam when application closes.
-    
-    .PARAMETER LogPath
-    Path to store webcam access logs
-    #>
-    param(
-        [string]$LogPath
-    )
-    
-    # Initialize static variables
-    if (-not $script:WebcamGuardianState) {
-        $script:WebcamGuardianState = @{
-            Initialized = $false
-            WebcamDevices = @()
-            CurrentlyAllowedProcesses = @{}
-            LastCheck = [DateTime]::MinValue
-            AccessLog = if ($LogPath) { Join-Path $LogPath "webcam_access.log" } else { "$env:TEMP\webcam_access.log" }
-        }
-    }
-    
-    # Initialize webcam devices list (only once)
-    if (-not $script:WebcamGuardianState.Initialized) {
-        try {
-            # Find all imaging devices (webcams) using multiple methods
-            $webcamDevices = @()
-            
-            # Method 1: Check Camera class
-            try {
-                $cameras = Get-PnpDevice -Class "Camera" -Status "OK" -ErrorAction SilentlyContinue
-                if ($cameras) {
-                    if ($cameras.Count) {
-                        $webcamDevices += $cameras
-                    } else {
-                        $webcamDevices += @($cameras)
-                    }
-                }
-                # Also check without status filter as fallback
-                if (-not $cameras -or ($cameras | Measure-Object).Count -eq 0) {
-                    $camerasNoStatus = Get-PnpDevice -Class "Camera" -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq "OK" }
-                    if ($camerasNoStatus) {
-                        if ($camerasNoStatus.Count) {
-                            $webcamDevices += $camerasNoStatus
-                        } else {
-                            $webcamDevices += @($camerasNoStatus)
-                        }
-                    }
-                }
-            } catch {}
-            
-            # Method 2: Check Image class
-            try {
-                $images = Get-PnpDevice -Class "Image" -Status "OK" -ErrorAction SilentlyContinue
-                if ($images) {
-                    if ($images.Count) {
-                        $webcamDevices += $images
-                    } else {
-                        $webcamDevices += @($images)
-                    }
-                }
-            } catch {}
-            
-            # Method 3: Check MEDIA class (some webcams appear here, but be very strict to avoid audio devices)
-            try {
-                $media = Get-PnpDevice -Class "MEDIA" -ErrorAction SilentlyContinue | 
-                    Where-Object { 
-                        $_.Status -eq "OK" -and
-                        # Only match if explicitly contains Camera or Webcam (not Video/Capture which could be audio/video cards)
-                        ($_.FriendlyName -match "Camera|Webcam" -or
-                         $_.Description -match "Camera|Webcam") -and
-                        # Exclude audio devices explicitly
-                        $_.FriendlyName -notmatch "Audio|Headphone|Headset|Microphone|Speaker|Sound" -and
-                        $_.Description -notmatch "Audio|Headphone|Headset|Microphone|Speaker|Sound"
-                    }
-                if ($media) {
-                    if ($media.Count) {
-                        $webcamDevices += $media
-                    } else {
-                        $webcamDevices += @($media)
-                    }
-                }
-            } catch {}
-            
-            # Method 4: Comprehensive search by friendly name and description (strict matching)
-            $allDevices = Get-PnpDevice | Where-Object {
-                $_.Status -eq "OK" -and
-                # Only Camera or Image class, or MEDIA class with explicit camera name
-                (($_.Class -match "Camera|Image") -or 
-                 ($_.Class -eq "MEDIA" -and ($_.FriendlyName -match "Camera|Webcam" -or $_.Description -match "Camera|Webcam"))) -and
-                # Must explicitly contain Camera or Webcam in name/description
-                ($_.FriendlyName -match "Camera|Webcam|USB.*Camera" -or
-                 $_.Description -match "Camera|Webcam") -and
-                # Exclude audio/video cards and other non-camera devices
-                $_.FriendlyName -notmatch "Audio|Headphone|Headset|Microphone|Speaker|Sound|Video.*Card|Graphics|Display" -and
-                $_.Description -notmatch "Audio|Headphone|Headset|Microphone|Speaker|Sound|Video.*Card|Graphics|Display"
-            } -ErrorAction SilentlyContinue
-            
-            if ($allDevices) {
-                $webcamDevices += $allDevices
-            }
-            
-            # Method 5: WMI query as fallback (very strict)
-            if ($webcamDevices.Count -eq 0) {
-                try {
-                    $wmiCameras = Get-WmiObject Win32_PnPEntity | Where-Object {
-                        $_.Status -eq "OK" -and
-                        # Must be Camera or Image class
-                        ($_.PNPClass -match "Camera|Image") -and
-                        # Must explicitly contain Camera or Webcam
-                        ($_.Name -match "Camera|Webcam" -or $_.DeviceID -match "USB.*VID.*PID.*Camera") -and
-                        # Exclude audio/video devices
-                        $_.Name -notmatch "Audio|Headphone|Headset|Microphone|Speaker|Sound|Video.*Card|Graphics|Display"
-                    } -ErrorAction SilentlyContinue
-                    
-                    if ($wmiCameras) {
-                        # Convert WMI objects to PnP device format
-                        foreach ($wmi in $wmiCameras) {
-                            try {
-                                $pnpDevice = Get-PnpDevice -InstanceId $wmi.DeviceID -ErrorAction SilentlyContinue
-                                # Double-check it's actually a camera before adding
-                                if ($pnpDevice -and 
-                                    ($pnpDevice.FriendlyName -match "Camera|Webcam" -or $pnpDevice.Description -match "Camera|Webcam") -and
-                                    $pnpDevice.FriendlyName -notmatch "Audio|Headphone|Headset|Microphone|Speaker|Sound") {
-                                    $webcamDevices += $pnpDevice
-                                }
-                            } catch {}
-                        }
-                    }
-                } catch {}
-            }
-            
-            # Remove duplicates and assign
-            # Ensure we always have an array (even if empty)
-            if ($null -eq $webcamDevices) {
-                $webcamDevices = @()
-            } elseif ($webcamDevices.Count -eq $null) {
-                # Single object, convert to array
-                $webcamDevices = @($webcamDevices)
-            }
-            
-            # Remove duplicates and apply final strict filtering (ensure we only get actual cameras)
-            $script:WebcamGuardianState.WebcamDevices = $webcamDevices | 
-                Where-Object { 
-                    $_.Status -eq "OK" -and
-                    # Final validation: must explicitly contain Camera or Webcam in name/description
-                    ($_.FriendlyName -match "Camera|Webcam" -or $_.Description -match "Camera|Webcam") -and
-                    # Final exclusion: no audio/video/graphics devices, USB hubs, keyboards, mice
-                    $_.FriendlyName -notmatch "Audio|Headphone|Headset|Microphone|Speaker|Sound|Video.*Card|Graphics|Display|Keyboard|Mouse|USB.*Hub|HID" -and
-                    $_.Description -notmatch "Audio|Headphone|Headset|Microphone|Speaker|Sound|Video.*Card|Graphics|Display|Keyboard|Mouse|USB.*Hub|HID" -and
-                    $_.InstanceId -notmatch "HDAUDIO|HID\\" -and
-                    # Only Camera or Image class, or MEDIA class with explicit camera name
-                    (($_.Class -match "Camera|Image") -or ($_.Class -eq "MEDIA" -and ($_.FriendlyName -match "Camera|Webcam" -or $_.Description -match "Camera|Webcam")))
-                } | 
-                Sort-Object InstanceId -Unique
-            
-            if ($script:WebcamGuardianState.WebcamDevices -and $script:WebcamGuardianState.WebcamDevices.Count -gt 0) {
-                $deviceList = ($script:WebcamGuardianState.WebcamDevices | ForEach-Object { "$($_.FriendlyName) ($($_.Class))" }) -join "; "
-                Write-AVLog "[WebcamGuardian] Found $($script:WebcamGuardianState.WebcamDevices.Count) webcam device(s): $deviceList" "INFO"
-                
-                # Disable all webcams by default (with final safety check)
-                foreach ($device in $script:WebcamGuardianState.WebcamDevices) {
-                    try {
-                        # Final safety check: verify this is actually a camera device before disabling
-                        if ($device.FriendlyName -match "Camera|Webcam" -and 
-                            $device.FriendlyName -notmatch "Audio|Headphone|Headset|Microphone|Speaker|Sound|Keyboard|Mouse|HID" -and
-                            $device.InstanceId -notmatch "HDAUDIO|HID\\") {
-                            
-                            Disable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
-                            Write-AVLog "[WebcamGuardian] Disabled webcam: $($device.FriendlyName) ($($device.Class))" "INFO"
-                        } else {
-                            Write-AVLog "[WebcamGuardian] SKIPPED: Device does not appear to be a camera - $($device.FriendlyName) ($($device.Class))" "WARN"
-                        }
-                    }
-                    catch {
-                        Write-AVLog "[WebcamGuardian] Could not disable $($device.FriendlyName): $($_.Exception.Message)" "WARN"
-                    }
-                }
-                
-                $script:WebcamGuardianState.Initialized = $true
-                Write-Host "[WebcamGuardian] Protection initialized - webcam disabled by default" -ForegroundColor Green
-            }
-            else {
-                Write-AVLog "[WebcamGuardian] No webcam devices found" "INFO"
-                $script:WebcamGuardianState.Initialized = $true
-                return
-            }
-        }
-        catch {
-            Write-AVLog "[WebcamGuardian] Initialization error: $($_.Exception.Message)" "ERROR"
-            return
-        }
-    }
-    
-    # Skip check if no webcam devices
-    if ($script:WebcamGuardianState.WebcamDevices.Count -eq 0) {
-        return
-    }
-    
-    # Monitor for processes trying to access webcam
-    try {
-        # Get all processes that might access camera
-        $cameraProcesses = Get-Process | Where-Object {
-            $_.ProcessName -match "chrome|firefox|edge|msedge|teams|zoom|skype|obs|discord|slack" -or
-            $_.MainWindowTitle -ne ""
-        } | Select-Object Id, ProcessName, Path, MainWindowTitle
-        
-        foreach ($proc in $cameraProcesses) {
-            # Skip if already allowed
-            if ($script:WebcamGuardianState.CurrentlyAllowedProcesses.ContainsKey($proc.Id)) {
-                # Check if process still exists
-                if (-not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) {
-                    # Process closed - remove from allowed list and disable webcam
-                    $script:WebcamGuardianState.CurrentlyAllowedProcesses.Remove($proc.Id)
-                    
-                    # Disable webcam if no other processes are using it (with safety check)
-                    if ($script:WebcamGuardianState.CurrentlyAllowedProcesses.Count -eq 0) {
-                        foreach ($device in $script:WebcamGuardianState.WebcamDevices) {
-                            # Safety check: only disable if confirmed to be a camera device
-                            if ($device.FriendlyName -match "Camera|Webcam" -and 
-                                $device.FriendlyName -notmatch "Audio|Headphone|Headset|Microphone|Speaker|Sound|Keyboard|Mouse|HID" -and
-                                $device.InstanceId -notmatch "HDAUDIO|HID\\") {
-                                Disable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
-                            }
-                        }
-                        $logEntry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [AUTO-DISABLE] Process closed - webcam disabled"
-                        Add-Content -Path $script:WebcamGuardianState.AccessLog -Value $logEntry -ErrorAction SilentlyContinue
-                        Write-AVLog "[WebcamGuardian] All processes closed - webcam disabled" "INFO"
-                    }
-                }
-                continue
-            }
-            
-            # Check if process is trying to access webcam (heuristic check)
-            $isAccessingCamera = $false
-            
-            try {
-                # Check if process has handles to camera devices
-                $handles = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue | 
-                    Select-Object -ExpandProperty Modules -ErrorAction SilentlyContinue |
-                    Where-Object { $_.ModuleName -match "mf|avicap|video|camera" }
-                
-                if ($handles) {
-                    $isAccessingCamera = $true
-                }
-            }
-            catch {}
-            
-            # If camera access detected, show permission dialog
-            if ($isAccessingCamera) {
-                $procName = if ($proc.Path) { Split-Path -Leaf $proc.Path } else { $proc.ProcessName }
-                $windowTitle = if ($proc.MainWindowTitle) { $proc.MainWindowTitle } else { "Unknown Window" }
-                
-                # Create permission dialog
-                Add-Type -AssemblyName System.Windows.Forms
-                $result = [System.Windows.Forms.MessageBox]::Show(
-                    "Application '$procName' is trying to access your webcam.`n`nWindow: $windowTitle`nPID: $($proc.Id)`n`nAllow webcam access?",
-                    "Webcam Permission Request",
-                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
-                    [System.Windows.Forms.MessageBoxIcon]::Warning,
-                    [System.Windows.Forms.MessageBoxDefaultButton]::Button2
-                )
-                
-                $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-                
-                if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
-                    # User allowed - enable webcam (with safety check)
-                    foreach ($device in $script:WebcamGuardianState.WebcamDevices) {
-                        # Safety check: only enable if confirmed to be a camera device
-                        if ($device.FriendlyName -match "Camera|Webcam" -and 
-                            $device.FriendlyName -notmatch "Audio|Headphone|Headset|Microphone|Speaker|Sound|Keyboard|Mouse|HID" -and
-                            $device.InstanceId -notmatch "HDAUDIO|HID\\") {
-                            Enable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
-                        }
-                    }
-                    
-                    $script:WebcamGuardianState.CurrentlyAllowedProcesses[$proc.Id] = @{
-                        ProcessName = $procName
-                        WindowTitle = $windowTitle
-                        AllowedAt = Get-Date
-                    }
-                    
-                    $logEntry = "[$timestamp] [ALLOWED] $procName (PID: $($proc.Id)) | Window: $windowTitle"
-                    Add-Content -Path $script:WebcamGuardianState.AccessLog -Value $logEntry -ErrorAction SilentlyContinue
-                    Write-AVLog "[WebcamGuardian] Access ALLOWED: $procName (PID: $($proc.Id))" "INFO"
-                    Write-Host "[WebcamGuardian] Webcam access ALLOWED for $procName" -ForegroundColor Green
-                }
-                else {
-                    # User denied - keep webcam disabled and log
-                    $logEntry = "[$timestamp] [DENIED] $procName (PID: $($proc.Id)) | Window: $windowTitle"
-                    Add-Content -Path $script:WebcamGuardianState.AccessLog -Value $logEntry -ErrorAction SilentlyContinue
-                    Write-AVLog "[WebcamGuardian] Access DENIED: $procName (PID: $($proc.Id))" "WARN"
-                    Write-Host "[WebcamGuardian] Webcam access DENIED for $procName" -ForegroundColor Red
-                    
-                    # Optionally terminate the process trying to access webcam
-                    # Uncomment the next line if you want to kill processes that are denied
-                    # Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-                }
-            }
-        }
-        
-        # Clean up dead processes from allowed list
-        $deadProcesses = @()
-        foreach ($procPid in $script:WebcamGuardianState.CurrentlyAllowedProcesses.Keys) {
-            if (-not (Get-Process -Id $procPid -ErrorAction SilentlyContinue)) {
-                $deadProcesses += $procPid
-            }
-        }
-        
-        foreach ($procPid in $deadProcesses) {
-            $script:WebcamGuardianState.CurrentlyAllowedProcesses.Remove($procPid)
-        }
-        
-        # Disable webcam if no processes are allowed
-        if ($script:WebcamGuardianState.CurrentlyAllowedProcesses.Count -eq 0) {
-            $now = Get-Date
-            # Only disable every 30 seconds to avoid excessive device operations
-            if (($now - $script:WebcamGuardianState.LastCheck).TotalSeconds -ge 30) {
-                foreach ($device in $script:WebcamGuardianState.WebcamDevices) {
-                    # Safety check: only disable if confirmed to be a camera device
-                    if ($device.FriendlyName -match "Camera|Webcam" -and 
-                        $device.FriendlyName -notmatch "Audio|Headphone|Headset|Microphone|Speaker|Sound|Keyboard|Mouse|HID" -and
-                        $device.InstanceId -notmatch "HDAUDIO|HID\\") {
-                        $status = Get-PnpDevice -InstanceId $device.InstanceId -ErrorAction SilentlyContinue
-                        if ($status -and $status.Status -eq "OK") {
-                            Disable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
-                        }
-                    }
-                }
-                $script:WebcamGuardianState.LastCheck = $now
-            }
-        }
-    }
-    catch {
-        Write-AVLog "[WebcamGuardian] Monitoring error: $($_.Exception.Message)" "ERROR"
-    }
-    }
-
 function Invoke-KeyScramblerManagement {
     param(
         [bool]$AutoStart = $true
@@ -8391,6 +8192,48 @@ function Test-SuspiciousDLL {
     }
     
     return $null
+}
+
+function Invoke-ElfCatcher {
+    $detections = @()
+    try {
+        foreach ($target in $Script:BrowserTargets) {
+            try {
+                $procs = Get-Process -Name $target -ErrorAction SilentlyContinue
+                foreach ($proc in $procs) {
+                    try {
+                        $modules = $proc.Modules | Where-Object { $_.FileName -like "*.dll" -or $_.FileName -like "*.winmd" }
+                        foreach ($mod in $modules) {
+                            try {
+                                $dllName = [System.IO.Path]::GetFileName($mod.FileName)
+                                $dllPath = $mod.FileName
+                                $key = "$($proc.Id):$dllPath"
+                                if ($Script:ProcessedDlls.ContainsKey($key)) { continue }
+                                $result = Test-SuspiciousDLL -DllName $dllName -DllPath $dllPath -ProcessName $proc.ProcessName
+                                if ($result) {
+                                    $detections += @{ ProcessId = $proc.Id; ProcessName = $proc.ProcessName; DllName = $dllName; DllPath = $dllPath; Reasons = $result.Reasons; Risk = $result.Risk }
+                                    $Script:ProcessedDlls[$key] = Get-Date
+                                    Write-AVLog "ELF CATCHER: Suspicious DLL in $($proc.ProcessName) (PID: $($proc.Id)) - $dllName - $($result.Reasons -join ', ')" "THREAT" "elf_catcher_detections.log"
+                                    $Global:AntivirusState.ThreatCount++
+                                }
+                            } catch { continue }
+                        }
+                    } catch { continue }
+                }
+            } catch { continue }
+        }
+        if ($Script:ProcessedDlls.Count -gt 1000) {
+            $oldKeys = $Script:ProcessedDlls.Keys | Where-Object { ((Get-Date) - $Script:ProcessedDlls[$_]).TotalHours -gt 24 }
+            foreach ($key in $oldKeys) { $Script:ProcessedDlls.Remove($key) }
+        }
+        if ($detections.Count -gt 0) {
+            $logPath = "$Script:InstallPath\Logs\ElfCatcher_$(Get-Date -Format 'yyyy-MM-dd').log"
+            if (!(Test-Path (Split-Path $logPath -Parent))) { New-Item -ItemType Directory -Path (Split-Path $logPath -Parent) -Force | Out-Null }
+            $detections | ForEach-Object { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|PID:$($_.ProcessId)|$($_.ProcessName)|$($_.DllName)|$($_.DllPath)|$($_.Reasons -join ';')" | Add-Content -Path $logPath -ErrorAction SilentlyContinue }
+            Write-AVLog "ElfCatcher detection completed: $($detections.Count) suspicious DLL(s) found" "INFO" "elf_catcher_detections.log"
+        }
+    } catch { Write-AVLog "ElfCatcher error: $_" "ERROR" "elf_catcher_detections.log" }
+    return $detections.Count
 }
 
 $Script:ScannedFiles = @{}
@@ -9943,6 +9786,61 @@ function Invoke-PrivacyForgeSpoofClipboard {
 # These modules operate independently and do not respect whitelists or use the response engine
 # They share logs and quarantine folders with the main antivirus
 
+# ELF DLL Unloader - Actively unloads ELF DLLs from browser processes
+function Invoke-ElfDLLUnloader {
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'DLLUnloader').Type) {
+            Add-Type -TypeDefinition @"
+using System; using System.Runtime.InteropServices;
+public class DLLUnloader {
+    [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(int access, bool inherit, int pid);
+    [DllImport("kernel32.dll")] public static extern IntPtr GetProcAddress(IntPtr mod, string name);
+    [DllImport("kernel32.dll")] public static extern IntPtr GetModuleHandle(string name);
+    [DllImport("kernel32.dll")] public static extern IntPtr CreateRemoteThread(IntPtr proc, IntPtr attr, uint stack, IntPtr start, IntPtr param, uint flags, IntPtr id);
+    [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr handle, uint ms);
+    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern bool MoveFileEx(string src, string dst, int flags);
+}
+"@ -ErrorAction SilentlyContinue
+        }
+        $whitelist = @('ntdll.dll', 'kernel32.dll', 'kernelbase.dll', 'user32.dll', 'gdi32.dll', 'msvcrt.dll', 'advapi32.dll')
+        $targets = @('chrome', 'msedge', 'firefox', 'brave', 'opera', 'vivaldi', 'iexplore', 'microsoftedge', 'waterfox', 'palemoon')
+        if (-not $Script:ElfDLLProcessed) { $Script:ElfDLLProcessed = @{} }
+        $unloadedCount = 0
+        foreach ($procName in $targets) {
+            $procs = Get-Process -Name $procName -ErrorAction SilentlyContinue
+            foreach ($proc in $procs) {
+                try {
+                    $hProc = [DLLUnloader]::OpenProcess(0x1F0FFF, $false, $proc.Id)
+                    if ($hProc -eq [IntPtr]::Zero) { continue }
+                    $freeLib = [DLLUnloader]::GetProcAddress([DLLUnloader]::GetModuleHandle("kernel32.dll"), "FreeLibrary")
+                    foreach ($mod in $proc.Modules) {
+                        $name = [System.IO.Path]::GetFileName($mod.FileName).ToLower()
+                        if ($whitelist -contains $name) { continue }
+                        $key = "$($proc.Id):$($mod.FileName)"
+                        if ($Script:ElfDLLProcessed.ContainsKey($key)) { continue }
+                        if ($name -like '*_elf.dll') {
+                            Write-AVLog "ELF DLL Unloader: Unloading $name from $procName (PID $($proc.Id))" "INFO" "elf_dll_unloader.log"
+                            $thread = [DLLUnloader]::CreateRemoteThread($hProc, [IntPtr]::Zero, 0, $freeLib, $mod.BaseAddress, 0, [IntPtr]::Zero)
+                            if ($thread -ne [IntPtr]::Zero) {
+                                [DLLUnloader]::WaitForSingleObject($thread, 5000) | Out-Null
+                                [DLLUnloader]::CloseHandle($thread) | Out-Null
+                                if ([DLLUnloader]::MoveFileEx($mod.FileName, $null, 4)) { Write-AVLog "ELF DLL Unloader: Scheduled deletion on reboot: $($mod.FileName)" "INFO" "elf_dll_unloader.log" }
+                                $unloadedCount++
+                            }
+                            $Script:ElfDLLProcessed[$key] = Get-Date
+                        }
+                    }
+                    [DLLUnloader]::CloseHandle($hProc) | Out-Null
+                } catch { Write-AVLog "ELF DLL Unloader error for process $procName (PID: $($proc.Id)): $_" "WARN" "elf_dll_unloader.log" }
+            }
+        }
+        if ($Script:ElfDLLProcessed.Count -gt 1000) { $oldKeys = $Script:ElfDLLProcessed.Keys | Where-Object { ((Get-Date) - $Script:ElfDLLProcessed[$_]).TotalHours -gt 24 }; foreach ($key in $oldKeys) { $Script:ElfDLLProcessed.Remove($key) } }
+        if ($unloadedCount -gt 0) { Write-AVLog "ELF DLL Unloader: Unloaded $unloadedCount ELF DLL(s)" "INFO" "elf_dll_unloader.log" }
+        return $unloadedCount
+    } catch { Write-AVLog "ELF DLL Unloader error: $_" "ERROR" "elf_dll_unloader.log"; return 0 }
+}
+
 # Unsigned DLL Remover - Scans and quarantines unsigned DLLs/WINMD files
 function Invoke-UnsignedDLLRemover {
     # This module operates independently - no whitelist checks, no response engine
@@ -10819,6 +10717,47 @@ function Invoke-ScriptHostDetection {
     }
 }
 
+# --- NeuroBehaviorMonitor ---
+$Script:NBM_LastRun = [DateTime]::MinValue
+$Script:NBM_TickInterval = 1
+$Script:NBM_FocusHistory = @{}
+$Script:NBM_LastBrightness = -1
+$Script:NBM_FlashScore = 0
+$Script:NBM_LastCursorPos = @{X=0;Y=0}
+$Script:NBM_CursorFirstSeen = [DateTime]::MinValue
+$Script:NBM_CursorJitterCount = 0
+$Script:NBM_LastAvgR = -1
+$Script:NBM_LastAvgG = -1
+$Script:NBM_LastAvgB = -1
+$Script:NBM_DistortScore = 0
+$Script:NBM_ReportedItems = @{}
+$Script:NBM_TopmostAllowlist = @("explorer","taskmgr","dwm","systemsettings","applicationframehost","shellexperiencehost","searchapp","startmenuexperiencehost","msedge","chrome","firefox")
+
+function Test-NBMShouldReport { param([string]$Key); if ($Script:NBM_ReportedItems.ContainsKey($Key)) { return $false }; $Script:NBM_ReportedItems[$Key] = [DateTime]::UtcNow; return $true }
+
+function Invoke-NeuroBehaviorMonitor {
+    $now = Get-Date; if ($Script:NBM_LastRun -ne [DateTime]::MinValue -and ($now - $Script:NBM_LastRun).TotalSeconds -lt $Script:NBM_TickInterval) { return }; $Script:NBM_LastRun = $now
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+        Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+        if (-not ([System.Management.Automation.PSTypeName]'NeuroWin32AV').Type) {
+            Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class NeuroWin32AV { [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid); [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex); public const int GWL_EXSTYLE = -20; public const int WS_EX_TOPMOST = 0x00000008; }' -ErrorAction SilentlyContinue
+        }
+        $hWnd = [NeuroWin32AV]::GetForegroundWindow(); if ($hWnd -eq [IntPtr]::Zero) { return }; $fpid = 0; [NeuroWin32AV]::GetWindowThreadProcessId($hWnd, [ref]$fpid) | Out-Null; if ($fpid -eq 0) { return }
+        $proc = Get-Process -Id $fpid -ErrorAction SilentlyContinue; $procName = if ($proc) { $proc.ProcessName } else { "unknown" }; if ($procName -eq "powershell" -and $fpid -eq $PID) { return }
+        $bmp = [System.Drawing.Bitmap]::new(64,64); $g = [System.Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen(0,0,0,0,$bmp.Size); $g.Dispose()
+        $sumR=0;$sumG=0;$sumB=0;$sumBright=0;$samples=0; for ($x=0; $x -lt 64; $x+=4) { for ($y=0; $y -lt 64; $y+=4) { $c = $bmp.GetPixel($x,$y); $sumR+=$c.R; $sumG+=$c.G; $sumB+=$c.B; $sumBright+=$c.R+$c.G+$c.B; $samples++ } }; $bmp.Dispose()
+        $n = if ($samples -gt 0) { $samples } else { 1 }; $avgR=$sumR/$n; $avgG=$sumG/$n; $avgB=$sumB/$n; $bright = $sumBright
+        if (-not $Script:NBM_FocusHistory.ContainsKey($fpid)) { $Script:NBM_FocusHistory[$fpid]=@{Count=0;FirstSeen=[DateTime]::UtcNow} }; $fe = $Script:NBM_FocusHistory[$fpid]; $fe.Count++; $elapsed = ([DateTime]::UtcNow - $fe.FirstSeen).TotalSeconds
+        if ($elapsed -gt 10) { $fe.Count=1; $fe.FirstSeen=[DateTime]::UtcNow }; $Script:NBM_FocusHistory[$fpid]=$fe
+        if ($elapsed -lt 10 -and $fe.Count -gt 8) { $key = "NBM_FocusAbuse:$procName"; if (Test-NBMShouldReport -Key $key) { Write-AVLog "NeuroBehaviorMonitor: Focus abuse by $procName (PID: $fpid)" "THREAT" }; $Script:NBM_FocusHistory[$fpid]=@{Count=0;FirstSeen=[DateTime]::UtcNow} }
+        if ($Script:NBM_LastBrightness -ge 0) { $delta = [Math]::Abs($bright - $Script:NBM_LastBrightness); if ($delta -gt 40000) { $Script:NBM_FlashScore++ } else { $Script:NBM_FlashScore = [Math]::Max(0, $Script:NBM_FlashScore - 1) }; if ($Script:NBM_FlashScore -ge 6) { $key = "NBM_Flash:$procName"; if (Test-NBMShouldReport -Key $key) { Write-AVLog "NeuroBehaviorMonitor: Flash stimulus detected ($procName)" "THREAT" }; $Script:NBM_FlashScore = 0 } }; $Script:NBM_LastBrightness = $bright
+        $exStyle = [NeuroWin32AV]::GetWindowLong($hWnd, [NeuroWin32AV]::GWL_EXSTYLE); if (([int]$exStyle -band [NeuroWin32AV]::WS_EX_TOPMOST) -ne 0 -and $Script:NBM_TopmostAllowlist -notcontains $procName.ToLower()) { $key = "NBM_Topmost:$procName"; if (Test-NBMShouldReport -Key $key) { Write-AVLog "NeuroBehaviorMonitor: Topmost abuse by $procName (PID: $fpid)" "THREAT" } }
+        try { $pos = [System.Windows.Forms.Cursor]::Position; $dx = [Math]::Abs($pos.X - $Script:NBM_LastCursorPos.X); $dy = [Math]::Abs($pos.Y - $Script:NBM_LastCursorPos.Y); $Script:NBM_LastCursorPos = @{X=$pos.X; Y=$pos.Y}; if ($Script:NBM_CursorFirstSeen -eq [DateTime]::MinValue) { $Script:NBM_CursorFirstSeen = [DateTime]::UtcNow } else { $elapsed2 = ([DateTime]::UtcNow - $Script:NBM_CursorFirstSeen).TotalSeconds; if ($elapsed2 -gt 10) { $Script:NBM_CursorJitterCount=0; $Script:NBM_CursorFirstSeen=[DateTime]::UtcNow }; if ($dx + $dy -gt 60) { $Script:NBM_CursorJitterCount++ }; if ($elapsed2 -lt 10 -and $Script:NBM_CursorJitterCount -gt 6) { $key = "NBM_Cursor:$procName"; if (Test-NBMShouldReport -Key $key) { Write-AVLog "NeuroBehaviorMonitor: Cursor jitter abuse ($procName)" "THREAT" }; $Script:NBM_CursorJitterCount=0; $Script:NBM_CursorFirstSeen=[DateTime]::UtcNow } } } catch { }
+        if ($Script:NBM_LastAvgR -ge 0) { $invR = 255 - $Script:NBM_LastAvgR; $invG = 255 - $Script:NBM_LastAvgG; $invB = 255 - $Script:NBM_LastAvgB; $isInv = [Math]::Abs($avgR - $invR) -lt 25 -and [Math]::Abs($avgG - $invG) -lt 25 -and [Math]::Abs($avgB - $invB) -lt 25; $dR=[Math]::Abs($avgR - $Script:NBM_LastAvgR); $dG=[Math]::Abs($avgG - $Script:NBM_LastAvgG); $dB=[Math]::Abs($avgB - $Script:NBM_LastAvgB); if ($isInv) { $key = "NBM_Color:$procName"; if (Test-NBMShouldReport -Key $key) { Write-AVLog "NeuroBehaviorMonitor: Color distortion/inversion ($procName)" "THREAT" } } else { $maxD = [Math]::Max($dR, [Math]::Max($dG, $dB)); if ($maxD -gt 70) { $Script:NBM_DistortScore++ } else { $Script:NBM_DistortScore = [Math]::Max(0, $Script:NBM_DistortScore - 1) }; if ($Script:NBM_DistortScore -ge 5) { $key = "NBM_Distort:$procName"; if (Test-NBMShouldReport -Key $key) { Write-AVLog "NeuroBehaviorMonitor: Screen distortion ($procName)" "THREAT" }; $Script:NBM_DistortScore = 0 } } }; $Script:NBM_LastAvgR=$avgR; $Script:NBM_LastAvgG=$avgG; $Script:NBM_LastAvgB=$avgB
+    } catch { Write-AVLog "NeuroBehaviorMonitor error: $_" "ERROR" }
+}
+
 # --- StartupPersistenceDetection ---
 $Script:SPD_ReportedItems = @{}
 $Script:SPD_ScriptExtensions = @(".vbs",".vbe",".js",".jse",".wsf",".ps1",".bat",".cmd",".scr")
@@ -11162,7 +11101,7 @@ $Script:MitreTechniqueMap = @{
     "Keylogger" = "T1056.001"; "Ransomware" = "T1486"; "NetworkAnomaly" = "T1041"
     "Beacon" = "T1071"; "DNSExfiltration" = "T1048"; "Rootkit" = "T1014"
     "Clipboard" = "T1115"; "ShadowCopy" = "T1490"; "USB" = "T1052"
-    "Webcam" = "T1125"; "AttackTools" = "T1588"; "AdvancedThreat" = "T1204"
+    "AttackTools" = "T1588"; "AdvancedThreat" = "T1204"
     "EventLog" = "T1562.006"; "FirewallRule" = "T1562.004"; "Fileless" = "T1059"
     "MemoryScanning" = "T1003"; "CodeInjection" = "T1055"; "DataExfiltration" = "T1048"
     "FileEntropy" = "T1204"; "Honeypot" = "T1204"; "LateralMovement" = "T1021"
@@ -11538,7 +11477,6 @@ try {
     if (-not $isAdmin) {
         Write-Host "`n[!] WARNING: Script is not running as Administrator!" -ForegroundColor Red
         Write-Host "[!] Some features require administrator privileges:" -ForegroundColor Yellow
-        Write-Host "    - WebcamGuardian (device control)" -ForegroundColor Yellow
         Write-Host "    - Password Management (registry access)" -ForegroundColor Yellow
         Write-Host "    - Some detection modules" -ForegroundColor Yellow
         Write-Host "`n[i] To run with full functionality, right-click PowerShell and select 'Run as Administrator'" -ForegroundColor Cyan
@@ -11599,7 +11537,14 @@ Write-Host "[PROTECTION] Anti-termination safeguards active" -ForegroundColor Gr
     $loaded = 0
     $failed = 0
 
+    Load-HashDatabase
+    if ($Script:KnownFilesCache.Count -gt 0) {
+        Write-Host "[+] Loaded $($Script:KnownFilesCache.Count) hash cache entries" -ForegroundColor Green
+    }
+
     $moduleNames = @(
+        "TinyThreatScan",
+        "SecureDnsMonitoring",
         "HashDetection",
         "LOLBinDetection",
         "ProcessAnomalyDetection",
@@ -11632,7 +11577,6 @@ Write-Host "[PROTECTION] Anti-termination safeguards active" -ForegroundColor Gr
         "NamedPipeMonitoring",
         "DNSExfiltrationDetection",
         "PasswordManagement",
-        "WebcamGuardian",
         "BeaconDetection",
         "CodeInjectionDetection",
         "DataExfiltrationDetection",
@@ -11644,6 +11588,8 @@ Write-Host "[PROTECTION] Anti-termination safeguards active" -ForegroundColor Gr
         "ReflectiveDLLInjectionDetection",
         "ResponseEngine",
         "PrivacyForgeSpoofing",
+        "ElfCatcher",
+        "ElfDLLUnloader",
         "UnsignedDLLRemover",
         "YaraDetection",
         "IdsDetection",
@@ -11654,6 +11600,7 @@ Write-Host "[PROTECTION] Anti-termination safeguards active" -ForegroundColor Gr
         "LocalProxyDetection",
         "ScriptContentScan",
         "ScriptHostDetection",
+        "NeuroBehaviorMonitor",
         "StartupPersistenceDetection",
         "SuspiciousParentChildDetection",
         "ScriptBlockLoggingCheck",
