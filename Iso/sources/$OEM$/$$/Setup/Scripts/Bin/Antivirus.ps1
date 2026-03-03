@@ -181,7 +181,7 @@ $Config = @{
     DriveRootScanDepth = 1        # 0 = root only, 1 = root + one subdir level
 
     # PUA/PUP response (may flag legitimate tools like TeamViewer)
-    AutoKillPUA = $false          # Auto-kill PUA (RATs, miners) - set $true for aggressive
+    AutoKillPUA = $true          # Auto-kill PUA (RATs, miners) - set $false to avoid killing Teamviewer, Anydesk, etc
     AutoKillCryptoMiners = $true  # Auto-kill crypto miners (xmrig, ccminer, etc.)
 
     EnableThreatToastNotifications = $true  # Show Windows toast when threat is quarantined/terminated
