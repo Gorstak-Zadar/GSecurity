@@ -1,13 +1,35 @@
-param([switch]$Uninstall)
+param(
+    [switch]$Uninstall,
+    [switch]$ChaosMode,   # Test mode: creates benign test threats to validate detections
+    [switch]$LearningMode # Log-only: build baseline, no kill/quarantine (DeepSeek suggestion)
+)
 
 #Requires -Version 5.1
 
 # ============================================================================
-# Antivirus.ps1
+# Antivirus.ps1 - Single-file EDR/Antivirus (Merged)
 # Author: Gorstak
+# Version: 2.0.0
+#
+# Changelog:
+#   v2.0.0 - Merged AV1+AV2; Grok improvements (hash DB, low-power, opt-in modules)
+#   v2.1.0 - DeepSeek improvements (circuit breakers, cache cleanup, LearningMode)
+#   v2.2.0 - Claude improvements (hash DB locking, FSW debounce, Invoke-Response)
+#   v2.3.0 - DeepSeek: Safe Mode detection, system path protection in UnsignedDLLRemover
+#   v2.4.0 - Grok: EICARHash/ForceQuarantineInSafeMode in Config, cache size limits, RTFM temp exclusions
+#
+# Dependencies: PowerShell 5.1+, Windows (WMI, EventLog, .NET)
+#
+# USAGE:
+#   Normal run:    .\Antivirus.ps1
+#   Uninstall:     .\Antivirus.ps1 -Uninstall   (removes persistence, stops instances)
+#   Test/chaos:    .\Antivirus.ps1 -ChaosMode   (validates detections with EICAR)
+#   Learning:      .\Antivirus.ps1 -LearningMode (log-only, no kill/quarantine)
+#   Full stop:     Use -Uninstall, or kill PID from Data\antivirus.pid
 
 # Unique script identifier (GUID) - used for process identification and mutex naming
 $Script:ScriptGUID = "539EF6B5-578B-4AF3-A5C7-FD564CB9C8FB"
+$Script:LearningMode = $false
 
 # Portable mode: Use script's directory as base path
 $Script:ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $PSCommandPath }
@@ -124,6 +146,24 @@ $Config = @{
     MaxDatabaseEntries = 50000
     DatabaseCleanupDays = 30
     CymruDetectionThreshold = 60
+
+    # Grok-suggested improvements
+    LowPowerMode = $false                    # Doubles all detection intervals to reduce CPU/RAM on low-end machines
+    MaxLogSizeMB = 10                        # Rotate logs when exceeding this size to prevent disk bloat
+    EnableClipboardMonitoring = $false       # Opt-in: invasive - monitors clipboard for sensitive data
+    EnableKeystrokeInjectionDetection = $false  # Opt-in: invasive - monitors keystroke injection
+    ApiUserAgent = "MalwareDetector-EDR/1.0 (PowerShell; Windows)"  # Identify requests to hash APIs
+
+    # Resource governors & stability (DeepSeek suggestions)
+    MaxFilesPerScan = 500              # Cap files per scan to avoid CPU spikes
+    CircuitBreakerFailureThreshold = 10  # Skip API after N consecutive failures
+    CircuitBreakerCooldownMinutes = 5   # Resume API after this many minutes
+    CacheCleanupIntervalIterations = 60  # Run Clear-StaleCache every N Monitor-Jobs ticks
+    MaxCacheEntries = 10000            # Trim caches when exceeding (Grok: prevent memory bloat)
+
+    # Centralized threat hashes (Grok: reduce magic strings)
+    EICARHash = "275A021BBFB6489E54D471899F7DB9D1663FC695EC2FE2A2C4538AABF651FD0F"
+    ForceQuarantineInSafeMode = $false # Advanced: override Safe Mode quarantine disable
 }
 
 $Script:MonitoredExtensions = @(
@@ -250,17 +290,93 @@ function Save-ToHashDatabase {
     if (-not $Hash -or -not $Config.HashDatabaseFile) { return }
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $entry = "$Hash,$IsSafe,$timestamp"
+    $mutexName = "Local\AV_HashDB_$($Config.HashDatabaseFile -replace '[\\:]+','_')"
+    $mutex = $null
     try {
-        $entry | Out-File -FilePath $Config.HashDatabaseFile -Append -Encoding UTF8
-        $Script:KnownFilesCache[$Hash] = $IsSafe
+        $mutex = New-Object System.Threading.Mutex($false, $mutexName)
+        if ($mutex.WaitOne(5000)) {
+            $entry | Out-File -FilePath $Config.HashDatabaseFile -Append -Encoding UTF8
+            $Script:KnownFilesCache[$Hash] = $IsSafe
+        }
     } catch {
         Write-AVLog "Failed to save to hash database: $_" "WARN"
+    } finally {
+        if ($mutex) {
+            try { $mutex.ReleaseMutex(); $mutex.Dispose() } catch {}
+        }
     }
 }
 
-function Test-CirclKnownGood { param([string]$SHA256); if (-not $SHA256) { return $false }; try { $url = "$($Config.CirclHashLookupUrl)/$SHA256"; $response = Invoke-RestMethod -Uri $url -TimeoutSec 8 -ErrorAction Stop; if ($response) { Write-AVLog "CIRCL known-good match: $SHA256" "INFO"; return $true } } catch {}; return $false }
-function Test-CymruMalware { param([string]$SHA256); if (-not $SHA256) { return $false }; try { $url = "$($Config.CymruApiUrl)/$SHA256"; $response = Invoke-RestMethod -Uri $url -TimeoutSec 8 -ErrorAction Stop; if ($response.detections -ge $Config.CymruDetectionThreshold) { Write-AVLog "CYMRU malware match: $SHA256 (detections: $($response.detections))" "THREAT"; return $true } } catch {}; return $false }
-function Test-MalwareBazaar { param([string]$SHA256); if (-not $SHA256) { return $false }; try { $body = @{ query = 'get_info'; hash = $SHA256 }; $response = Invoke-RestMethod -Uri $Config.MalwareBazaarApiUrl -Method Post -Body $body -TimeoutSec 10 -ErrorAction Stop; if ($response.query_status -eq 'ok' -or ($response.data -and $response.data.Count -gt 0)) { Write-AVLog "MalwareBazaar match: $SHA256" "THREAT"; return $true } } catch {}; return $false }
+function Get-ApiHeaders {
+    $ua = if ($Config -and $Config.ApiUserAgent) { $Config.ApiUserAgent } else { "MalwareDetector-EDR/1.0 (PowerShell; Windows)" }
+    return @{ "User-Agent" = $ua }
+}
+
+# Circuit breakers: stop hammering failing APIs (DeepSeek)
+$Script:CircuitBreakers = @{}
+function Test-CircuitBreaker {
+    param([string]$Service)
+    $breaker = $Script:CircuitBreakers[$Service]
+    if (-not $breaker) { return $true }
+    $threshold = if ($Config.CircuitBreakerFailureThreshold) { $Config.CircuitBreakerFailureThreshold } else { 10 }
+    $cooldownMins = if ($Config.CircuitBreakerCooldownMinutes) { $Config.CircuitBreakerCooldownMinutes } else { 5 }
+    if ($breaker.FailureCount -ge $threshold -and ((Get-Date) - $breaker.LastFailure).TotalMinutes -lt $cooldownMins) { return $false }
+    return $true
+}
+function Update-CircuitBreakerOnFailure { param([string]$Service)
+    if (-not $Script:CircuitBreakers[$Service]) { $Script:CircuitBreakers[$Service] = @{ FailureCount = 0; LastFailure = [DateTime]::MinValue } }
+    $Script:CircuitBreakers[$Service].FailureCount++
+    $Script:CircuitBreakers[$Service].LastFailure = Get-Date
+}
+function Reset-CircuitBreakerOnSuccess { param([string]$Service)
+    if ($Script:CircuitBreakers[$Service]) { $Script:CircuitBreakers[$Service].FailureCount = 0 }
+}
+
+# Config validation at startup (DeepSeek)
+function Test-Configuration {
+    $errors = @()
+    if (-not $Script:InstallPath) { $errors += "InstallPath not set" }
+    $minMem = 100
+    if ($Config.MaxMemoryUsageMB -lt $minMem) { $errors += "MaxMemoryUsageMB should be >= $minMem" }
+    if ($Config.MaxFilesPerScan -lt 10) { $errors += "MaxFilesPerScan should be >= 10" }
+    if ($errors.Count -gt 0) {
+        Write-Warning "Configuration validation: $($errors -join '; ')"
+    }
+}
+
+# Central cache cleanup to prevent memory bloat (DeepSeek); size limits (Grok)
+function Clear-StaleCache {
+    $cutoff = (Get-Date).AddHours(-24)
+    $maxEntries = if ($Config.MaxCacheEntries -gt 0) { $Config.MaxCacheEntries } else { 10000 }
+    if ($Script:ProcessedDlls -and $Script:ProcessedDlls.Count -gt 0) {
+        $oldKeys = $Script:ProcessedDlls.Keys | Where-Object { $Script:ProcessedDlls[$_] -lt $cutoff }
+        foreach ($k in $oldKeys) { $Script:ProcessedDlls.Remove($k) | Out-Null }
+        if ($Script:ProcessedDlls.Count -gt $maxEntries) {
+            $trim = $Script:ProcessedDlls.GetEnumerator() | Sort-Object { $_.Value } | Select-Object -First ($Script:ProcessedDlls.Count - $maxEntries)
+            foreach ($e in $trim) { $Script:ProcessedDlls.Remove($e.Key) | Out-Null }
+        }
+    }
+    if ($Script:ScannedFiles -and $Script:ScannedFiles.Count -gt 500) {
+        $oldKeys = $Script:ScannedFiles.Keys | Where-Object { -not (Test-Path $_) }
+        foreach ($k in $oldKeys) { $Script:ScannedFiles.Remove($k) | Out-Null }
+        if ($Script:ScannedFiles.Count -gt $maxEntries) {
+            $trim = $Script:ScannedFiles.Keys | Select-Object -First ($Script:ScannedFiles.Count - $maxEntries)
+            foreach ($k in $trim) { $Script:ScannedFiles.Remove($k) | Out-Null }
+        }
+    }
+    if ($Script:ElfDLLProcessed -and $Script:ElfDLLProcessed.Count -gt 500) {
+        $oldKeys = $Script:ElfDLLProcessed.Keys | Where-Object { ((Get-Date) - $Script:ElfDLLProcessed[$_]).TotalHours -gt 24 }
+        foreach ($k in $oldKeys) { $Script:ElfDLLProcessed.Remove($k) | Out-Null }
+        if ($Script:ElfDLLProcessed.Count -gt $maxEntries) {
+            $trim = $Script:ElfDLLProcessed.GetEnumerator() | Sort-Object { $_.Value } | Select-Object -First ($Script:ElfDLLProcessed.Count - $maxEntries)
+            foreach ($e in $trim) { $Script:ElfDLLProcessed.Remove($e.Key) | Out-Null }
+        }
+    }
+}
+
+function Test-CirclKnownGood { param([string]$SHA256); if (-not $SHA256) { return $false }; if (-not (Test-CircuitBreaker -Service 'CIRCL')) { return $false }; try { $url = "$($Config.CirclHashLookupUrl)/$SHA256"; $response = Invoke-RestMethod -Uri $url -Headers (Get-ApiHeaders) -TimeoutSec 8 -ErrorAction Stop; Reset-CircuitBreakerOnSuccess -Service 'CIRCL'; if ($response) { Write-AVLog "CIRCL known-good match: $SHA256" "INFO"; return $true } } catch { Update-CircuitBreakerOnFailure -Service 'CIRCL' }; return $false }
+function Test-CymruMalware { param([string]$SHA256); if (-not $SHA256) { return $false }; if (-not (Test-CircuitBreaker -Service 'Cymru')) { return $false }; try { $url = "$($Config.CymruApiUrl)/$SHA256"; $response = Invoke-RestMethod -Uri $url -Headers (Get-ApiHeaders) -TimeoutSec 8 -ErrorAction Stop; Reset-CircuitBreakerOnSuccess -Service 'Cymru'; if ($response.detections -ge $Config.CymruDetectionThreshold) { Write-AVLog "CYMRU malware match: $SHA256 (detections: $($response.detections))" "THREAT"; return $true } } catch { Update-CircuitBreakerOnFailure -Service 'Cymru' }; return $false }
+function Test-MalwareBazaar { param([string]$SHA256); if (-not $SHA256) { return $false }; if (-not (Test-CircuitBreaker -Service 'MalwareBazaar')) { return $false }; try { $body = @{ query = 'get_info'; hash = $SHA256 }; $response = Invoke-RestMethod -Uri $Config.MalwareBazaarApiUrl -Method Post -Body $body -Headers (Get-ApiHeaders) -TimeoutSec 10 -ErrorAction Stop; Reset-CircuitBreakerOnSuccess -Service 'MalwareBazaar'; if ($response.query_status -eq 'ok' -or ($response.data -and $response.data.Count -gt 0)) { Write-AVLog "MalwareBazaar match: $SHA256" "THREAT"; return $true } } catch { Update-CircuitBreakerOnFailure -Service 'MalwareBazaar' }; return $false }
 
 $Global:AntivirusState = @{
     Running = $false
@@ -316,6 +432,17 @@ function Write-AVLog {
         }
     }
 
+    # Log rotation: prevent disk bloat (Grok suggestion)
+    $maxBytes = 10 * 1024 * 1024  # 10 MB default
+    if ($configVar -and $null -ne $configVar.MaxLogSizeMB) { $maxBytes = $configVar.MaxLogSizeMB * 1024 * 1024 }
+    if (Test-Path $logFilePath) {
+        $fi = Get-Item $logFilePath -ErrorAction SilentlyContinue
+        if ($fi -and $fi.Length -gt $maxBytes) {
+            $rotated = "$logFilePath.old"
+            try { Move-Item -Path $logFilePath -Destination $rotated -Force -ErrorAction Stop } catch {}
+        }
+    }
+
     Add-Content -Path $logFilePath -Value $entry -ErrorAction SilentlyContinue
 
     $eid = switch ($Level) {
@@ -356,19 +483,41 @@ function Write-StabilityLog {
         New-Item -ItemType Directory -Path (Split-Path $Script:StabilityLogPath -Parent) -Force | Out-Null
     }
 
+    # Log rotation for stability log
+    $maxBytes = 10 * 1024 * 1024
+    if ($Config -and $Config.MaxLogSizeMB) { $maxBytes = $Config.MaxLogSizeMB * 1024 * 1024 }
+    if (Test-Path $Script:StabilityLogPath) {
+        $fi = Get-Item $Script:StabilityLogPath -ErrorAction SilentlyContinue
+        if ($fi -and $fi.Length -gt $maxBytes) { try { Move-Item -Path $Script:StabilityLogPath -Destination "$Script:StabilityLogPath.old" -Force -ErrorAction Stop } catch {} }
+    }
+
     Add-Content -Path $Script:StabilityLogPath -Value $entry -ErrorAction SilentlyContinue
     Write-Host $entry -ForegroundColor $(switch($Level) { "ERROR" {"Red"} "WARN" {"Yellow"} default {"White"} })
 }
 
 
+function Stop-Antivirus {
+    Write-Host "`n[*] Shutting down gracefully..." -ForegroundColor Cyan
+    $Global:AntivirusState.Running = $false
+    try {
+        if ($Script:RTFM_Watchers -and $Script:RTFM_Watchers.Count -gt 0) {
+            foreach ($w in $Script:RTFM_Watchers) { try { $w.EnableRaisingEvents = $false; $w.Dispose() } catch {} }
+            $Script:RTFM_Watchers = @()
+        }
+        $pidPath = if ($Config -and $Config.PIDFilePath) { $Config.PIDFilePath } elseif ($global:AntivirusPIDFilePath) { $global:AntivirusPIDFilePath } else { $null }
+        if ($pidPath -and (Test-Path $pidPath)) { Remove-Item $pidPath -Force -ErrorAction SilentlyContinue }
+        if ($Global:AntivirusState.Mutex) { try { $Global:AntivirusState.Mutex.ReleaseMutex(); $Global:AntivirusState.Mutex.Dispose() } catch {} }
+        Write-AVLog "Graceful shutdown complete"
+    } catch {}
+}
+
 function Register-ExitCleanup {
     if ($script:ExitCleanupRegistered) {
         return
     }
-
     try {
         Register-EngineEvent -SourceIdentifier "AntivirusProtection_ExitCleanup" -EventName PowerShell.Exiting -Action {
-            # Cleanup actions if needed
+            Stop-Antivirus
         } | Out-Null
         $script:ExitCleanupRegistered = $true
     }
@@ -1174,6 +1323,12 @@ function Monitor-Jobs {
                     $consecutiveErrors = 0
                 }
 
+                # Periodic cache cleanup to prevent memory bloat (DeepSeek)
+                $cleanupInterval = if ($Config.CacheCleanupIntervalIterations -gt 0) { $Config.CacheCleanupIntervalIterations } else { 60 }
+                if ($iteration % $cleanupInterval -eq 0) {
+                    try { Clear-StaleCache } catch {}
+                }
+
                 if ($iteration % 12 -eq 0) {
                     try {
                         $enabledCount = 0
@@ -1228,7 +1383,30 @@ function Monitor-Jobs {
 
 function Move-ToQuarantine {
     param([string]$Path, [string]$Reason)
-    
+
+    # Sanity check: NEVER quarantine system-critical paths (Grok: prevent accidental deletion)
+    $pathLower = $Path.ToLower()
+    $pf = [Environment]::GetEnvironmentVariable('ProgramFiles','Machine')
+    $pf86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)','Machine')
+    $protectedPrefixes = @(
+        (Join-Path $env:windir "").ToLower(),
+        (Join-Path $pf "").ToLower(),
+        (Join-Path $env:SystemRoot "system32\").ToLower(),
+        (Join-Path $env:SystemRoot "syswow64\").ToLower()
+    )
+    if ($pf86) { $protectedPrefixes += (Join-Path $pf86 "").ToLower() }
+    foreach ($prefix in $protectedPrefixes) {
+        if ($pathLower.StartsWith($prefix)) {
+            Write-AVLog "BLOCKED: Refusing to quarantine system path: $Path (Reason: $Reason)" "WARN"
+            return $false
+        }
+    }
+
+    if ($Script:LearningMode -or ($Config.AutoQuarantine -eq $false)) {
+        Write-AVLog "[LEARNING] Would have quarantined: $Path (Reason: $Reason)" "INFO"
+        return $false
+    }
+
     $FileName = [System.IO.Path]::GetFileName($Path)
     $QuarantineFile = "$($Config.QuarantinePath)\$([DateTime]::Now.Ticks)_$FileName"
     
@@ -1247,6 +1425,10 @@ function Stop-ThreatProcess {
     param([int]$ProcessId, [string]$ProcessName)
     
     if ($ProcessId -eq $PID -or $ProcessId -eq $Script:SelfPID) { return }
+    if ($Script:LearningMode -or ($Config.AutoKillThreats -eq $false)) {
+        Write-AVLog "[LEARNING] Would have terminated: $ProcessName (PID: $ProcessId)" "INFO"
+        return
+    }
     
     # Critical system processes that must NEVER be terminated
     $ProtectedProcessNames = @(
@@ -1321,11 +1503,13 @@ function Invoke-HashDetection {
         "$env:USERPROFILE\Downloads\*"
     )
 
-    $Files = Get-ChildItem -Path $SuspiciousPaths -Include *.exe,*.dll,*.scr,*.vbs,*.ps1,*.bat,*.cmd,*.com,*.msi,*.hta,*.js,*.jse,*.wsf,*.wsh -Recurse -ErrorAction SilentlyContinue
+    $maxFiles = if ($Config.MaxFilesPerScan -gt 0) { $Config.MaxFilesPerScan } else { 500 }
+    $Files = @(Get-ChildItem -Path $SuspiciousPaths -Include *.exe,*.dll,*.scr,*.vbs,*.ps1,*.bat,*.cmd,*.com,*.msi,*.hta,*.js,*.jse,*.wsf,*.wsh -Recurse -ErrorAction SilentlyContinue | Select-Object -First $maxFiles)
 
     # Local known-bad hashes (includes EICAR test file and common malware)
+    $eicarHash = if ($Config.EICARHash) { $Config.EICARHash } else { "275A021BBFB6489E54D471899F7DB9D1663FC695EC2FE2A2C4538AABF651FD0F" }
     $KnownBadHashes = @{
-        "275A021BBFB6489E54D471899F7DB9D1663FC695EC2FE2A2C4538AABF651FD0F" = "EICAR-Test-File"
+        $eicarHash = "EICAR-Test-File"
         "44D88612FEA8A8F36DE82E1278ABB02F" = "EICAR-Test-File-MD5"
     }
     
@@ -1342,14 +1526,18 @@ function Invoke-HashDetection {
             if ($Script:KnownFilesCache.ContainsKey($Hash)) {
                 if (-not $Script:KnownFilesCache[$Hash]) {
                     if (Test-Path $File.FullName) {
-                        Write-AVLog "[HashDetection] Known bad file re-detected - HARD DELETING: $($File.FullName) (hash: $Hash)" "THREAT"
-                        try {
-                            Remove-Item -Path $File.FullName -Force -ErrorAction Stop
-                            Write-AVLog "[HashDetection] Successfully deleted known-bad file: $($File.FullName)" "ACTION"
-                            $Global:AntivirusState.FilesQuarantined++
-                        } catch {
-                            Write-AVLog "[HashDetection] Delete failed - falling back to quarantine: $_" "WARN"
-                            Move-ToQuarantine -Path $File.FullName -Reason "Known threat (delete failed)"
+                        if ($Script:LearningMode -or -not $Config.AutoQuarantine) {
+                            Write-AVLog "[LEARNING] Would have deleted known-bad: $($File.FullName) (hash: $Hash)" "INFO"
+                        } else {
+                            Write-AVLog "[HashDetection] Known bad file re-detected - HARD DELETING: $($File.FullName) (hash: $Hash)" "THREAT"
+                            try {
+                                Remove-Item -Path $File.FullName -Force -ErrorAction Stop
+                                Write-AVLog "[HashDetection] Successfully deleted known-bad file: $($File.FullName)" "ACTION"
+                                $Global:AntivirusState.FilesQuarantined++
+                            } catch {
+                                Write-AVLog "[HashDetection] Delete failed - falling back to quarantine: $_" "WARN"
+                                Move-ToQuarantine -Path $File.FullName -Reason "Known threat (delete failed)"
+                            }
                         }
                     }
                 }
@@ -1370,32 +1558,41 @@ function Invoke-HashDetection {
             }
 
             try {
-                $CirclResponse = Invoke-RestMethod -Uri "$CirclHashLookupUrl/$Hash" -Method Get -TimeoutSec 5 -ErrorAction SilentlyContinue
-                if ($CirclResponse.KnownMalicious) {
-                    $Reputation.IsMalicious = $true
-                    $Reputation.Confidence += 40
-                    $Reputation.Sources += "CIRCL"
+                if (Test-CircuitBreaker -Service 'CIRCL') {
+                    $CirclResponse = Invoke-RestMethod -Uri "$CirclHashLookupUrl/$Hash" -Method Get -Headers (Get-ApiHeaders) -TimeoutSec 5 -ErrorAction SilentlyContinue
+                    if ($CirclResponse) { Reset-CircuitBreakerOnSuccess -Service 'CIRCL' }
+                    if ($CirclResponse.KnownMalicious) {
+                        $Reputation.IsMalicious = $true
+                        $Reputation.Confidence += 40
+                        $Reputation.Sources += "CIRCL"
+                    }
                 }
-            } catch {}
+            } catch { Update-CircuitBreakerOnFailure -Service 'CIRCL' }
 
             try {
-                $MBBody = @{ query = "get_info"; hash = $Hash } | ConvertTo-Json
-                $MBResponse = Invoke-RestMethod -Uri $MalwareBazaarApiUrl -Method Post -Body $MBBody -ContentType "application/json" -TimeoutSec 5 -ErrorAction SilentlyContinue
-                if ($MBResponse.query_status -eq "ok") {
-                    $Reputation.IsMalicious = $true
-                    $Reputation.Confidence += 50
-                    $Reputation.Sources += "MalwareBazaar"
+                if (Test-CircuitBreaker -Service 'MalwareBazaar') {
+                    $MBBody = @{ query = "get_info"; hash = $Hash } | ConvertTo-Json
+                    $MBResponse = Invoke-RestMethod -Uri $MalwareBazaarApiUrl -Method Post -Body $MBBody -ContentType "application/json" -Headers (Get-ApiHeaders) -TimeoutSec 5 -ErrorAction SilentlyContinue
+                    if ($MBResponse) { Reset-CircuitBreakerOnSuccess -Service 'MalwareBazaar' }
+                    if ($MBResponse.query_status -eq "ok") {
+                        $Reputation.IsMalicious = $true
+                        $Reputation.Confidence += 50
+                        $Reputation.Sources += "MalwareBazaar"
+                    }
                 }
-            } catch {}
+            } catch { Update-CircuitBreakerOnFailure -Service 'MalwareBazaar' }
 
             try {
-                $CymruResponse = Invoke-RestMethod -Uri "$CymruApiUrl/$Hash" -Method Get -TimeoutSec 5 -ErrorAction SilentlyContinue
-                if ($CymruResponse.malware -eq $true) {
-                    $Reputation.IsMalicious = $true
-                    $Reputation.Confidence += 30
-                    $Reputation.Sources += "Cymru"
+                if (Test-CircuitBreaker -Service 'Cymru') {
+                    $CymruResponse = Invoke-RestMethod -Uri "$CymruApiUrl/$Hash" -Method Get -Headers (Get-ApiHeaders) -TimeoutSec 5 -ErrorAction SilentlyContinue
+                    if ($CymruResponse) { Reset-CircuitBreakerOnSuccess -Service 'Cymru' }
+                    if ($CymruResponse.malware -eq $true) {
+                        $Reputation.IsMalicious = $true
+                        $Reputation.Confidence += 30
+                        $Reputation.Sources += "Cymru"
+                    }
                 }
-            } catch {}
+            } catch { Update-CircuitBreakerOnFailure -Service 'Cymru' }
 
             if ($Reputation.IsMalicious -and $Reputation.Confidence -ge 50) {
                 Write-AVLog "[HashDetection] THREAT: $($File.FullName) | Hash: $Hash | Sources: $($Reputation.Sources -join ', ') | Confidence: $($Reputation.Confidence)%" "THREAT"
@@ -1499,8 +1696,17 @@ function Invoke-TinyThreatAnalysis {
 }
 
 function Invoke-TinyThreatScan {
+    $maxFiles = if ($Config.MaxFilesPerScan -gt 0) { $Config.MaxFilesPerScan } else { 500 }
     $highRiskFolders = @("$env:USERPROFILE\Downloads", "$env:USERPROFILE\Desktop", "$env:TEMP", "$env:APPDATA", "$env:LOCALAPPDATA\Temp")
-    foreach ($folder in $highRiskFolders) { if (Test-Path $folder) { Get-ChildItem -Path $folder -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { Invoke-TinyThreatAnalysis -FilePath $_.FullName } } }
+    $filesToScan = @()
+    foreach ($folder in $highRiskFolders) {
+        if ($filesToScan.Count -ge $maxFiles) { break }
+        if (Test-Path $folder) {
+            $remaining = $maxFiles - $filesToScan.Count
+            $filesToScan += @(Get-ChildItem -Path $folder -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First $remaining)
+        }
+    }
+    foreach ($f in $filesToScan) { Invoke-TinyThreatAnalysis -FilePath $f.FullName }
     Write-Output "[TinyThreatScan] Scan cycle completed. Files in cache: $($Script:KnownFilesCache.Count)"
 }
 
@@ -9868,26 +10074,20 @@ function Invoke-UnsignedDLLRemover {
         
         $quarantinedCount = 0
         
-        # Helper function to check if file should be excluded
+        # Helper function to check if file should be excluded (DeepSeek: protect system)
         function Should-ExcludeDLLFile {
             param ([string]$filePath)
             $lowerPath = $filePath.ToLower()
             
-            # Exclude assembly folders
-            if ($lowerPath -like "*\assembly\*") {
+            # NEVER touch Windows system DLLs - could cause boot failure
+            if ($lowerPath -like "*\windows\system32\*" -or $lowerPath -like "*\windows\syswow64\*" -or
+                $lowerPath -like "*\windows\winsxs\*" -or $lowerPath -like "*\program files\*") {
                 return $true
             }
             
-            # Exclude ctfmon-related files
-            if ($lowerPath -like "*ctfmon*" -or $lowerPath -like "*msctf.dll" -or $lowerPath -like "*msutb.dll") {
-                return $true
-            }
-            
-            # Exclude antivirus installation path
-            if ($lowerPath -like "*$($Config.QuarantinePath -replace '\\', '\\')*") {
-                return $true
-            }
-            
+            if ($lowerPath -like "*\assembly\*") { return $true }
+            if ($lowerPath -like "*ctfmon*" -or $lowerPath -like "*msctf.dll" -or $lowerPath -like "*msutb.dll") { return $true }
+            if ($lowerPath -like "*$($Config.QuarantinePath -replace '\\', '\\')*") { return $true }
             return $false
         }
         
@@ -9941,9 +10141,10 @@ function Invoke-UnsignedDLLRemover {
             }
         }
         
-        # Helper function to quarantine file (uses shared quarantine folder)
+        # Helper function to quarantine file - delegates to Move-ToQuarantine for path safety
         function Quarantine-DLLFile {
             param ([string]$filePath)
+            if (Should-ExcludeDLLFile -filePath $filePath) { return $false }
             try {
                 $fileName = Split-Path -Leaf $filePath
                 $quarantinePath = Join-Path -Path $Config.QuarantinePath -ChildPath "$([DateTime]::Now.Ticks)_$fileName"
@@ -11136,9 +11337,11 @@ function Invoke-MitreMapping {
     return $mapped
 }
 
-# --- RealTimeFileMonitor ---
+# --- RealTimeFileMonitor (with debouncing - Claude) ---
 $Script:RTFM_Watchers = @()
 $Script:RTFM_Initialized = $false
+$Script:RTFM_PendingQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+$Script:RTFM_MaxProcessPerTick = 50
 
 function Start-RealtimeFileMonitor {
     $drives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Root -match '^[A-Z]:\\$' }
@@ -11154,38 +11357,7 @@ function Start-RealtimeFileMonitor {
                 $path = $Event.SourceEventArgs.FullPath
                 $ext = [System.IO.Path]::GetExtension($path).ToLower()
                 $monitoredExts = @('.exe','.dll','.sys','.com','.scr','.bat','.cmd','.ps1','.vbs','.js','.hta','.msi')
-                if ($ext -in $monitoredExts) {
-                    Start-Sleep -Seconds 1
-                    if (Test-Path $path) {
-                        try {
-                            $hash = (Get-FileHash -Path $path -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
-                            
-                            # Known-bad hashes for immediate action
-                            $knownBad = @{
-                                "275A021BBFB6489E54D471899F7DB9D1663FC695EC2FE2A2C4538AABF651FD0F" = "EICAR-Test-File"
-                            }
-                            
-                            if ($hash -and $knownBad.ContainsKey($hash)) {
-                                Write-EventLog -LogName Application -Source "MalwareDetector" -EntryType Error -EventId 9999 -Message "[RealTime] THREAT DETECTED - Quarantining: $path (hash: $hash)" -ErrorAction SilentlyContinue
-                                
-                                # Quarantine the file
-                                $quarantinePath = "C:\ProgramData\Antivirus\Quarantine"
-                                $quarantineFile = "$quarantinePath\$([DateTime]::Now.Ticks)_$([System.IO.Path]::GetFileName($path))"
-                                try {
-                                    [System.IO.File]::Move($path, $quarantineFile)
-                                    Write-EventLog -LogName Application -Source "MalwareDetector" -EntryType Warning -EventId 9998 -Message "[RealTime] Quarantined: $path" -ErrorAction SilentlyContinue
-                                } catch {
-                                    # If move fails, try delete
-                                    Remove-Item -Path $path -Force -ErrorAction SilentlyContinue
-                                }
-                            } else {
-                                # Log for monitoring
-                                $logPath = "C:\ProgramData\Antivirus\Logs\realtime_monitor_$(Get-Date -Format 'yyyy-MM-dd').log"
-                                "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|Created/Changed|$path|$hash" | Add-Content -Path $logPath -ErrorAction SilentlyContinue
-                            }
-                        } catch { }
-                    }
-                }
+                if ($ext -in $monitoredExts) { $Script:RTFM_PendingQueue.Enqueue($path) }
             }
             Register-ObjectEvent $watcher Created -Action $action | Out-Null
             Register-ObjectEvent $watcher Changed -Action $action | Out-Null
@@ -11199,6 +11371,38 @@ function Invoke-RealTimeFileMonitor {
     if (-not $Script:RTFM_Initialized) {
         Start-RealtimeFileMonitor
         $Script:RTFM_Initialized = $true
+    }
+    $processed = 0
+    $maxPerTick = $Script:RTFM_MaxProcessPerTick
+    $eicarHash = if ($Config.EICARHash) { $Config.EICARHash } else { "275A021BBFB6489E54D471899F7DB9D1663FC695EC2FE2A2C4538AABF651FD0F" }
+    $knownBad = @{ $eicarHash = "EICAR-Test-File" }
+    $quarantinePath = if ($Config.QuarantinePath) { $Config.QuarantinePath } else { "$env:ProgramData\Antivirus\Quarantine" }
+    $logPath = if ($Config.LogPath) { $Config.LogPath } else { "$env:ProgramData\Antivirus\Logs" }
+    # Skip temp/system paths to reduce noise (Grok: exclude temp/system folders)
+    $rtExclude = @('\temp\','\tmp\','\windows\temp\','\$recycle.bin\','\prefetch\','\caches\','\cache\')
+    while ($processed -lt $maxPerTick) {
+        $path = $null
+        if (-not $Script:RTFM_PendingQueue.TryDequeue([ref]$path)) { break }
+        $pathLower = $path.ToLower()
+        if ($rtExclude | Where-Object { $pathLower -like "*$_*" }) { continue }
+        $processed++
+        Start-Sleep -Milliseconds 100
+        if (-not (Test-Path $path -PathType Leaf)) { continue }
+        try {
+            $hash = (Get-FileHash -Path $path -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
+            if ($hash -and $knownBad.ContainsKey($hash)) {
+                if (-not $Script:LearningMode -and $Config.AutoQuarantine) {
+                    $qf = "$quarantinePath\$([DateTime]::Now.Ticks)_$([System.IO.Path]::GetFileName($path))"
+                    try {
+                        [System.IO.File]::Move($path, $qf)
+                        Write-EventLog -LogName Application -Source "MalwareDetector" -EntryType Warning -EventId 9998 -Message "[RealTime] Quarantined: $path" -ErrorAction SilentlyContinue
+                    } catch { Remove-Item -Path $path -Force -ErrorAction SilentlyContinue }
+                }
+            } else {
+                $rtLog = "$logPath\realtime_monitor_$(Get-Date -Format 'yyyy-MM-dd').log"
+                "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|Created/Changed|$path|$hash" | Add-Content -Path $rtLog -ErrorAction SilentlyContinue
+            }
+        } catch { }
     }
     return $Script:RTFM_Watchers.Count
 }
@@ -11232,10 +11436,14 @@ $Script:CrudePayloadPattern = '(?i)(<script|javascript:|onerror=|onload=|alert\(
 
 function Invoke-CrudePayloadGuard {
     $detections = 0
+    # Browser processes legitimately have JS in command line (extensions, web dev tools) - skip them (Grok)
+    $browserNames = @('chrome','firefox','msedge','iexplore','brave','opera','vivaldi','waterfox')
     try {
         $processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Select-Object ProcessId, Name, CommandLine
         foreach ($proc in $processes) {
             if (-not $proc.CommandLine) { continue }
+            $procName = ($proc.Name -replace '\.exe$','').ToLower()
+            if ($browserNames -contains $procName) { continue }  # Skip browsers - benign JS/HTML in CLI
             if ($proc.CommandLine -match $Script:CrudePayloadPattern) {
                 Write-EventLog -LogName Application -Source "AntivirusEDR" -EntryType Warning -EventId 2092 -Message "CrudePayloadGuard: Potential XSS/payload in PID $($proc.ProcessId) - $($proc.Name)" -ErrorAction SilentlyContinue
                 $detections++
@@ -11464,11 +11672,42 @@ function Invoke-ShadowProxyCaptureDetection {
     return $detections
 }
 
+# ===================== Chaos Mode (Test/Validation) =====================
+# Simulates benign threats to validate detections - for testing only
+function Invoke-ChaosMode {
+    Write-Host "`n[CHAOS MODE] Running detection validation tests...`n" -ForegroundColor Cyan
+    $eicar = 'X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*'
+    $testPath = Join-Path $env:TEMP "eicar_test_$(Get-Random).com"
+    try {
+        $eicar | Out-File -FilePath $testPath -Encoding ASCII -NoNewline
+        $hash = (Get-FileHash -Path $testPath -Algorithm SHA256).Hash
+        $expectedHash = if ($Config.EICARHash) { $Config.EICARHash } else { "275A021BBFB6489E54D471899F7DB9D1663FC695EC2FE2A2C4538AABF651FD0F" }
+        if ($hash -eq $expectedHash) {
+            Write-Host "[CHAOS] EICAR test file created: $testPath" -ForegroundColor Green
+            Write-Host "[CHAOS] Hash matches known-bad - detection would trigger. Cleanup..." -ForegroundColor Green
+        } else {
+            Write-Host "[CHAOS] EICAR created (hash: $hash) - run full scan to validate" -ForegroundColor Yellow
+        }
+        Remove-Item $testPath -Force -ErrorAction SilentlyContinue
+        Write-Host "[CHAOS] Test complete. Run without -ChaosMode for full protection.`n" -ForegroundColor Cyan
+    } catch {
+        Write-Host "[CHAOS] Error: $_" -ForegroundColor Red
+    }
+}
+
 # ===================== Main =====================
+# UNINSTALL: Run with -Uninstall to remove persistence, stop instances, clean Run key.
+# Full stop: Use -Uninstall, or kill PID from Data\antivirus.pid, then remove Run key manually if needed.
 
 try {
     if ($Uninstall) {
         Uninstall-Antivirus
+        exit 0
+    }
+
+    if ($ChaosMode) {
+        Invoke-ChaosMode
+        exit 0
     }
 
     # Check for administrator privileges
@@ -11488,6 +11727,30 @@ try {
 
     Write-Host "`nAntivirus Protection (Single File)`n" -ForegroundColor Cyan
     Write-StabilityLog "=== Antivirus Starting ==="
+
+    Test-Configuration
+
+    if ((Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).BootupState -match "Safe|Fail-safe") {
+        if (-not $Config.ForceQuarantineInSafeMode) {
+            Write-Host "[!] Safe Mode detected - AutoQuarantine disabled to prevent system instability" -ForegroundColor Yellow
+            $Config.AutoQuarantine = $false
+            Write-StabilityLog "Safe Mode detected - quarantine disabled"
+        } else {
+            Write-Host "[!] Safe Mode detected - ForceQuarantineInSafeMode=true, quarantine enabled (advanced)" -ForegroundColor Yellow
+            Write-StabilityLog "Safe Mode with ForceQuarantineInSafeMode - quarantine enabled"
+        }
+    }
+
+    if ($LearningMode) {
+        $Script:LearningMode = $true
+        $Config.AutoKillThreats = $false
+        $Config.AutoQuarantine = $false
+        Write-Host "[LEARNING MODE] Log-only: no kill/quarantine. Building baseline." -ForegroundColor Yellow
+        Write-StabilityLog "Learning mode enabled - detections logged only"
+    } else {
+        $Script:LearningMode = $false
+    }
+    $global:AntivirusPIDFilePath = $Config.PIDFilePath
 
     Write-StabilityLog "Executing script path: $PSCommandPath" "INFO"
 
@@ -11618,8 +11881,20 @@ Write-Host "[PROTECTION] Anti-termination safeguards active" -ForegroundColor Gr
     )
 
     foreach ($modName in $moduleNames) {
+        # Opt-in for invasive modules (Grok: clipboard/keystroke need explicit enable)
+        if ($modName -eq "ClipboardMonitoring" -and -not $Config.EnableClipboardMonitoring) {
+            Write-Host "[.] ClipboardMonitoring - skipped (opt-in: set Config.EnableClipboardMonitoring = `$true)" -ForegroundColor DarkGray
+            continue
+        }
+        if ($modName -eq "KeystrokeInjectionDetection" -and -not $Config.EnableKeystrokeInjectionDetection) {
+            Write-Host "[.] KeystrokeInjectionDetection - skipped (set Config.EnableKeystrokeInjectionDetection = `$true to enable)" -ForegroundColor DarkGray
+            continue
+        }
+
         $key = "${modName}IntervalSeconds"
         $interval = if ($Script:ManagedJobConfig.ContainsKey($key)) { $Script:ManagedJobConfig[$key] } else { 60 }
+        # Low-power mode: double intervals to reduce CPU/RAM (Grok suggestion)
+        if ($Config.LowPowerMode) { $interval = [Math]::Max($interval * 2, 60) }
 
         try {
             Start-ManagedJob -ModuleName $modName -IntervalSeconds $interval
