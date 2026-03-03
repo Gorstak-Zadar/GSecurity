@@ -1,7 +1,8 @@
 param(
     [switch]$Uninstall,
     [switch]$ChaosMode,   # Test mode: creates benign test threats to validate detections
-    [switch]$LearningMode # Log-only: build baseline, no kill/quarantine (DeepSeek suggestion)
+    [switch]$LearningMode, # Log-only: build baseline, no kill/quarantine (DeepSeek suggestion)
+    [switch]$SelfTest     # Run self-diagnostics and exit
 )
 
 #Requires -Version 5.1
@@ -18,6 +19,8 @@ param(
 #   v2.3.0 - DeepSeek: Safe Mode detection, system path protection in UnsignedDLLRemover
 #   v2.4.0 - Grok: EICARHash/ForceQuarantineInSafeMode in Config, cache size limits, RTFM temp exclusions
 #   v2.5.0 - Expanded scope: all local/removable/network drive roots; RTFM runs Cymru/MalwareBazaar on new files
+#   v2.6.0 - Invoke-WithRetry, Test-ConfigurationSanity, Invoke-SelfTest, Invoke-GracefulShutdown, Safe Mode enhancement
+#   v2.7.0 - PUA/PUP/PUM detection, Phantom Process Killer
 #
 # Dependencies: PowerShell 5.1+, Windows (WMI, EventLog, .NET)
 #
@@ -26,6 +29,7 @@ param(
 #   Uninstall:     .\Antivirus.ps1 -Uninstall   (removes persistence, stops instances)
 #   Test/chaos:    .\Antivirus.ps1 -ChaosMode   (validates detections with EICAR)
 #   Learning:      .\Antivirus.ps1 -LearningMode (log-only, no kill/quarantine)
+#   Self-test:     .\Antivirus.ps1 -SelfTest    (run diagnostics and exit)
 #   Full stop:     Use -Uninstall, or kill PID from Data\antivirus.pid
 
 # Unique script identifier (GUID) - used for process identification and mutex naming
@@ -66,6 +70,10 @@ $Script:ManagedJobConfig = @{
     USBMonitoringIntervalSeconds = 20
     MobileDeviceMonitoringIntervalSeconds = 15
     AttackToolsDetectionIntervalSeconds = 30
+    PUADetectionIntervalSeconds = 180
+    PUPDetectionIntervalSeconds = 180
+    PUMDetectionIntervalSeconds = 180
+    PhantomProcessKillerIntervalSeconds = 30
     AdvancedThreatDetectionIntervalSeconds = 20
     EventLogMonitoringIntervalSeconds = 60
     FirewallRuleMonitoringIntervalSeconds = 120
@@ -171,6 +179,12 @@ $Config = @{
     ScanRemovableDrives = $true   # Include removable drives (USB) root + shallow
     ScanNetworkDrives = $true     # Include mapped network shares root + shallow (may be slow)
     DriveRootScanDepth = 1        # 0 = root only, 1 = root + one subdir level
+
+    # PUA/PUP response (may flag legitimate tools like TeamViewer)
+    AutoKillPUA = $false          # Auto-kill PUA (RATs, miners) - set $true for aggressive
+    AutoKillCryptoMiners = $true  # Auto-kill crypto miners (xmrig, ccminer, etc.)
+
+    EnableThreatToastNotifications = $true  # Show Windows toast when threat is quarantined/terminated
 }
 
 $Script:MonitoredExtensions = @(
@@ -361,6 +375,68 @@ function Reset-CircuitBreakerOnSuccess { param([string]$Service)
     if ($Script:CircuitBreakers[$Service]) { $Script:CircuitBreakers[$Service].FailureCount = 0 }
 }
 
+# Retry with exponential backoff for transient failures (API, WMI)
+function Invoke-WithRetry {
+    param(
+        [scriptblock]$ScriptBlock,
+        [int]$MaxRetries = 3,
+        [string]$Operation = "unknown"
+    )
+    $retryCount = 0
+    $baseDelay = 2
+    while ($retryCount -lt $MaxRetries) {
+        try {
+            return & $ScriptBlock
+        } catch {
+            $retryCount++
+            if ($retryCount -eq $MaxRetries) {
+                Write-AVLog "Operation '$Operation' failed after $MaxRetries retries: $_" "ERROR"
+                throw
+            }
+            $delay = $baseDelay * [Math]::Pow(2, $retryCount - 1)
+            Write-AVLog "Retry $retryCount/$MaxRetries for '$Operation' in ${delay}s" "WARN"
+            Start-Sleep -Seconds $delay
+        }
+    }
+}
+
+# Config validation and sanity checks (path creation, intervals, conflicts)
+function Test-ConfigurationSanity {
+    $issues = @()
+    if (-not $Script:InstallPath) { $issues += "InstallPath not set" }
+    $minMem = 100
+    if ($Config.MaxMemoryUsageMB -lt $minMem) { $issues += "MaxMemoryUsageMB should be >= $minMem" }
+    if ($Config.MaxFilesPerScan -lt 10) { $issues += "MaxFilesPerScan should be >= 10" }
+    # Ensure paths exist and are writable
+    foreach ($pathKey in @("LogPath","QuarantinePath","DatabasePath","ReportsPath")) {
+        $p = $Config[$pathKey]
+        if ($p) {
+            try {
+                if (-not (Test-Path $p)) { New-Item -Path $p -ItemType Directory -Force -ErrorAction Stop | Out-Null }
+            } catch {
+                $issues += "Cannot create $pathKey : $_"
+            }
+        }
+    }
+    # Validate intervals (min 5s to avoid resource thrash)
+    foreach ($key in $Script:ManagedJobConfig.Keys) {
+        if ($Script:ManagedJobConfig[$key] -lt 5) {
+            Write-AVLog "$key interval too low ($($Script:ManagedJobConfig[$key])s) - setting to minimum 5s" "WARN"
+            $Script:ManagedJobConfig[$key] = 5
+        }
+    }
+    # Conflicting settings
+    if ($Script:LearningMode -and $Config.AutoKillThreats) {
+        $issues += "LearningMode active - AutoKillThreats disabled"
+        $Config.AutoKillThreats = $false
+    }
+    if ($issues.Count -gt 0) {
+        $issues | ForEach-Object { Write-Warning "Config: $_" }
+        return $false
+    }
+    return $true
+}
+
 # Config validation at startup (DeepSeek)
 function Test-Configuration {
     $errors = @()
@@ -371,6 +447,7 @@ function Test-Configuration {
     if ($errors.Count -gt 0) {
         Write-Warning "Configuration validation: $($errors -join '; ')"
     }
+    Test-ConfigurationSanity | Out-Null
 }
 
 # Central cache cleanup to prevent memory bloat (DeepSeek); size limits (Grok)
@@ -403,9 +480,48 @@ function Clear-StaleCache {
     }
 }
 
-function Test-CirclKnownGood { param([string]$SHA256); if (-not $SHA256) { return $false }; if (-not (Test-CircuitBreaker -Service 'CIRCL')) { return $false }; try { $url = "$($Config.CirclHashLookupUrl)/$SHA256"; $response = Invoke-RestMethod -Uri $url -Headers (Get-ApiHeaders) -TimeoutSec 8 -ErrorAction Stop; Reset-CircuitBreakerOnSuccess -Service 'CIRCL'; if ($response) { Write-AVLog "CIRCL known-good match: $SHA256" "INFO"; return $true } } catch { Update-CircuitBreakerOnFailure -Service 'CIRCL' }; return $false }
-function Test-CymruMalware { param([string]$SHA256); if (-not $SHA256) { return $false }; if (-not (Test-CircuitBreaker -Service 'Cymru')) { return $false }; try { $url = "$($Config.CymruApiUrl)/$SHA256"; $response = Invoke-RestMethod -Uri $url -Headers (Get-ApiHeaders) -TimeoutSec 8 -ErrorAction Stop; Reset-CircuitBreakerOnSuccess -Service 'Cymru'; if ($response.detections -ge $Config.CymruDetectionThreshold) { Write-AVLog "CYMRU malware match: $SHA256 (detections: $($response.detections))" "THREAT"; return $true } } catch { Update-CircuitBreakerOnFailure -Service 'Cymru' }; return $false }
-function Test-MalwareBazaar { param([string]$SHA256); if (-not $SHA256) { return $false }; if (-not (Test-CircuitBreaker -Service 'MalwareBazaar')) { return $false }; try { $body = @{ query = 'get_info'; hash = $SHA256 }; $response = Invoke-RestMethod -Uri $Config.MalwareBazaarApiUrl -Method Post -Body $body -Headers (Get-ApiHeaders) -TimeoutSec 10 -ErrorAction Stop; Reset-CircuitBreakerOnSuccess -Service 'MalwareBazaar'; if ($response.query_status -eq 'ok' -or ($response.data -and $response.data.Count -gt 0)) { Write-AVLog "MalwareBazaar match: $SHA256" "THREAT"; return $true } } catch { Update-CircuitBreakerOnFailure -Service 'MalwareBazaar' }; return $false }
+function Test-CirclKnownGood {
+    param([string]$SHA256)
+    if (-not $SHA256) { return $false }
+    if (-not (Test-CircuitBreaker -Service 'CIRCL')) { return $false }
+    try {
+        $response = Invoke-WithRetry -ScriptBlock {
+            $url = "$($Config.CirclHashLookupUrl)/$SHA256"
+            Invoke-RestMethod -Uri $url -Headers (Get-ApiHeaders) -TimeoutSec 8 -ErrorAction Stop
+        } -MaxRetries 2 -Operation "CIRCL"
+        Reset-CircuitBreakerOnSuccess -Service 'CIRCL'
+        if ($response) { Write-AVLog "CIRCL known-good match: $SHA256" "INFO"; return $true }
+    } catch { Update-CircuitBreakerOnFailure -Service 'CIRCL' }
+    return $false
+}
+function Test-CymruMalware {
+    param([string]$SHA256)
+    if (-not $SHA256) { return $false }
+    if (-not (Test-CircuitBreaker -Service 'Cymru')) { return $false }
+    try {
+        $response = Invoke-WithRetry -ScriptBlock {
+            $url = "$($Config.CymruApiUrl)/$SHA256"
+            Invoke-RestMethod -Uri $url -Headers (Get-ApiHeaders) -TimeoutSec 8 -ErrorAction Stop
+        } -MaxRetries 2 -Operation "Cymru"
+        Reset-CircuitBreakerOnSuccess -Service 'Cymru'
+        if ($response.detections -ge $Config.CymruDetectionThreshold) { Write-AVLog "CYMRU malware match: $SHA256 (detections: $($response.detections))" "THREAT"; return $true }
+    } catch { Update-CircuitBreakerOnFailure -Service 'Cymru' }
+    return $false
+}
+function Test-MalwareBazaar {
+    param([string]$SHA256)
+    if (-not $SHA256) { return $false }
+    if (-not (Test-CircuitBreaker -Service 'MalwareBazaar')) { return $false }
+    try {
+        $response = Invoke-WithRetry -ScriptBlock {
+            $body = @{ query = 'get_info'; hash = $SHA256 }
+            Invoke-RestMethod -Uri $Config.MalwareBazaarApiUrl -Method Post -Body $body -Headers (Get-ApiHeaders) -TimeoutSec 10 -ErrorAction Stop
+        } -MaxRetries 2 -Operation "MalwareBazaar"
+        Reset-CircuitBreakerOnSuccess -Service 'MalwareBazaar'
+        if ($response.query_status -eq 'ok' -or ($response.data -and $response.data.Count -gt 0)) { Write-AVLog "MalwareBazaar match: $SHA256" "THREAT"; return $true }
+    } catch { Update-CircuitBreakerOnFailure -Service 'MalwareBazaar' }
+    return $false
+}
 
 $Global:AntivirusState = @{
     Running = $false
@@ -525,19 +641,68 @@ function Write-StabilityLog {
 }
 
 
-function Stop-Antivirus {
-    Write-Host "`n[*] Shutting down gracefully..." -ForegroundColor Cyan
+function Invoke-GracefulShutdown {
+    param([string]$Reason = "user requested")
+    Write-Host "`n[*] Initiating graceful shutdown: $Reason" -ForegroundColor Cyan
     $Global:AntivirusState.Running = $false
     try {
         if ($Script:RTFM_Watchers -and $Script:RTFM_Watchers.Count -gt 0) {
             foreach ($w in $Script:RTFM_Watchers) { try { $w.EnableRaisingEvents = $false; $w.Dispose() } catch {} }
             $Script:RTFM_Watchers = @()
         }
+        # Save shutdown state for diagnostics
+        $dbPath = if ($Config -and $Config.DatabasePath) { $Config.DatabasePath } else { "$Script:InstallPath\Data" }
+        if (Test-Path $dbPath) {
+            try {
+                $state = @{
+                    PID = $PID
+                    ShutdownTime = (Get-Date).ToString("o")
+                    Reason = $Reason
+                    ModulesRunning = if ($Global:AntivirusState.Jobs) { $Global:AntivirusState.Jobs.Count } else { 0 }
+                    TotalDetections = $Global:AntivirusState.ThreatCount
+                }
+                $state | ConvertTo-Json | Out-File (Join-Path $dbPath "last_shutdown.json") -Force
+            } catch {}
+        }
         $pidPath = if ($Config -and $Config.PIDFilePath) { $Config.PIDFilePath } elseif ($global:AntivirusPIDFilePath) { $global:AntivirusPIDFilePath } else { $null }
         if ($pidPath -and (Test-Path $pidPath)) { Remove-Item $pidPath -Force -ErrorAction SilentlyContinue }
         if ($Global:AntivirusState.Mutex) { try { $Global:AntivirusState.Mutex.ReleaseMutex(); $Global:AntivirusState.Mutex.Dispose() } catch {} }
-        Write-AVLog "Graceful shutdown complete"
+        Write-AVLog "Graceful shutdown complete - $Reason"
     } catch {}
+    Write-Host "[*] Shutdown complete" -ForegroundColor Green
+}
+
+function Stop-Antivirus {
+    Invoke-GracefulShutdown -Reason "Stop-Antivirus"
+}
+
+function Invoke-SelfTest {
+    Write-Host "`nRunning self-diagnostics..." -ForegroundColor Cyan
+    $tests = @(
+        @{ Name = "Config Load"; Test = { $null -ne $Config } },
+        @{ Name = "Paths Exist"; Test = {
+            (Test-Path $Config.LogPath) -and
+            (Test-Path $Config.QuarantinePath) -and
+            (Test-Path $Config.DatabasePath)
+        }},
+        @{ Name = "Hash Functions"; Test = { (Get-Command Test-CirclKnownGood -ErrorAction SilentlyContinue) -ne $null } },
+        @{ Name = "Circuit Breaker"; Test = { (Get-Command Test-CircuitBreaker -ErrorAction SilentlyContinue) -ne $null } },
+        @{ Name = "Job Config"; Test = { $Script:ManagedJobConfig -and $Script:ManagedJobConfig.Keys.Count -gt 0 } }
+    )
+    $passed = 0
+    foreach ($t in $tests) {
+        try {
+            if (& $t.Test) {
+                Write-Host "  [PASS] $($t.Name)" -ForegroundColor Green
+                $passed++
+            } else {
+                Write-Host "  [FAIL] $($t.Name)" -ForegroundColor Red
+            }
+        } catch {
+            Write-Host "  [WARN] $($t.Name) - $_" -ForegroundColor Yellow
+        }
+    }
+    Write-Host "`nSelf-test: $passed/$($tests.Count) passed" -ForegroundColor Cyan
 }
 
 function Register-ExitCleanup {
@@ -1410,6 +1575,34 @@ function Monitor-Jobs {
     }
 }
 
+function Show-ThreatToast {
+    param([string]$Title, [string]$Message, [string]$ActionType = "Threat")
+    if (-not $Config.EnableThreatToastNotifications) { return }
+    if ($Script:LearningMode) { return }
+    try {
+        Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
+        $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+        $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+        $appId = if ($Config.EDRName) { $Config.EDRName } else { "GShield" }
+        $msgShort = if ($Message.Length -gt 80) { $Message.Substring(0, 77) + "..." } else { $Message }
+        $xml = @"
+<toast>
+  <visual>
+    <binding template="ToastGeneric">
+      <text>$([System.Security.SecurityElement]::Escape($Title))</text>
+      <text>$([System.Security.SecurityElement]::Escape($msgShort))</text>
+    </binding>
+  </visual>
+  <audio src="ms-winsoundevent:Notification.System" />
+</toast>
+"@
+        $xmlDoc = [Windows.Data.Xml.Dom.XmlDocument]::new()
+        $xmlDoc.LoadXml($xml)
+        $toast = [Windows.UI.Notifications.ToastNotification]::new($xmlDoc)
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)
+    } catch { }
+}
+
 function Move-ToQuarantine {
     param([string]$Path, [string]$Reason)
 
@@ -1443,6 +1636,7 @@ function Move-ToQuarantine {
         [System.IO.File]::Move($Path, $QuarantineFile)
         $Global:AntivirusState.FilesQuarantined++
         Write-AVLog "Quarantined: $Path (Reason: $Reason)" "THREAT"
+        Show-ThreatToast -Title "Threat Quarantined" -Message "File quarantined: $([System.IO.Path]::GetFileName($Path)) - $Reason" -ActionType "Quarantined"
         return $true
     } catch {
         Write-AVLog "Quarantine failed for $Path : $_" "ERROR"
@@ -1502,6 +1696,7 @@ function Stop-ThreatProcess {
         Stop-Process -Id $ProcessId -Force -ErrorAction Stop
         $Global:AntivirusState.ProcessesTerminated++
         Write-AVLog "Terminated threat process: $ProcessName (PID: $ProcessId)" "ACTION"
+        Show-ThreatToast -Title "Threat Terminated" -Message "Process stopped: $ProcessName (PID: $ProcessId)" -ActionType "Terminated"
     } catch {
         Write-AVLog "Failed to terminate process $ProcessName : $_" "ERROR"
     }
@@ -6288,6 +6483,142 @@ function Invoke-AttackToolsDetection {
     }
     
     return ($detections.Count + $threats.Count)
+}
+
+function Invoke-PUADetection {
+    $threats = @()
+    try {
+        $puaPatterns = @{
+            "RATs" = @("darkcomet", "poisonivy", "njrat", "cyberghost", "bifrost", "procerat", "blackshades", "gh0st", "spynet", "weirdrat", "remcos")
+            "CryptoMiners" = @("xmrig", "xmrig.exe", "ccminer", "ccminer.exe", "cgminer", "minerd", "nicehash", "claymore", "ethminer", "cpuminer")
+            "UnwantedRemoteAccess" = @("ammyy", "ammyy.exe", "supremacy", "crossloop", "join.me", "showmypc", "litemanager")
+        }
+        $legitimateRemote = @("teamviewer", "anydesk", "vnc", "remote", "rdp", "mstsc")
+        $autoKillPUA = if ($null -ne $Config.AutoKillPUA) { $Config.AutoKillPUA } else { $false }
+        $autoKillMiners = if ($null -ne $Config.AutoKillCryptoMiners) { $Config.AutoKillCryptoMiners } else { $true }
+        $processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -and $_.ProcessId -ne $PID -and $_.ProcessId -ne $Script:SelfPID }
+        foreach ($proc in $processes) {
+            $procName = (Split-Path -Leaf $proc.ExecutablePath -ErrorAction SilentlyContinue).ToLower()
+            $procPath = $proc.ExecutablePath.ToLower()
+            foreach ($category in $puaPatterns.Keys) {
+                foreach ($pattern in $puaPatterns[$category]) {
+                    if ($procName -match [regex]::Escape($pattern) -or $procPath -match [regex]::Escape($pattern)) {
+                        $isLegit = $legitimateRemote | Where-Object { $procName -match $_ }
+                        if ($isLegit -and $category -eq "UnwantedRemoteAccess") { continue }
+                        $killIt = ($category -eq "CryptoMiners" -and $autoKillMiners) -or ($category -ne "CryptoMiners" -and $autoKillPUA)
+                        $threats += @{ Type = "PUA: $category"; ProcessName = $proc.Name; ProcessId = $proc.ProcessId; ProcessPath = $proc.ExecutablePath; Risk = "HIGH"; KillIt = $killIt }
+                        break
+                    }
+                }
+            }
+        }
+        foreach ($threat in $threats) {
+            Write-AVLog "PUADetection: $($threat.Type) - $($threat.ProcessName) (PID: $($threat.ProcessId))" "THREAT" "pua_detection.log"
+            $Global:AntivirusState.ThreatCount++
+            if ($threat.KillIt -and $Config.AutoKillThreats) {
+                try { Stop-Process -Id $threat.ProcessId -Force -ErrorAction SilentlyContinue; Write-AVLog "Terminated PUA: $($threat.ProcessName)" "THREAT" "pua_detection.log" } catch { }
+            } else {
+                Add-ThreatToResponseQueue -ThreatType $threat.Type -ThreatPath $threat.ProcessPath -Severity $threat.Risk
+            }
+        }
+    } catch { Write-AVLog "PUADetection error: $_" "ERROR" "pua_detection.log" }
+    return $threats.Count
+}
+
+function Invoke-PUPDetection {
+    $threats = @()
+    try {
+        $pupPatterns = @("toolbar", "mysearch", "babylon", "conduit", "ask.com", "searchprotect", "dns unlocker", "speedial", "igdefender", "sweetim", "funmoods", "crossrider", "adware", "vosteran", "incredibar", "webcake", "openshopper", "softonic")
+        $scanPaths = @("$env:APPDATA", "$env:LOCALAPPDATA", "$env:ProgramData")
+        foreach ($path in $scanPaths) {
+            if (-not (Test-Path $path)) { continue }
+            try {
+                $dirs = Get-ChildItem -Path $path -Directory -ErrorAction SilentlyContinue
+                foreach ($dir in $dirs) {
+                    $dirName = $dir.Name.ToLower()
+                    foreach ($pup in $pupPatterns) {
+                        if ($dirName -match [regex]::Escape($pup)) {
+                            $exes = Get-ChildItem -Path $dir.FullName -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 5
+                            foreach ($exe in $exes) {
+                                $threats += @{ Type = "PUP: $pup"; FilePath = $exe.FullName; DirName = $dir.Name; Risk = "MEDIUM" }
+                            }
+                            break
+                        }
+                    }
+                }
+            } catch { }
+        }
+        foreach ($threat in $threats) {
+            Write-AVLog "PUPDetection: $($threat.Type) - $($threat.FilePath)" "THREAT" "pup_detection.log"
+            $Global:AntivirusState.ThreatCount++
+            if ($Config.AutoQuarantine) {
+                try { Move-ToQuarantine -Path $threat.FilePath -Reason "PUP: $($threat.Type)"; Write-AVLog "Quarantined PUP: $($threat.FilePath)" "THREAT" "pup_detection.log" } catch { }
+            }
+        }
+    } catch { Write-AVLog "PUPDetection error: $_" "ERROR" "pup_detection.log" }
+    return $threats.Count
+}
+
+function Invoke-PUMDetection {
+    $threats = @()
+    try {
+        $hostsPath = "$env:SystemRoot\System32\drivers\etc\hosts"
+        if (Test-Path $hostsPath) {
+            $hosts = Get-Content $hostsPath -ErrorAction SilentlyContinue
+            $suspicious = $hosts | Where-Object { $_ -match "^\s*\d" -and $_ -notmatch "^\s*#|localhost|127\.0\.0\.1\s+localhost" -and $_ -match "google|facebook|yahoo|bing|microsoft|avast|avg|norton|mcafee" }
+            if ($suspicious.Count -gt 0) {
+                $threats += @{ Type = "PUM: Hosts file hijack"; Path = $hostsPath; Lines = $suspicious.Count; Risk = "HIGH" }
+            }
+        }
+        $proxyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        if (Test-Path $proxyPath) {
+            try {
+                $proxy = Get-ItemProperty -Path $proxyPath -Name ProxyEnable -ErrorAction SilentlyContinue
+                $proxyServer = Get-ItemProperty -Path $proxyPath -Name ProxyServer -ErrorAction SilentlyContinue
+                if ($proxy.ProxyEnable -eq 1 -and $proxyServer.ProxyServer -and $proxyServer.ProxyServer -match "^\d+\.\d+\.\d+\.\d+:\d+$") {
+                    $threats += @{ Type = "PUM: Suspicious proxy"; Proxy = $proxyServer.ProxyServer; Risk = "MEDIUM" }
+                }
+            } catch { }
+        }
+        foreach ($threat in $threats) {
+            Write-AVLog "PUMDetection: $($threat.Type) - $($threat.Path -or $threat.Proxy)" "THREAT" "pum_detection.log"
+            $Global:AntivirusState.ThreatCount++
+            Add-ThreatToResponseQueue -ThreatType $threat.Type -ThreatPath ($threat.Path -or $threat.Proxy) -Severity $threat.Risk
+        }
+    } catch { Write-AVLog "PUMDetection error: $_" "ERROR" "pum_detection.log" }
+    return $threats.Count
+}
+
+function Invoke-PhantomProcessKiller {
+    $killed = 0
+    try {
+        $processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+        $runningPids = $processes | Select-Object -ExpandProperty ProcessId
+        $protected = @('System', 'Idle', 'smss', 'csrss', 'wininit', 'services', 'lsass', 'svchost', 'winlogon', 'explorer', 'dwm', 'powershell', 'pwsh', 'Code', 'Cursor')
+        foreach ($proc in $processes) {
+            if ($proc.ProcessId -eq $PID -or $proc.ProcessId -eq $Script:SelfPID) { continue }
+            $procName = $proc.Name -replace '\.exe$', ''
+            if ($protected -contains $procName) { continue }
+            $path = $proc.ExecutablePath
+            if (-not $path) { continue }
+            $pathLower = $path.ToLower()
+            $parentId = $proc.ParentProcessId
+            $parentExists = $parentId -eq 0 -or ($runningPids -contains $parentId)
+            $isOrphan = -not $parentExists
+            $fromTemp = $pathLower -match "\\temp\\|\\tmp\\|\\appdata\\local\\temp\\"
+            $suspiciousName = $procName -match "^(svchost|lsass|csrss|smss|dllhost|rundll32|conhost|ctfmon)$" -and $pathLower -notmatch "\\windows\\system32\\"
+            if (($isOrphan -and $fromTemp) -or $suspiciousName) {
+                if ($Config.AutoKillThreats) {
+                    try {
+                        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+                        Write-AVLog "PhantomProcessKiller: Terminated orphan/suspicious $procName (PID: $($proc.ProcessId)) from $path" "THREAT" "phantom_process_killer.log"
+                        $killed++
+                    } catch { }
+                }
+            }
+        }
+    } catch { Write-AVLog "PhantomProcessKiller error: $_" "ERROR" "phantom_process_killer.log" }
+    return $killed
 }
 
 function Invoke-EventLogMonitoring {
@@ -11802,6 +12133,12 @@ try {
         exit 0
     }
 
+    if ($SelfTest) {
+        Test-Configuration
+        Invoke-SelfTest
+        exit 0
+    }
+
     # Check for administrator privileges
     $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     
@@ -11820,19 +12157,7 @@ try {
     Write-Host "`nAntivirus Protection (Single File)`n" -ForegroundColor Cyan
     Write-StabilityLog "=== Antivirus Starting ==="
 
-    Test-Configuration
-
-    if ((Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).BootupState -match "Safe|Fail-safe") {
-        if (-not $Config.ForceQuarantineInSafeMode) {
-            Write-Host "[!] Safe Mode detected - AutoQuarantine disabled to prevent system instability" -ForegroundColor Yellow
-            $Config.AutoQuarantine = $false
-            Write-StabilityLog "Safe Mode detected - quarantine disabled"
-        } else {
-            Write-Host "[!] Safe Mode detected - ForceQuarantineInSafeMode=true, quarantine enabled (advanced)" -ForegroundColor Yellow
-            Write-StabilityLog "Safe Mode with ForceQuarantineInSafeMode - quarantine enabled"
-        }
-    }
-
+    # Set LearningMode early so Test-ConfigurationSanity can detect conflicts
     if ($LearningMode) {
         $Script:LearningMode = $true
         $Config.AutoKillThreats = $false
@@ -11842,6 +12167,29 @@ try {
     } else {
         $Script:LearningMode = $false
     }
+
+    Test-Configuration
+
+    # Safe Mode detection: WMI BootupState or registry fallback
+    $safeMode = $false
+    try {
+        $bootState = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).BootupState
+        if ($bootState -match "Safe|Fail-safe") { $safeMode = $true }
+    } catch {}
+    if (-not $safeMode -and (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Control\SafeBoot\Option")) {
+        try {
+            $opt = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SafeBoot\Option" -Name "OptionValue" -ErrorAction SilentlyContinue
+            if ($opt.OptionValue -in @(1, 2)) { $safeMode = $true }
+        } catch {}
+    }
+    if ($safeMode) {
+        Write-Host "[!] Safe Mode detected - disabling auto-actions to prevent system instability" -ForegroundColor Yellow
+        if (-not $Config.ForceQuarantineInSafeMode) { $Config.AutoQuarantine = $false }
+        $Config.AutoKillThreats = $false
+        $Config.EnableUnsignedDLLScanner = $false
+        Write-StabilityLog "Safe Mode - AutoKillThreats, AutoQuarantine, UnsignedDLLScanner disabled"
+    }
+
     $global:AntivirusPIDFilePath = $Config.PIDFilePath
 
     Write-StabilityLog "Executing script path: $PSCommandPath" "INFO"
@@ -11923,6 +12271,10 @@ Write-Host "[PROTECTION] Anti-termination safeguards active" -ForegroundColor Gr
         "USBMonitoring",
         "MobileDeviceMonitoring",
         "AttackToolsDetection",
+        "PUADetection",
+        "PUPDetection",
+        "PUMDetection",
+        "PhantomProcessKiller",
         "AdvancedThreatDetection",
         "EventLogMonitoring",
         "FirewallRuleMonitoring",
