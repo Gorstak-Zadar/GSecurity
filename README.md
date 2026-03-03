@@ -304,7 +304,7 @@ $Config = @{
     LowPowerMode = $false         # Doubles intervals to reduce CPU/RAM
 
     # PUA/PUP (may flag TeamViewer, AnyDesk - whitelist if needed)
-    AutoKillPUA = $false          # Auto-kill PUA (RATs) - miners use AutoKillCryptoMiners
+    AutoKillPUA = $true          # Auto-kill PUA (RATs) - miners use AutoKillCryptoMiners
     AutoKillCryptoMiners = $true  # Auto-kill crypto miners
 }
 ```
@@ -565,7 +565,7 @@ C:\ProgramData\Antivirus/
 | 📦 **File Quarantine** | EDR may quarantine legitimate files — review logs regularly |
 | 🔐 **Permission Changes** | Critical system files have permissions hardened |
 | 🛡️ **SMB Disabled** | LanmanWorkstation/Server disabled (may affect network shares) |
-| 🚫 **PUA Detection** | May flag legitimate remote access tools (TeamViewer, AnyDesk) — set AutoKillPUA=$false |
+| 🚫 **PUA Detection** | May flag legitimate remote access tools (TeamViewer, AnyDesk) — set AutoKillPUA=$true |
 | ⛏️ **Crypto Miner Auto-Kill** | Crypto miners terminated by default (AutoKillCryptoMiners=$true) |
 
 ### ✅ Best Practices
