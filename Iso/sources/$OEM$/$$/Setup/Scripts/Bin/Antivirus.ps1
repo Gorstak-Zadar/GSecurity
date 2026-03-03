@@ -17,6 +17,7 @@ param(
 #   v2.2.0 - Claude improvements (hash DB locking, FSW debounce, Invoke-Response)
 #   v2.3.0 - DeepSeek: Safe Mode detection, system path protection in UnsignedDLLRemover
 #   v2.4.0 - Grok: EICARHash/ForceQuarantineInSafeMode in Config, cache size limits, RTFM temp exclusions
+#   v2.5.0 - Expanded scope: all local/removable/network drive roots; RTFM runs Cymru/MalwareBazaar on new files
 #
 # Dependencies: PowerShell 5.1+, Windows (WMI, EventLog, .NET)
 #
@@ -164,6 +165,12 @@ $Config = @{
     # Centralized threat hashes (Grok: reduce magic strings)
     EICARHash = "275A021BBFB6489E54D471899F7DB9D1663FC695EC2FE2A2C4538AABF651FD0F"
     ForceQuarantineInSafeMode = $false # Advanced: override Safe Mode quarantine disable
+
+    # Scan scope: expand detections to all drive types (catches e.g. mimikatz on D:\ root)
+    ScanLocalDrives = $true       # Include local fixed drives (C:\, D:\, etc.) root + shallow
+    ScanRemovableDrives = $true   # Include removable drives (USB) root + shallow
+    ScanNetworkDrives = $true     # Include mapped network shares root + shallow (may be slow)
+    DriveRootScanDepth = 1        # 0 = root only, 1 = root + one subdir level
 }
 
 $Script:MonitoredExtensions = @(
@@ -204,6 +211,28 @@ $Script:MonitoredExtensions = @(
     '.arc','.appref-ms','.application','.app','.air','.adp','.adn','.ade',
     '.ad','.acm','.accdu','.accdt','.accdr','.accde','.accda','.c','.h'
 )
+
+function Get-DriveRootsForScan {
+    # Returns drive roots to scan based on Config (ScanLocalDrives, ScanRemovableDrives, ScanNetworkDrives)
+    $roots = @()
+    $scanLocal = if ($null -ne $Config.ScanLocalDrives) { $Config.ScanLocalDrives } else { $true }
+    $scanRemovable = if ($null -ne $Config.ScanRemovableDrives) { $Config.ScanRemovableDrives } else { $true }
+    $scanNetwork = if ($null -ne $Config.ScanNetworkDrives) { $Config.ScanNetworkDrives } else { $true }
+    try {
+        $disks = Get-CimInstance -ClassName Win32_LogicalDisk -ErrorAction SilentlyContinue
+        foreach ($disk in $disks) {
+            if (-not $disk.DeviceID) { continue }
+            $path = $disk.DeviceID.TrimEnd(':') + ":\"
+            switch ($disk.DriveType) {
+                2 { if ($scanRemovable) { $roots += $path } }  # Removable
+                3 { if ($scanLocal) { $roots += $path } }      # Local fixed
+                4 { if ($scanNetwork) { $roots += $path } }    # Network
+                default { }
+            }
+        }
+    } catch { }
+    return $roots
+}
 
 # <CHANGE> Add graceful elevation check function (insert after $Config block, ~line 99)
 function Test-IsAdmin {
@@ -1506,6 +1535,20 @@ function Invoke-HashDetection {
     $maxFiles = if ($Config.MaxFilesPerScan -gt 0) { $Config.MaxFilesPerScan } else { 500 }
     $Files = @(Get-ChildItem -Path $SuspiciousPaths -Include *.exe,*.dll,*.scr,*.vbs,*.ps1,*.bat,*.cmd,*.com,*.msi,*.hta,*.js,*.jse,*.wsf,*.wsh -Recurse -ErrorAction SilentlyContinue | Select-Object -First $maxFiles)
 
+    # Tier 2: Drive roots (local, removable, network) - shallow scan to catch drops like D:\mimikatz.exe
+    $driveRoots = Get-DriveRootsForScan
+    $depth = if ($Config.DriveRootScanDepth -ge 0) { $Config.DriveRootScanDepth } else { 1 }
+    $extensions = @('*.exe','*.dll','*.scr','*.vbs','*.ps1','*.bat','*.cmd','*.com','*.msi','*.hta','*.js','*.jse','*.wsf','*.wsh')
+    foreach ($root in $driveRoots) {
+        if ($Files.Count -ge $maxFiles) { break }
+        if (-not (Test-Path $root -ErrorAction SilentlyContinue)) { continue }
+        try {
+            $remaining = $maxFiles - $Files.Count
+            $rootFiles = Get-ChildItem -Path $root -Include $extensions -Recurse -Depth $depth -File -ErrorAction SilentlyContinue | Select-Object -First $remaining
+            $Files = @($Files) + @($rootFiles)
+        } catch { }
+    }
+
     # Local known-bad hashes (includes EICAR test file and common malware)
     $eicarHash = if ($Config.EICARHash) { $Config.EICARHash } else { "275A021BBFB6489E54D471899F7DB9D1663FC695EC2FE2A2C4538AABF651FD0F" }
     $KnownBadHashes = @{
@@ -1705,6 +1748,18 @@ function Invoke-TinyThreatScan {
             $remaining = $maxFiles - $filesToScan.Count
             $filesToScan += @(Get-ChildItem -Path $folder -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First $remaining)
         }
+    }
+    # Tier 2: Drive roots (local, removable, network) - shallow scan
+    $driveRoots = Get-DriveRootsForScan
+    $depth = if ($Config.DriveRootScanDepth -ge 0) { $Config.DriveRootScanDepth } else { 1 }
+    foreach ($root in $driveRoots) {
+        if ($filesToScan.Count -ge $maxFiles) { break }
+        if (-not (Test-Path $root -ErrorAction SilentlyContinue)) { continue }
+        try {
+            $remaining = $maxFiles - $filesToScan.Count
+            $rootFiles = Get-ChildItem -Path $root -Recurse -File -Depth $depth -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in $Script:MonitoredExtensions } | Select-Object -First $remaining
+            $filesToScan += @($rootFiles)
+        } catch { }
     }
     foreach ($f in $filesToScan) { Invoke-TinyThreatAnalysis -FilePath $f.FullName }
     Write-Output "[TinyThreatScan] Scan cycle completed. Files in cache: $($Script:KnownFilesCache.Count)"
@@ -2105,6 +2160,41 @@ function Invoke-SystemWideAdvancedThreatDetection {
                             }
                             
                             # Auto-quarantine
+                            if ($Config.AutoQuarantine -and $detectionResult.Risk -in @("HIGH", "CRITICAL")) {
+                                try {
+                                    Move-ToQuarantine -FilePath $file.FullName -Reason "Advanced threat detected: $($detectionResult.ThreatName)"
+                                    Write-AVLog "Quarantined advanced threat: $($file.Name)" "THREAT" "advanced_threat_detection.log"
+                                } catch { }
+                            }
+                        }
+                    } catch { }
+                }
+            } catch { }
+        }
+        
+        # Tier 2: Drive roots (local, removable, network) - shallow scan for dropped executables
+        $driveRoots = Get-DriveRootsForScan
+        $depth = if ($Config.DriveRootScanDepth -ge 0) { $Config.DriveRootScanDepth } else { 1 }
+        foreach ($root in $driveRoots) {
+            if (-not (Test-Path $root -ErrorAction SilentlyContinue)) { continue }
+            try {
+                $exeFiles = Get-ChildItem -Path $root -Filter "*.exe" -Recurse -Depth $depth -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Length -lt 50MB } |
+                    Select-Object -First 30
+                foreach ($file in $exeFiles) {
+                    try {
+                        $detectionResult = Invoke-AdvancedThreatDetection -FilePath $file.FullName -FileSignatures $threatSignatures -CheckEntropy $true
+                        if ($detectionResult.IsThreat) {
+                            $threats += @{
+                                Type = "Advanced Threat File Detected: $($detectionResult.ThreatName)"
+                                FilePath = $file.FullName
+                                FileName = $file.Name
+                                DetectionMethods = $detectionResult.DetectionMethods -join ", "
+                                Confidence = $detectionResult.Confidence
+                                Risk = $detectionResult.Risk
+                                Details = $detectionResult.Details
+                                Timestamp = Get-Date
+                            }
                             if ($Config.AutoQuarantine -and $detectionResult.Risk -in @("HIGH", "CRITICAL")) {
                                 try {
                                     Move-ToQuarantine -FilePath $file.FullName -Reason "Advanced threat detected: $($detectionResult.ThreatName)"
@@ -11399,6 +11489,8 @@ function Invoke-RealTimeFileMonitor {
                     } catch { Remove-Item -Path $path -Force -ErrorAction SilentlyContinue }
                 }
             } else {
+                # Run full threat analysis (Cymru, MalwareBazaar, cache) on new/changed executables
+                Invoke-TinyThreatAnalysis -FilePath $path
                 $rtLog = "$logPath\realtime_monitor_$(Get-Date -Format 'yyyy-MM-dd').log"
                 "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|Created/Changed|$path|$hash" | Add-Content -Path $rtLog -ErrorAction SilentlyContinue
             }
