@@ -20,7 +20,7 @@ param(
 #   v2.4.0 - Grok: EICARHash/ForceQuarantineInSafeMode in Config, cache size limits, RTFM temp exclusions
 #   v2.5.0 - Expanded scope: all local/removable/network drive roots; RTFM runs Cymru/MalwareBazaar on new files
 #   v2.6.0 - Invoke-WithRetry, Test-ConfigurationSanity, Invoke-SelfTest, Invoke-GracefulShutdown, Safe Mode enhancement
-#   v2.7.0 - PUA/PUP/PUM detection, Phantom Process Killer
+#   v2.8.0 - Deeper drive scan (depth 2), expanded Tier 1 paths (Desktop, Public, ProgramData)
 #
 # Dependencies: PowerShell 5.1+, Windows (WMI, EventLog, .NET)
 #
@@ -178,7 +178,7 @@ $Config = @{
     ScanLocalDrives = $true       # Include local fixed drives (C:\, D:\, etc.) root + shallow
     ScanRemovableDrives = $true   # Include removable drives (USB) root + shallow
     ScanNetworkDrives = $true     # Include mapped network shares root + shallow (may be slow)
-    DriveRootScanDepth = 1        # 0 = root only, 1 = root + one subdir level
+    DriveRootScanDepth = 2        # 0 = root only, 1 = root+1 level, 2 = root+2 levels (deeper = more coverage, slower)
 
     # PUA/PUP response (may flag legitimate tools like TeamViewer)
     AutoKillPUA = $true          # Auto-kill PUA (RATs, miners) - set $false to avoid killing Teamviewer, Anydesk, etc
@@ -1583,7 +1583,7 @@ function Show-ThreatToast {
         Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
         $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
         $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
-        $appId = if ($Config.EDRName) { $Config.EDRName } else { "GShield" }
+        $appId = if ($Config.EDRName) { $Config.EDRName } else { "GSecurity" }
         $msgShort = if ($Message.Length -gt 80) { $Message.Substring(0, 77) + "..." } else { $Message }
         $xml = @"
 <toast>
@@ -1720,11 +1720,14 @@ function Invoke-HashDetection {
     }
 
     $SuspiciousPaths = @(
-        "$env:TEMP\*",
-        "$env:APPDATA\*",
-        "$env:LOCALAPPDATA\Temp\*",
-        "C:\Windows\Temp\*",
-        "$env:USERPROFILE\Downloads\*"
+        "$env:TEMP",
+        "$env:APPDATA",
+        "$env:LOCALAPPDATA\Temp",
+        "C:\Windows\Temp",
+        "$env:USERPROFILE\Downloads",
+        "$env:USERPROFILE\Desktop",
+        "$env:PUBLIC",
+        "$env:ProgramData"
     )
 
     $maxFiles = if ($Config.MaxFilesPerScan -gt 0) { $Config.MaxFilesPerScan } else { 500 }
@@ -1732,7 +1735,7 @@ function Invoke-HashDetection {
 
     # Tier 2: Drive roots (local, removable, network) - shallow scan to catch drops like D:\mimikatz.exe
     $driveRoots = Get-DriveRootsForScan
-    $depth = if ($Config.DriveRootScanDepth -ge 0) { $Config.DriveRootScanDepth } else { 1 }
+    $depth = if ($Config.DriveRootScanDepth -ge 0) { $Config.DriveRootScanDepth } else { 2 }
     $extensions = @('*.exe','*.dll','*.scr','*.vbs','*.ps1','*.bat','*.cmd','*.com','*.msi','*.hta','*.js','*.jse','*.wsf','*.wsh')
     foreach ($root in $driveRoots) {
         if ($Files.Count -ge $maxFiles) { break }
@@ -1935,7 +1938,7 @@ function Invoke-TinyThreatAnalysis {
 
 function Invoke-TinyThreatScan {
     $maxFiles = if ($Config.MaxFilesPerScan -gt 0) { $Config.MaxFilesPerScan } else { 500 }
-    $highRiskFolders = @("$env:USERPROFILE\Downloads", "$env:USERPROFILE\Desktop", "$env:TEMP", "$env:APPDATA", "$env:LOCALAPPDATA\Temp")
+    $highRiskFolders = @("$env:USERPROFILE\Downloads", "$env:USERPROFILE\Desktop", "$env:TEMP", "$env:APPDATA", "$env:LOCALAPPDATA\Temp", "$env:PUBLIC", "$env:ProgramData")
     $filesToScan = @()
     foreach ($folder in $highRiskFolders) {
         if ($filesToScan.Count -ge $maxFiles) { break }
@@ -1946,7 +1949,7 @@ function Invoke-TinyThreatScan {
     }
     # Tier 2: Drive roots (local, removable, network) - shallow scan
     $driveRoots = Get-DriveRootsForScan
-    $depth = if ($Config.DriveRootScanDepth -ge 0) { $Config.DriveRootScanDepth } else { 1 }
+    $depth = if ($Config.DriveRootScanDepth -ge 0) { $Config.DriveRootScanDepth } else { 2 }
     foreach ($root in $driveRoots) {
         if ($filesToScan.Count -ge $maxFiles) { break }
         if (-not (Test-Path $root -ErrorAction SilentlyContinue)) { continue }
@@ -2369,7 +2372,7 @@ function Invoke-SystemWideAdvancedThreatDetection {
         
         # Tier 2: Drive roots (local, removable, network) - shallow scan for dropped executables
         $driveRoots = Get-DriveRootsForScan
-        $depth = if ($Config.DriveRootScanDepth -ge 0) { $Config.DriveRootScanDepth } else { 1 }
+        $depth = if ($Config.DriveRootScanDepth -ge 0) { $Config.DriveRootScanDepth } else { 2 }
         foreach ($root in $driveRoots) {
             if (-not (Test-Path $root -ErrorAction SilentlyContinue)) { continue }
             try {
