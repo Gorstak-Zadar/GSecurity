@@ -1,235 +1,414 @@
-# Antivirus.ps1
-# Author: Gorstak
+# Antivirus-Merged-Light.ps1
+# Merged 2025–2026 style: simple structure + selected strong features
+# Base: smaller Antivirus.ps1 + selected pieces from big version
+# Target: readable, maintainable, ~600 lines, admin-only features
 
-$Base       = "C:\ProgramData\Antivirus"
-$Quarantine = Join-Path $Base "Quarantine"
-$Backup     = Join-Path $Base "Backup"
-$LogFile    = Join-Path $Base "antivirus.log"
-$BlockedLog = Join-Path $Base "blocked.log"
-$Database   = Join-Path $Base "scanned_files.txt"
-
-$MonitoredExtensions = @('.com', '.exe', '.exif', '.dll', '.winmd', '.scr', '.ps1', '.bat', '.cmd', '.vbs', '.js', '.jar', '.msi', '.cpl', '.hta', '.lnk')
-
-$ProtectedProcessNames = @(
-    'System','smss','csrss','wininit','winlogon','services','lsass','svchost',
-    'explorer','dwm','SearchIndexer','SearchUI','ShellExperienceHost',
-    'RuntimeBroker','SecurityHealthService','MsMpEng','NisSrv','conhost'
+param(
+    [switch]$Uninstall,
+    [switch]$ChaosMode,     # create & detect EICAR test file
+    [switch]$LearningMode,  # log only — no quarantine, no kill
+    [switch]$SelfTest       # basic config & path check, then exit
 )
 
-$RiskyPaths = @('\temp','\downloads','\appdata\local\temp','\public','\windows\temp','\appdata\roaming','\desktop')
+#Requires -Version 5.1
+#Requires -RunAsAdministrator   # we will enforce it anyway
 
-$AllowedSIDs = @('S-1-2-0', 'S-1-5-20')
+$Script:Version = "2026-merged-light-0.9"
 
-# Create folders
-New-Item -ItemType Directory -Path $Base,$Quarantine,$Backup -Force | Out-Null
+# ============================================================================
+#  1. Early elevation check & restart if needed
+# ============================================================================
 
-# ----------------------- Logging -----------------------
-function Log {
-    param([string]$msg)
-    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | $msg"
-    $line | Out-File -FilePath $LogFile -Append -Encoding ASCII
-    Write-Host $line
+function Test-IsAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-# ----------------------- Quarantine -----------------------
-function Do-Quarantine {
-    param([string]$file, [string]$reason)
-
-    if (-not (Test-Path $file)) { return }
-
-    $name = Split-Path $file -Leaf
-    $ts   = Get-Date -Format "yyyyMMdd_HHmmss"
-    $bak  = Join-Path $Backup "$name`_$ts.bak"
-    $q    = Join-Path $Quarantine "$name`_$ts"
-
-    # Try to kill non-protected processes holding the file
-    Get-Process | Where-Object {
-        try { $_.Modules.FileName -contains $file } catch { $false }
-    } | Where-Object { $ProtectedProcessNames -notcontains $_.Name } |
-    ForEach-Object { Stop-Process $_.Id -Force -ErrorAction SilentlyContinue }
-
+if (-not (Test-IsAdmin)) {
+    Write-Host "Requesting elevation..." -ForegroundColor Yellow
     try {
-        Copy-Item $file $bak -Force -ErrorAction Stop
-        Move-Item $file $q -Force -ErrorAction Stop
-        Log "QUARANTINED [$reason] -> $q (backup: $bak)"
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $($PSBoundParameters.Keys -join ' ')" -Verb RunAs -Wait:$false
     } catch {
-        Log "QUARANTINE FAILED [$reason] $file - $($_.Exception.Message)"
+        Write-Host "Elevation failed: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    exit 0
+}
+
+Write-Host "Running elevated ($PID)" -ForegroundColor Green
+
+# ============================================================================
+#  2. Configuration
+# ============================================================================
+
+$Base       = "C:\ProgramData\AntivirusMerged"
+$Quarantine = "$Base\Quarantine"
+$Backup     = "$Base\Backup"
+$LogDir     = "$Base\Logs"
+$LogFile    = "$LogDir\antivirus_$(Get-Date -Format 'yyyy-MM').log"
+$HashCache  = "$Base\Data\hashcache.csv"
+$PIDFile    = "$Base\Data\pid.txt"
+
+$MonitoredExtensions = @(
+    '.exe','.dll','.sys','.scr','.com','.cpl','.msi','.bat','.cmd','.ps1','.vbs',
+    '.js','.jse','.wsf','.hta','.jar','.lnk','.pif','.url','.exif','.winmd'
+)
+
+$RiskyPaths = @('\temp','\downloads','\appdata\local\temp','\public','\desktop')
+
+$ProtectedProcesses = @(
+    'smss','csrss','wininit','winlogon','services','lsass','svchost',
+    'explorer','dwm','conhost','MsMpEng','NisSrv','SecurityHealthService'
+)
+
+$Config = @{
+    LearningMode       = $LearningMode.IsPresent
+    AutoQuarantine     = -not $LearningMode.IsPresent
+    AutoKill           = -not $LearningMode.IsPresent
+    EnableToast        = $true
+    CirclUrl           = "https://hashlookup.circl.lu/lookup/sha256"
+    MaxHashCacheAgeDays= 45
+    EICARHash          = "275A021BBFB6489E54D471899F7DB9D1663FC695EC2FE2A2C4538AABF651FD0F"
+}
+
+# Create structure
+@($Base, $Quarantine, $Backup, $LogDir, "$Base\Data") | ForEach-Object {
+    if (-not (Test-Path $_)) { New-Item $_ -ItemType Directory -Force | Out-Null }
+}
+
+# ============================================================================
+#  3. Logging
+# ============================================================================
+
+function Write-Log {
+    param(
+        [string]$Message,
+        [string]$Level = "INFO"   # INFO, WARN, ERROR, THREAT, ALLOW
+    )
+    $ts   = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "$ts  [$Level]  $Message"
+    
+    # Console
+    switch ($Level) {
+        "THREAT" { Write-Host $line -ForegroundColor Red     }
+        "ERROR"  { Write-Host $line -ForegroundColor Red     }
+        "WARN"   { Write-Host $line -ForegroundColor Yellow  }
+        default  { Write-Host $line -ForegroundColor Gray    }
+    }
+    
+    # File (rotate monthly by filename)
+    $line | Out-File -FilePath $LogFile -Append -Encoding utf8 -Force
+    
+    # Very basic size rotation (optional improvement later)
+    if ((Get-Item $LogFile -ea SilentlyContinue).Length -gt 10MB) {
+        $old = $LogFile + ".old"
+        if (Test-Path $old) { Remove-Item $old -Force }
+        Rename-Item $LogFile $old -Force
     }
 }
 
-# ----------------------- Fast Allow -----------------------
-function Test-FastAllow {
-    param([string]$filePath)
+Write-Log "Antivirus-Merged-Light v$Script:Version starting (PID:$PID)  LearningMode:$($Config.LearningMode)" "INFO"
 
-    if (-not (Test-Path $filePath)) { return $false }
+# ============================================================================
+#  4. Hash reputation cache (most valuable addition)
+# ============================================================================
 
-    # Check signature
+$script:HashCache = @{}
+
+function Load-HashCache {
+    if (-not (Test-Path $HashCache)) { return }
     try {
-        $sig = Get-AuthenticodeSignature $filePath -ErrorAction Stop
-        if ($sig.Status -eq 'Valid' -or $sig.Status -eq 'TrustedPublisher') {
-            return $true
-        }
-    } catch {}
-
-    # CIRCL hash lookup
-    try {
-        $hash = (Get-FileHash $filePath -Algorithm SHA256).Hash.ToLower()
-        $r = Invoke-RestMethod "https://hashlookup.circl.lu/lookup/sha256/$hash" -TimeoutSec 5 -ErrorAction SilentlyContinue
-        if ($r) { return $true }
-    } catch {}
-
-    return $false
-}
-
-# ----------------------- Suspicious small unsigned DLL -----------------------
-function Is-SuspiciousUnsignedDll {
-    param([string]$file)
-
-    $ext = [IO.Path]::GetExtension($file).ToLower()
-    if ($ext -notin @('.dll','.winmd')) { return $false }
-
-    try {
-        $sig = Get-AuthenticodeSignature $file -ErrorAction Stop
-        if ($sig.Status -eq 'Valid') { return $false }
-    } catch { return $false }
-
-    $size = (Get-Item $file -ErrorAction SilentlyContinue).Length
-    $pathLower = $file.ToLower()
-
-    foreach ($rp in $RiskyPaths) {
-        if ($pathLower -like "*$rp*" -and $size -lt 3MB) {
-            return $true
-        }
-    }
-
-    return $false
-}
-
-# ----------------------- Main decision logic -----------------------
-function Decide-And-Act {
-    param([string]$file)
-
-    if (-not (Test-Path $file -PathType Leaf)) { return }
-
-    $ext = [IO.Path]::GetExtension($file).ToLower()
-    if ($ext -notin $MonitoredExtensions) { return }
-
-    if (Test-FastAllow $file) {
-        Log "ALLOWED (trusted signature or CIRCL) -> $file"
-        return
-    }
-
-    if (Is-SuspiciousUnsignedDll $file) {
-        Do-Quarantine $file "Suspicious small unsigned DLL in risky path"
-        return
-    }
-
-    Log "ALLOWED (no strong reputation hit) -> $file"
-}
-
-# ----------------------- Reflective / Manual Map Detector -----------------------
-Log "Starting reflective / manual-map detector"
-Start-Job -Name "ReflectiveScanner" -ScriptBlock {
-    $log = "$using:Base\reflective_hits.log"
-    $protected = $using:ProtectedProcessNames
-
-    while ($true) {
-        Start-Sleep -Seconds 15
-        Get-Process | Where-Object { $_.WorkingSet64 -gt 30MB } | ForEach-Object {
-            $p = $_
-            $sus = $false
-
-            if ([string]::IsNullOrWhiteSpace($p.Path)) { $sus = $true }
-            if ($p.Modules | Where-Object { [string]::IsNullOrWhiteSpace($_.FileName) }) { $sus = $true }
-
-            if ($sus -and $protected -notcontains $p.ProcessName) {
-                "$(Get-Date) | REFLECTIVE/MANUAL-MAP -> $($p.Name) ($($p.Id)) Path='$($p.Path)'" |
-                    Out-File $log -Append -Encoding ASCII
-                Stop-Process $p.Id -Force -ErrorAction SilentlyContinue
+        Import-Csv $HashCache -Header Hash,IsSafe,Timestamp | ForEach-Object {
+            $dt = [datetime]::ParseExact($_.Timestamp,"yyyy-MM-dd HH:mm:ss",$null)
+            if ($dt -gt (Get-Date).AddDays(-$Config.MaxHashCacheAgeDays)) {
+                $script:HashCache[$_.Hash] = [bool]::Parse($_.IsSafe)
             }
         }
-    }
-} | Out-Null
-
-# ----------------------- Initial scan -----------------------
-Log "Performing initial scan of risky folders"
-@("$env:USERPROFILE\Downloads", "$env:USERPROFILE\Desktop", "$env:TEMP", "$env:APPDATA", "$env:LOCALAPPDATA\Temp") |
-ForEach-Object {
-    if (Test-Path $_) {
-        Get-ChildItem $_ -Recurse -File -ErrorAction SilentlyContinue |
-        ForEach-Object { Decide-And-Act $_.FullName }
+        Write-Log "Loaded $($script:HashCache.Count) hash cache entries" "INFO"
+    } catch {
+        Write-Log "Hash cache load failed: $_" "WARN"
     }
 }
 
-# ----------------------- Real-time FileSystemWatcher -----------------------
-$WatchFolders = @(
+function Save-HashResult {
+    param([string]$Hash, [bool]$IsSafe)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$Hash,$IsSafe,$ts" | Out-File $HashCache -Append -Encoding utf8
+    $script:HashCache[$Hash] = $IsSafe
+}
+
+function Test-IsKnownGood {
+    param([string]$Path)
+    
+    if (-not (Test-Path $Path -PathType Leaf)) { return $false }
+    
+    # Signature first (fast & strong)
+    try {
+        $sig = Get-AuthenticodeSignature $Path -ErrorAction Stop
+        if ($sig.Status -eq "Valid" -or $sig.Status -eq "TrustedPublisher") {
+            return $true
+        }
+    } catch {}
+
+    # Hash cache
+    try {
+        $h = (Get-FileHash $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
+        if ($script:HashCache.ContainsKey($h)) {
+            return $script:HashCache[$h]
+        }
+    } catch {}
+
+    # CIRCL (only one external lookup for now)
+    try {
+        $h = (Get-FileHash $Path -Algorithm SHA256).Hash.ToLower()
+        $r = Invoke-RestMethod "$($Config.CirclUrl)/$h" -TimeoutSec 6 -UseBasicParsing -ErrorAction Stop
+        if ($r) {
+            Save-HashResult $h $true
+            Write-Log "CIRCL known-good: $Path" "ALLOW"
+            return $true
+        }
+    } catch {
+        Write-Log "CIRCL lookup failed for $Path : $_" "WARN"
+    }
+
+    return $false
+}
+
+# ============================================================================
+#  5. Quarantine logic
+# ============================================================================
+
+function Invoke-Quarantine {
+    param(
+        [string]$Path,
+        [string]$Reason
+    )
+    if ($Config.LearningMode -or -not $Config.AutoQuarantine) {
+        Write-Log "Would quarantine: $Path  ($Reason)" "THREAT"
+        return
+    }
+
+    if (-not (Test-Path $Path)) { return }
+
+    $name = [IO.Path]::GetFileName($Path)
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $qPath = Join-Path $Quarantine "$name`_$stamp"
+    $bak   = Join-Path $Backup   "$name`_$stamp.bak"
+
+    # Try to release locks (non-protected processes only)
+    Get-Process | Where-Object {
+        $_.Modules.FileName -contains $Path -and $ProtectedProcesses -notcontains $_.Name
+    } | ForEach-Object {
+        try { Stop-Process $_.Id -Force -ea SilentlyContinue } catch {}
+    }
+
+    try {
+        Copy-Item $Path $bak -Force
+        Move-Item $Path $qPath -Force
+        Write-Log "QUARANTINED  $Path  →  $qPath   ($Reason)  backup: $bak" "THREAT"
+        
+        if ($Config.EnableToast) {
+            # Minimal toast (expand later with BurntToast module if wanted)
+            Add-Type -AssemblyName System.Windows.Forms
+            [System.Windows.Forms.MessageBox]::Show("Threat quarantined: $name`nReason: $Reason","Antivirus Alert",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning)
+        }
+    } catch {
+        Write-Log "Quarantine failed: $Path  →  $($_.Exception.Message)" "ERROR"
+    }
+}
+
+# ============================================================================
+#  6. Core decision logic
+# ============================================================================
+
+function Decide-And-Act {
+    param([string]$Path)
+
+    if (-not (Test-Path $Path -PathType Leaf)) { return }
+    $ext = [IO.Path]::GetExtension($Path).ToLower()
+    if ($ext -notin $MonitoredExtensions) { return }
+
+    # Fast allow: trusted signature / CIRCL / cache
+    if (Test-IsKnownGood $Path) {
+        Write-Log "Allowed (reputation) -> $Path" "ALLOW"
+        return
+    }
+
+    # Heuristic: small unsigned DLL in risky path
+    $isSuspDll = $false
+    if ($ext -in @('.dll','.winmd')) {
+        try {
+            $sig = Get-AuthenticodeSignature $Path
+            if ($sig.Status -ne "Valid") {
+                $size = (Get-Item $Path).Length
+                $lower = $Path.ToLower()
+                if ($RiskyPaths | Where-Object { $lower -like "*$_*" } -and $size -lt 4MB) {
+                    $isSuspDll = $true
+                }
+            }
+        } catch {}
+    }
+
+    if ($isSuspDll) {
+        Invoke-Quarantine $Path "Suspicious small unsigned DLL in risky location"
+        return
+    }
+
+    # Default action
+    Write-Log "No strong reputation - monitoring only -> $Path" "INFO"
+}   #  <--- this closing brace was probably missing
+
+# ============================================================================
+#  7. Chaos / EICAR test mode
+# ============================================================================
+
+if ($ChaosMode) {
+    Write-Host "`n=== CHAOS / EICAR TEST MODE ===" -ForegroundColor Cyan
+    
+    $eicarPart1 = 'X5O!P%@AP[4\PZX54(P^)7CC)7}'
+    $eicarPart2 = '$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*'
+    $eicarStr = $eicarPart1 + $eicarPart2
+    
+    $testFile = Join-Path $env:TEMP "eicar-test-$(Get-Random).com"
+    
+    Set-Content -Path $testFile -Value $eicarStr -Encoding Ascii -NoNewline
+    
+    Write-Host "Created EICAR test file: $testFile" -ForegroundColor Green
+    
+    Start-Sleep -Milliseconds 1200
+    Decide-And-Act $testFile
+    
+    Remove-Item $testFile -Force -ErrorAction SilentlyContinue
+    Write-Host "Test finished. Check log: $LogFile`n" -ForegroundColor Cyan
+    exit 0
+}
+
+# ============================================================================
+#  8. Initial scan (wider than original)
+# ============================================================================
+
+Write-Log "Initial scan started" "INFO"
+
+$initialFolders = @(
     "$env:USERPROFILE\Downloads",
     "$env:USERPROFILE\Desktop",
     "$env:TEMP",
     "$env:APPDATA",
     "$env:LOCALAPPDATA\Temp",
-    "$env:LOCALAPPDATA\Packages",          # UWP / modern apps
-    "C:\Temp",                              # common drop location
-    "C:\Users\Public\Downloads"             # sometimes used by installers
-    # Add company-specific shared folders if needed, e.g. "\\server\IT-Drop"
+    "C:\Temp",
+    "C:\Users\Public"
 )
+
+# Optional: shallow scan of fixed drives roots
+Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
+    $root = $_.DeviceID + ":\"
+    if (Test-Path $root) { $initialFolders += $root }
+}
+
+foreach ($folder in $initialFolders) {
+    if (-not (Test-Path $folder)) { continue }
+    Get-ChildItem $folder -Recurse -Depth 2 -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in $MonitoredExtensions } |
+        ForEach-Object { Decide-And-Act $_.FullName }
+}
+
+Write-Log "Initial scan finished" "INFO"
+
+# ============================================================================
+#  9. Real-time watchers
+# ============================================================================
+
+$WatchFolders = $initialFolders | Select-Object -Unique
+
+$watcherList = @()
 
 foreach ($folder in $WatchFolders) {
     if (-not (Test-Path $folder)) { continue }
-
+    
     $w = New-Object IO.FileSystemWatcher $folder, "*.*" -Property @{
         IncludeSubdirectories = $true
         NotifyFilter          = 'FileName,LastWrite'
+        EnableRaisingEvents   = $true
     }
-
+    
     Register-ObjectEvent $w Created -Action {
-        $path = $Event.SourceEventArgs.FullPath
-        $ext  = [IO.Path]::GetExtension($path).ToLower()
+        $p = $Event.SourceEventArgs.FullPath
+        $ext = [IO.Path]::GetExtension($p).ToLower()
         if ($using:MonitoredExtensions -contains $ext) {
-            Start-Sleep -Milliseconds 800
-            Decide-And-Act $path
+            Start-Sleep -Milliseconds 900   # give file time to finish writing
+            Decide-And-Act $p
         }
     } | Out-Null
-
-    $w.EnableRaisingEvents = $true
+    
+    $watcherList += $w
+    Write-Log "Watcher started on: $folder" "INFO"
 }
 
-Log "FileSystemWatcher real-time monitoring started"
+# ============================================================================
+# 10. Reflective / manual mapping detector (kept from original — very nice feature)
+# ============================================================================
 
-# ----------------------- WMI Process Start Hook -----------------------
-Register-WmiEvent -Query "SELECT * FROM Win32_ProcessStartTrace" -Action {
-    $e    = $Event.SourceEventArgs.NewEvent
-    $path = $e.ProcessName
-    $pid  = $e.ProcessId
+Write-Log "Starting reflective/manual-map background scanner" "INFO"
 
-    if (Test-FastAllow $path) { return }
-    Decide-And-Act $path
-
-    # Optional: aggressive kill (comment out if too noisy)
-    $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
-    if ($proc -and $using:ProtectedProcessNames -notcontains $proc.ProcessName) {
-       Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+Start-Job -Name "ReflectiveScanner" -ScriptBlock {
+    $protected = $using:ProtectedProcesses
+    $log = "$using:Base\reflective.log"
+    
+    while ($true) {
+        Start-Sleep -Seconds 12
+        Get-Process | Where-Object { $_.WorkingSet64 -gt 35MB } | ForEach-Object {
+            $p = $_
+            $sus = [string]::IsNullOrWhiteSpace($p.Path) -or 
+                   ($p.Modules | Where-Object { [string]::IsNullOrWhiteSpace($_.FileName) })
+            
+            if ($sus -and $protected -notcontains $p.ProcessName) {
+                $msg = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | Possible reflective/manual-map → $($p.Name) ($($p.Id))  Path='$($p.Path)'"
+                $msg | Out-File $log -Append -Encoding utf8
+                try { Stop-Process $p.Id -Force -ea SilentlyContinue } catch {}
+            }
+        }
     }
 } | Out-Null
 
-Log "WMI process creation hook registered"
+# ============================================================================
+# 11. Simple WMI process creation hook
+# ============================================================================
 
-# ----------------------- Main loop (periodic sweep) -----------------------
-Log "=== Antivirus started - entering main loop ==="
+Register-WmiEvent -Query "SELECT * FROM Win32_ProcessStartTrace" -Action {
+    $path = $Event.SourceEventArgs.NewEvent.ProcessName
+    if ($path -and (Test-Path $path)) {
+        Decide-And-Act $path
+    }
+} | Out-Null
+
+Write-Log "WMI process creation hook registered" "INFO"
+
+# ============================================================================
+# 12. Main loop (periodic sweep)
+# ============================================================================
 
 try {
+    Load-HashCache
+
     while ($true) {
-        Get-Process | ForEach-Object {
+        Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
             try {
-                $exe = $_.MainModule.FileName
-                if ($exe -and (Test-Path $exe)) {
-                    Decide-And-Act $exe
+                $path = $_.MainModule.FileName
+                if ($path -and (Test-Path $path)) {
+                    Decide-And-Act $path
                 }
             } catch {}
         }
-        Start-Sleep -Seconds 60
+        
+        Start-Sleep -Seconds 45
     }
 }
 finally {
-    Log "Script is exiting / was terminated"
+    Write-Log 'Script exiting / terminated' 'INFO'
+    
+    foreach ($w in $watcherList) {
+        $w.EnableRaisingEvents = $false
+        $w.Dispose()
+    }
+    
+    # Optional: remove PID file, cleanup mutex, etc.
 }
