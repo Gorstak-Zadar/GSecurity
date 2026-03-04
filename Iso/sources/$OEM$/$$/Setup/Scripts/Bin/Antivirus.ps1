@@ -20,9 +20,10 @@ param(
 #   v2.4.0 - Grok: EICARHash/ForceQuarantineInSafeMode in Config, cache size limits, RTFM temp exclusions
 #   v2.5.0 - Expanded scope: all local/removable/network drive roots; RTFM runs Cymru/MalwareBazaar on new files
 #   v2.6.0 - Invoke-WithRetry, Test-ConfigurationSanity, Invoke-SelfTest, Invoke-GracefulShutdown, Safe Mode enhancement
-#   v2.8.0 - Deeper drive scan (depth 2), expanded Tier 1 paths (Desktop, Public, ProgramData)
-#   v2.9.0 - Documents scripts merge: Spoofer, BCD cleanup, Credential hardening, CVE Reapply/DryRun,
-#            takeown/icacls fallback, ShadowProxy toast, DragonBreathHunter, Password rotator (auto-install, flag when done)
+#   v2.7.0 - PUA/PUP/PUM detection, Phantom Process Killer
+#   v2.8.0 - Deeper drive scan (depth 2), expanded Tier 1 paths (Desktop, Public, ProgramData), elevation flag cleanup
+#   v2.9.0 - Documents scripts merge: Spoofer (full PrivacyForge), BCD cleanup, Credential hardening, CVE Reapply/DryRun,
+#            takeown/icacls quarantine fallback, ShadowProxy toast, DragonBreathHunter, Password rotator (auto-install, flag when done)
 #
 # Dependencies: PowerShell 5.1+, Windows (WMI, EventLog, .NET)
 #
@@ -189,11 +190,11 @@ $Config = @{
 
     EnableThreatToastNotifications = $true  # Show Windows toast when threat is quarantined/terminated
 
-    EnableBCDCleanup = $true
-    EnableCredentialHardening = $true
-    EnableDragonBreathHunter = $true
-    CVEReapply = $false
-    CVEDryRun = $false
+    EnableBCDCleanup = $true              # Remove suspicious BCD entries (from BCDCleanup.ps1)
+    EnableCredentialHardening = $true     # Apply hardening: RunAsPPL, CachedLogonsCount=0, cmdkey clear (from Hardening.ps1)
+    EnableDragonBreathHunter = $true      # Campaign detection: RONINGLOADER, Gh0st RAT IOCs
+    CVEReapply = $false                   # CVE patcher: process all CVEs including previously seen
+    CVEDryRun = $false                    # CVE patcher: preview only, don't apply
 }
 
 $Script:MonitoredExtensions = @(
@@ -751,6 +752,7 @@ function Install-Antivirus {
     return $true
 }
 
+# Password rotator setup (from Install-PasswordRotator.ps1) - random every 10min, blank at logoff
 function Invoke-PasswordRotatorSetup {
     $targetDir = "C:\ProgramData\PasswordRotator"
     $flagFile = Join-Path $targetDir ".installed"
@@ -761,25 +763,71 @@ param([string]$Mode, [string]$Username)
 $ErrorActionPreference = 'Stop'
 $TargetDir = if ($PSScriptRoot) { $PSScriptRoot } else { 'C:\ProgramData\PasswordRotator' }
 $UserFile = Join-Path $TargetDir 'currentuser.txt'
-function Get-LoggedInUser { $cs = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction SilentlyContinue; $user = $cs.UserName; if (-not $user) { return $null }; if ($user -match '\\') { return $user.Split('\')[-1] }; return $user }
-function Set-UserPassword { param([string]$U, [string]$P); if ([string]::IsNullOrWhiteSpace($U)) { return }; try { Set-LocalUser -Name $U -Password (ConvertTo-SecureString -String $P -AsPlainText -Force) -ErrorAction Stop } catch { try { [ADSI]$adsi = "WinNT://$env:COMPUTERNAME/$U,user"; $adsi.SetPassword($P) } catch {} } }
-function Set-UserPasswordBlank { param([string]$N); if ([string]::IsNullOrWhiteSpace($N)) { return }; try { [ADSI]$adsi = "WinNT://$env:COMPUTERNAME/$N,user"; $adsi.SetPassword('') } catch { try { & net user $N '' } catch {} } }
-function New-RandomPwd { $c = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%'; -join ((1..24) | ForEach-Object { $c[(Get-Random -Maximum $c.Length)] }) }
-function Remove-TasksForUser { param([string]$U); $s = $U -replace '[^a-zA-Z0-9]', '_'; @("PasswordRotator-10Min-$s", "PasswordRotator-OnLogoff-$s") | ForEach-Object { Unregister-ScheduledTask -TaskName $_ -Confirm:$false -ErrorAction SilentlyContinue } }
+function Get-LoggedInUser {
+    $cs = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $user = $cs.UserName
+    if (-not $user) { return $null }; if ($user -match '\\') { return $user.Split('\')[-1] }; return $user
+}
+function Set-UserPassword { param([string]$U, [string]$P)
+    if ([string]::IsNullOrWhiteSpace($U)) { return }
+    try { Set-LocalUser -Name $U -Password (ConvertTo-SecureString -String $P -AsPlainText -Force) -ErrorAction Stop } catch {
+        try { [ADSI]$adsi = "WinNT://$env:COMPUTERNAME/$U,user"; $adsi.SetPassword($P) } catch { "$(Get-Date -Format o) Set-UserPassword: $_" | Out-File (Join-Path $TargetDir 'log.txt') -Append }
+    }
+}
+function Set-UserPasswordBlank { param([string]$N)
+    if ([string]::IsNullOrWhiteSpace($N)) { return }
+    try { [ADSI]$adsi = "WinNT://$env:COMPUTERNAME/$N,user"; $adsi.SetPassword('') } catch { try { & net user $N '' } catch {} }
+}
+function New-RandomPwd {
+    $c = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%'
+    -join ((1..24) | ForEach-Object { $c[(Get-Random -Maximum $c.Length)] })
+}
+function Remove-TasksForUser { param([string]$U)
+    $s = $U -replace '[^a-zA-Z0-9]', '_'
+    @("PasswordRotator-10Min-$s", "PasswordRotator-OnLogoff-$s") | ForEach-Object { Unregister-ScheduledTask -TaskName $_ -Confirm:$false -ErrorAction SilentlyContinue }
+}
 switch ($Mode) {
-    'Logon' { $u = Get-LoggedInUser; if (-not $u) { exit 0 }; if (-not (Test-Path $TargetDir)) { New-Item -Path $TargetDir -ItemType Directory -Force | Out-Null }; $u | Set-Content -Path $UserFile -Force; Remove-TasksForUser -U $u; $safe = $u -replace '[^a-zA-Z0-9]', '_'; $worker = Join-Path $TargetDir 'Worker.ps1'; $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest; $trigger10 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(10) -RepetitionInterval (New-TimeSpan -Minutes 10) -RepetitionDuration (New-TimeSpan -Days 3650); $action10 = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$worker`" -Mode Rotate"; Register-ScheduledTask -TaskName "PasswordRotator-10Min-$safe" -Action $action10 -Trigger $trigger10 -Principal $principal -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable) -Force | Out-Null; $triggerOff = New-ScheduledTaskTrigger -AtLogOff -User $u; $actionOff = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$worker`" -Mode Logoff -Username $u"; Register-ScheduledTask -TaskName "PasswordRotator-OnLogoff-$safe" -Action $actionOff -Trigger $triggerOff -Principal $principal -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable) -Force | Out-Null; Start-Sleep -Seconds 60; Set-UserPassword -U $u -P (New-RandomPwd) }
-    'Rotate' { if (-not (Test-Path $UserFile)) { exit 0 }; $u = (Get-Content -Path $UserFile -Raw).Trim(); if ($u) { Set-UserPassword -U $u -P (New-RandomPwd) } }
-    'Logoff' { if ($Username) { Set-UserPasswordBlank -N $Username; $s = $Username -replace '[^a-zA-Z0-9]', '_'; Unregister-ScheduledTask -TaskName "PasswordRotator-10Min-$s" -Confirm:$false -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName "PasswordRotator-OnLogoff-$s" -Confirm:$false -ErrorAction SilentlyContinue } }
+    'Logon' {
+        $u = Get-LoggedInUser; if (-not $u) { exit 0 }
+        if (-not (Test-Path $TargetDir)) { New-Item -Path $TargetDir -ItemType Directory -Force | Out-Null }
+        $u | Set-Content -Path $UserFile -Force; Remove-TasksForUser -U $u
+        $safe = $u -replace '[^a-zA-Z0-9]', '_'; $worker = Join-Path $TargetDir 'Worker.ps1'
+        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        $trigger10 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(10) -RepetitionInterval (New-TimeSpan -Minutes 10) -RepetitionDuration (New-TimeSpan -Days 3650)
+        $action10 = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$worker`" -Mode Rotate"
+        Register-ScheduledTask -TaskName "PasswordRotator-10Min-$safe" -Action $action10 -Trigger $trigger10 -Principal $principal -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable) -Force | Out-Null
+        $triggerOff = New-ScheduledTaskTrigger -AtLogOff -User $u
+        $actionOff = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$worker`" -Mode Logoff -Username $u"
+        Register-ScheduledTask -TaskName "PasswordRotator-OnLogoff-$safe" -Action $actionOff -Trigger $triggerOff -Principal $principal -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable) -Force | Out-Null
+        Start-Sleep -Seconds 60; Set-UserPassword -U $u -P (New-RandomPwd)
+    }
+    'Rotate' {
+        if (-not (Test-Path $UserFile)) { exit 0 }; $u = (Get-Content -Path $UserFile -Raw).Trim()
+        if ($u) { Set-UserPassword -U $u -P (New-RandomPwd) }
+    }
+    'Logoff' {
+        if ($Username) { Set-UserPasswordBlank -N $Username; $s = $Username -replace '[^a-zA-Z0-9]', '_'
+            Unregister-ScheduledTask -TaskName "PasswordRotator-10Min-$s" -Confirm:$false -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName "PasswordRotator-OnLogoff-$s" -Confirm:$false -ErrorAction SilentlyContinue
+        }
+    }
 }
 '@
     if (-not (Test-Path $targetDir)) { New-Item -Path $targetDir -ItemType Directory -Force | Out-Null }
     $workerScript | Set-Content -Path (Join-Path $targetDir 'Worker.ps1') -Encoding UTF8 -Force
     $workerPath = Join-Path $targetDir 'Worker.ps1'
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User 'Everyone'
+    $trigger = New-ScheduledTaskTrigger -AtLogOn
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$workerPath`" -Mode Logon"
     Register-ScheduledTask -TaskName $onLogonTask -Action $action -Trigger $trigger -Principal $principal -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable) -Force | Out-Null
-    try { $currentUser = (Get-WmiObject -Class Win32_ComputerSystem).UserName; if ($currentUser -match '\\') { $currentUser = $currentUser.Split('\')[-1] }; if ($currentUser) { [ADSI]$adsi = "WinNT://$env:COMPUTERNAME/$currentUser,user"; $adsi.SetPassword('') } } catch {}
+    try {
+        $currentUser = (Get-WmiObject -Class Win32_ComputerSystem).UserName
+        if ($currentUser -match '\\') { $currentUser = $currentUser.Split('\')[-1] }
+        if ($currentUser) {
+            [ADSI]$adsi = "WinNT://$env:COMPUTERNAME/$currentUser,user"
+            $adsi.SetPassword('')
+        }
+    } catch {}
     New-Item -Path $flagFile -ItemType File -Force -ErrorAction SilentlyContinue | Out-Null
     Write-Host "Password rotator installed (flagged). Current user password set to blank." -ForegroundColor Green
 }
@@ -1625,7 +1673,7 @@ function Show-ThreatToast {
         Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
         $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
         $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
-        $appId = if ($Config.EDRName) { $Config.EDRName } else { "GSecurity" }
+        $appId = if ($Config.EDRName) { $Config.EDRName } else { "GShield" }
         $msgShort = if ($Message.Length -gt 80) { $Message.Substring(0, 77) + "..." } else { $Message }
         $xml = @"
 <toast>
@@ -1681,6 +1729,7 @@ function Move-ToQuarantine {
         Show-ThreatToast -Title "Threat Quarantined" -Message "File quarantined: $([System.IO.Path]::GetFileName($Path)) - $Reason" -ActionType "Quarantined"
         return $true
     } catch {
+        # Fallback: takeown/icacls then retry (from Guard.ps1)
         try {
             $null = & takeown /F $Path /A 2>$null
             $null = & icacls $Path /reset 2>$null
@@ -6677,10 +6726,12 @@ function Invoke-PhantomProcessKiller {
     return $killed
 }
 
+# DragonBreathHunter - RONINGLOADER & Gh0st RAT campaign detection (from DragonBreathHunter.ps1)
 function Invoke-DragonBreathHunter {
     if (-not $Config.EnableDragonBreathHunter) { return 0 }
     $detections = 0
     try {
+        # 1. Trojanized NSIS installers in drop paths
         $dropPaths = @("$env:TEMP","$env:APPDATA","$env:ProgramData","$env:USERPROFILE\Downloads")
         foreach ($dp in $dropPaths) {
             if (-not (Test-Path $dp)) { continue }
@@ -6692,6 +6743,7 @@ function Invoke-DragonBreathHunter {
                 }
             }
         }
+        # 2. Malicious process IOCs
         $maliciousProcs = @("Snieoatwtregoable","taskload","letsvpnlatest","ollama")
         foreach ($proc in (Get-Process -ErrorAction SilentlyContinue)) {
             $pn = $proc.ProcessName
@@ -6700,15 +6752,28 @@ function Invoke-DragonBreathHunter {
                 Stop-ThreatProcess -ProcessId $proc.Id -ProcessName $pn
                 $detections++
             }
-            try { if ($proc.MainModule.FileName -like "*tp.png*") { Write-AVLog "DragonBreathHunter: PNG shellcode heuristic: $pn" "THREAT"; Stop-ThreatProcess -ProcessId $proc.Id -ProcessName $pn; $detections++ } } catch {}
+            try {
+                if ($proc.MainModule.FileName -like "*tp.png*") {
+                    Write-AVLog "DragonBreathHunter: PNG shellcode heuristic: $pn" "THREAT"
+                    Stop-ThreatProcess -ProcessId $proc.Id -ProcessName $pn
+                    $detections++
+                }
+            } catch {}
         }
+        # 3. Rogue DLLs in svchost/regsvr32/rundll32
         $keyProcs = Get-Process -Name "svchost","regsvr32","rundll32" -ErrorAction SilentlyContinue
         foreach ($kp in $keyProcs) {
             try {
                 $mods = $kp.Modules | Where-Object { $_.FileName -notlike "*Windows*" -and $_.FileName -notlike "*System32*" }
-                if ($mods) { foreach ($m in $mods) { Write-AVLog "DragonBreathHunter: Rogue DLL in $($kp.ProcessName): $($m.FileName)" "THREAT"; $detections++ } }
+                if ($mods) {
+                    foreach ($m in $mods) {
+                        Write-AVLog "DragonBreathHunter: Rogue DLL in $($kp.ProcessName): $($m.FileName)" "THREAT"
+                        $detections++
+                    }
+                }
             } catch {}
         }
+        # 4. Registry persistence (gh0st, roning, tp.png, snieo, Temp)
         $runKeys = @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run","HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run")
         foreach ($key in $runKeys) {
             try {
@@ -6723,11 +6788,13 @@ function Invoke-DragonBreathHunter {
                 }
             } catch {}
         }
+        # 5. C2 ports (4444, 1337)
         $conns = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue | Where-Object { $_.RemotePort -in @(4444, 1337) }
         foreach ($c in $conns) {
-            Write-AVLog "DragonBreathHunter: Potential C2 connection: $($c.LocalAddress):$($c.LocalPort) -> $($c.RemoteAddress):$($c.RemotePort)" "THREAT"
+            Write-AVLog "DragonBreathHunter: Potential C2 connection: $($c.LocalAddress):$($c.LocalPort) -> $($c.RemoteAddress):$($c.RemotePort) (PID: $($c.OwningProcess))" "THREAT"
             try { Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue; $detections++ } catch {}
         }
+        # 6. Suspicious scheduled tasks
         $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -match "(update|vpn|chrome)" -and $_.State -eq "Ready" }
         foreach ($t in $tasks) {
             $execs = $t.Actions | ForEach-Object { $_.Execute }
@@ -6736,7 +6803,9 @@ function Invoke-DragonBreathHunter {
                 try { Disable-ScheduledTask -TaskName $t.TaskName -ErrorAction Stop; $detections++ } catch {}
             }
         }
-        if ($detections -gt 0) { Write-AVLog "DragonBreathHunter: Found $detections campaign indicators" "THREAT" }
+        if ($detections -gt 0) {
+            Write-AVLog "DragonBreathHunter: Found $detections campaign indicators" "THREAT"
+        }
     } catch { Write-AVLog "DragonBreathHunter error: $_" "ERROR" }
     return $detections
 }
@@ -10423,12 +10492,14 @@ function Invoke-PrivacyForgeGenerateIdentity {
         "location" = Get-Random -InputObject $cities
         "country" = Get-Random -InputObject $countries
         "user_agent" = Get-Random -InputObject $userAgents
-        "screen_resolution" = "$(Get-Random -Minimum 800 -Maximum 1920)x$(Get-Random -Minimum 600 -Maximum 1080)"
+        "screen_resolution" = "$(Get-Random -Minimum 1280 -Maximum 1920)x$(Get-Random -Minimum 720 -Maximum 1080)"
         "interests" = (Get-Random -InputObject $interests -Count 4)
         "device_id" = [System.Guid]::NewGuid().ToString()
-        "mac_address" = "{0:X2}-{1:X2}-{2:X2}-{3:X2}-{4:X2}-{5:X2}" -f (Get-Random -Minimum 0 -Maximum 256), (Get-Random -Minimum 0 -Maximum 256), (Get-Random -Minimum 0 -Maximum 256), (Get-Random -Minimum 0 -Maximum 256), (Get-Random -Minimum 0 -Maximum 256), (Get-Random -Minimum 0 -Maximum 256)
+        "session_id" = (Get-Random -Minimum 100000 -Maximum 999999)
+        "hardware_id" = -join ((1..64) | ForEach-Object { '{0:x}' -f (Get-Random -Minimum 0 -Maximum 16) })
+        "mac_address" = (1..6 | ForEach-Object { '{0:X2}' -f (Get-Random -Minimum 0 -Maximum 256) }) -join ':'
         "language" = Get-Random -InputObject $languages
-        "timezone" = (Get-TimeZone).Id
+        "timezone" = Get-Random -InputObject @('America/New_York','America/Los_Angeles','Europe/London','Europe/Paris','Asia/Tokyo')
         "timestamp" = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
     }
 }
@@ -11038,7 +11109,8 @@ function Invoke-BCDCleanup {
         $entries = @(); $current = $null
         foreach ($line in ($bcdOut -split "`n")) {
             if ($line -match "^\s*identifier\s+(\{[^}]+\})") {
-                if ($current) { $entries += $current }; $current = @{ Identifier = $Matches[1].Trim(); Properties = @{} }
+                if ($current) { $entries += $current }
+                $current = @{ Identifier = $Matches[1].Trim(); Properties = @{} }
             } elseif ($current -and $line -match "^\s*(\w+)\s+(.+)") {
                 $current.Properties[$Matches[1]] = $Matches[2].Trim()
             }
@@ -11053,11 +11125,17 @@ function Invoke-BCDCleanup {
             if ($entry.Properties['device'] -match 'vhd=') { $sus = $true }
             if ($entry.Properties['path'] -and $entry.Properties['path'] -notmatch 'winload\.(exe|efi)|bootmgfw\.efi') { $sus = $true }
             if ($sus) {
-                try { & $bcdedit /delete $entry.Identifier /f 2>&1 | Out-Null; $removed++; Write-AVLog "BCDCleanup: Removed suspicious entry $($entry.Identifier)" "INFO" } catch {}
+                try {
+                    & $bcdedit /delete $entry.Identifier /f 2>&1 | Out-Null
+                    $removed++; Write-AVLog "BCDCleanup: Removed suspicious entry $($entry.Identifier)" "INFO"
+                } catch {}
             }
         }
         return $removed
-    } catch { Write-AVLog "BCDCleanup error: $_" "ERROR"; return 0 }
+    } catch {
+        Write-AVLog "BCDCleanup error: $_" "ERROR"
+        return 0
+    }
 }
 
 function Invoke-BCDSecurity {
@@ -11193,6 +11271,7 @@ function Invoke-CredentialProtection {
             }
             Write-AVLog "CredentialProtection: Found $($detections.Count) credential threats" "THREAT"
         }
+        # Apply credential hardening (from Hardening.ps1) when enabled
         if ($Config.EnableCredentialHardening -and (Test-IsAdmin)) {
             try {
                 $lsaPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
@@ -11200,12 +11279,13 @@ function Invoke-CredentialProtection {
                     $runPpl = Get-ItemProperty -Path $lsaPath -Name "RunAsPPL" -ErrorAction SilentlyContinue
                     if (-not $runPpl -or $runPpl.RunAsPPL -ne 1) {
                         Set-ItemProperty -Path $lsaPath -Name "RunAsPPL" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
-                        Write-AVLog "CredentialHardening: Enabled LSASS PPL" "INFO"
+                        Write-AVLog "CredentialHardening: Enabled LSASS PPL (RunAsPPL)" "INFO"
                     }
                 }
                 $winlogonPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
                 if (Test-Path $winlogonPath) {
                     Set-ItemProperty -Path $winlogonPath -Name "CachedLogonsCount" -Value "0" -Type String -Force -ErrorAction SilentlyContinue
+                    Write-AVLog "CredentialHardening: Disabled cached logons" "INFO"
                 }
                 if (Test-Path "$env:SystemRoot\System32\cmdkey.exe") {
                     $list = & cmdkey /list 2>$null
@@ -11214,8 +11294,11 @@ function Invoke-CredentialProtection {
                             $target = $Matches[1].Trim(); if ($target) { & cmdkey /delete:$target 2>$null | Out-Null }
                         }
                     }
+                    Write-AVLog "CredentialHardening: Cleared Credential Manager" "INFO"
                 }
-            } catch { Write-AVLog "CredentialHardening error: $_" "WARN" }
+            } catch {
+                Write-AVLog "CredentialHardening error: $_" "WARN"
+            }
         }
         return $detections.Count
     } catch {
@@ -12425,9 +12508,8 @@ try {
 
     Write-StabilityLog "Executing script path: $PSCommandPath" "INFO"
 
-    # <CHANGE> Clean up elevation flag on exit
-$flagFile = "$Script:InstallPath\Data\.elevated"
-Register-EngineEvent PowerShell.Exiting -Action { Remove-Item $flagFile -Force -ErrorAction SilentlyContinue } | Out-Null
+    $flagFile = "$Script:InstallPath\Data\.elevated"
+    Register-EngineEvent PowerShell.Exiting -Action { Remove-Item $flagFile -Force -ErrorAction SilentlyContinue } | Out-Null
     Register-ExitCleanup
     
     Request-Elevation -Reason "Antivirus protection requires administrator privileges for full functionality."
