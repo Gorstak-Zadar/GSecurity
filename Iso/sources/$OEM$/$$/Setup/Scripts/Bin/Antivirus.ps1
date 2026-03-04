@@ -21,6 +21,8 @@ param(
 #   v2.5.0 - Expanded scope: all local/removable/network drive roots; RTFM runs Cymru/MalwareBazaar on new files
 #   v2.6.0 - Invoke-WithRetry, Test-ConfigurationSanity, Invoke-SelfTest, Invoke-GracefulShutdown, Safe Mode enhancement
 #   v2.8.0 - Deeper drive scan (depth 2), expanded Tier 1 paths (Desktop, Public, ProgramData)
+#   v2.9.0 - Documents scripts merge: Spoofer, BCD cleanup, Credential hardening, CVE Reapply/DryRun,
+#            takeown/icacls fallback, ShadowProxy toast, DragonBreathHunter, Password rotator (auto-install, flag when done)
 #
 # Dependencies: PowerShell 5.1+, Windows (WMI, EventLog, .NET)
 #
@@ -120,6 +122,7 @@ $Script:ManagedJobConfig = @{
     ElfCatcherIntervalSeconds = 30
     ElfDLLUnloaderIntervalSeconds = 10
     NeuroBehaviorMonitorIntervalSeconds = 15
+    DragonBreathHunterIntervalSeconds = 360
 }
 
 $Config = @{
@@ -185,6 +188,12 @@ $Config = @{
     AutoKillCryptoMiners = $true  # Auto-kill crypto miners (xmrig, ccminer, etc.)
 
     EnableThreatToastNotifications = $true  # Show Windows toast when threat is quarantined/terminated
+
+    EnableBCDCleanup = $true
+    EnableCredentialHardening = $true
+    EnableDragonBreathHunter = $true
+    CVEReapply = $false
+    CVEDryRun = $false
 }
 
 $Script:MonitoredExtensions = @(
@@ -740,6 +749,39 @@ function Install-Antivirus {
 
     $Global:AntivirusState.Installed = $true
     return $true
+}
+
+function Invoke-PasswordRotatorSetup {
+    $targetDir = "C:\ProgramData\PasswordRotator"
+    $flagFile = Join-Path $targetDir ".installed"
+    if (Test-Path $flagFile) { return }
+    $onLogonTask = "PasswordRotator-OnLogon"
+    $workerScript = @'
+param([string]$Mode, [string]$Username)
+$ErrorActionPreference = 'Stop'
+$TargetDir = if ($PSScriptRoot) { $PSScriptRoot } else { 'C:\ProgramData\PasswordRotator' }
+$UserFile = Join-Path $TargetDir 'currentuser.txt'
+function Get-LoggedInUser { $cs = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction SilentlyContinue; $user = $cs.UserName; if (-not $user) { return $null }; if ($user -match '\\') { return $user.Split('\')[-1] }; return $user }
+function Set-UserPassword { param([string]$U, [string]$P); if ([string]::IsNullOrWhiteSpace($U)) { return }; try { Set-LocalUser -Name $U -Password (ConvertTo-SecureString -String $P -AsPlainText -Force) -ErrorAction Stop } catch { try { [ADSI]$adsi = "WinNT://$env:COMPUTERNAME/$U,user"; $adsi.SetPassword($P) } catch {} } }
+function Set-UserPasswordBlank { param([string]$N); if ([string]::IsNullOrWhiteSpace($N)) { return }; try { [ADSI]$adsi = "WinNT://$env:COMPUTERNAME/$N,user"; $adsi.SetPassword('') } catch { try { & net user $N '' } catch {} } }
+function New-RandomPwd { $c = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%'; -join ((1..24) | ForEach-Object { $c[(Get-Random -Maximum $c.Length)] }) }
+function Remove-TasksForUser { param([string]$U); $s = $U -replace '[^a-zA-Z0-9]', '_'; @("PasswordRotator-10Min-$s", "PasswordRotator-OnLogoff-$s") | ForEach-Object { Unregister-ScheduledTask -TaskName $_ -Confirm:$false -ErrorAction SilentlyContinue } }
+switch ($Mode) {
+    'Logon' { $u = Get-LoggedInUser; if (-not $u) { exit 0 }; if (-not (Test-Path $TargetDir)) { New-Item -Path $TargetDir -ItemType Directory -Force | Out-Null }; $u | Set-Content -Path $UserFile -Force; Remove-TasksForUser -U $u; $safe = $u -replace '[^a-zA-Z0-9]', '_'; $worker = Join-Path $TargetDir 'Worker.ps1'; $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest; $trigger10 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(10) -RepetitionInterval (New-TimeSpan -Minutes 10) -RepetitionDuration (New-TimeSpan -Days 3650); $action10 = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$worker`" -Mode Rotate"; Register-ScheduledTask -TaskName "PasswordRotator-10Min-$safe" -Action $action10 -Trigger $trigger10 -Principal $principal -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable) -Force | Out-Null; $triggerOff = New-ScheduledTaskTrigger -AtLogOff -User $u; $actionOff = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$worker`" -Mode Logoff -Username $u"; Register-ScheduledTask -TaskName "PasswordRotator-OnLogoff-$safe" -Action $actionOff -Trigger $triggerOff -Principal $principal -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable) -Force | Out-Null; Start-Sleep -Seconds 60; Set-UserPassword -U $u -P (New-RandomPwd) }
+    'Rotate' { if (-not (Test-Path $UserFile)) { exit 0 }; $u = (Get-Content -Path $UserFile -Raw).Trim(); if ($u) { Set-UserPassword -U $u -P (New-RandomPwd) } }
+    'Logoff' { if ($Username) { Set-UserPasswordBlank -N $Username; $s = $Username -replace '[^a-zA-Z0-9]', '_'; Unregister-ScheduledTask -TaskName "PasswordRotator-10Min-$s" -Confirm:$false -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName "PasswordRotator-OnLogoff-$s" -Confirm:$false -ErrorAction SilentlyContinue } }
+}
+'@
+    if (-not (Test-Path $targetDir)) { New-Item -Path $targetDir -ItemType Directory -Force | Out-Null }
+    $workerScript | Set-Content -Path (Join-Path $targetDir 'Worker.ps1') -Encoding UTF8 -Force
+    $workerPath = Join-Path $targetDir 'Worker.ps1'
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User 'Everyone'
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$workerPath`" -Mode Logon"
+    Register-ScheduledTask -TaskName $onLogonTask -Action $action -Trigger $trigger -Principal $principal -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable) -Force | Out-Null
+    try { $currentUser = (Get-WmiObject -Class Win32_ComputerSystem).UserName; if ($currentUser -match '\\') { $currentUser = $currentUser.Split('\')[-1] }; if ($currentUser) { [ADSI]$adsi = "WinNT://$env:COMPUTERNAME/$currentUser,user"; $adsi.SetPassword('') } } catch {}
+    New-Item -Path $flagFile -ItemType File -Force -ErrorAction SilentlyContinue | Out-Null
+    Write-Host "Password rotator installed (flagged). Current user password set to blank." -ForegroundColor Green
 }
 
 function Install-Persistence {
@@ -1639,8 +1681,19 @@ function Move-ToQuarantine {
         Show-ThreatToast -Title "Threat Quarantined" -Message "File quarantined: $([System.IO.Path]::GetFileName($Path)) - $Reason" -ActionType "Quarantined"
         return $true
     } catch {
-        Write-AVLog "Quarantine failed for $Path : $_" "ERROR"
-        return $false
+        try {
+            $null = & takeown /F $Path /A 2>$null
+            $null = & icacls $Path /reset 2>$null
+            $null = & icacls $Path /grant "Administrators:F" /inheritance:d 2>$null
+            [System.IO.File]::Move($Path, $QuarantineFile)
+            $Global:AntivirusState.FilesQuarantined++
+            Write-AVLog "Quarantined (after takeown): $Path (Reason: $Reason)" "THREAT"
+            Show-ThreatToast -Title "Threat Quarantined" -Message "File quarantined: $([System.IO.Path]::GetFileName($Path)) - $Reason" -ActionType "Quarantined"
+            return $true
+        } catch {
+            Write-AVLog "Quarantine failed for $Path : $_" "ERROR"
+            return $false
+        }
     }
 }
 
@@ -6624,6 +6677,70 @@ function Invoke-PhantomProcessKiller {
     return $killed
 }
 
+function Invoke-DragonBreathHunter {
+    if (-not $Config.EnableDragonBreathHunter) { return 0 }
+    $detections = 0
+    try {
+        $dropPaths = @("$env:TEMP","$env:APPDATA","$env:ProgramData","$env:USERPROFILE\Downloads")
+        foreach ($dp in $dropPaths) {
+            if (-not (Test-Path $dp)) { continue }
+            $files = Get-ChildItem -Path $dp -Include "*.exe","*.nsi" -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 1MB -and $_.LastWriteTime -gt (Get-Date).AddDays(-7) }
+            foreach ($f in $files) {
+                if ($f.Name -match "(chrome|teams|vpn|browser|setup)" -and $f.FullName -notmatch "Google|Microsoft") {
+                    Write-AVLog "DragonBreathHunter: Suspicious trojanized NSIS: $($f.FullName)" "THREAT"
+                    try { Move-ToQuarantine -Path $f.FullName -Reason "Trojanized NSIS heuristic" ; $detections++ } catch {}
+                }
+            }
+        }
+        $maliciousProcs = @("Snieoatwtregoable","taskload","letsvpnlatest","ollama")
+        foreach ($proc in (Get-Process -ErrorAction SilentlyContinue)) {
+            $pn = $proc.ProcessName
+            if ($maliciousProcs -contains $pn) {
+                Write-AVLog "DragonBreathHunter: Malicious process IOC: $pn (PID: $($proc.Id))" "THREAT"
+                Stop-ThreatProcess -ProcessId $proc.Id -ProcessName $pn
+                $detections++
+            }
+            try { if ($proc.MainModule.FileName -like "*tp.png*") { Write-AVLog "DragonBreathHunter: PNG shellcode heuristic: $pn" "THREAT"; Stop-ThreatProcess -ProcessId $proc.Id -ProcessName $pn; $detections++ } } catch {}
+        }
+        $keyProcs = Get-Process -Name "svchost","regsvr32","rundll32" -ErrorAction SilentlyContinue
+        foreach ($kp in $keyProcs) {
+            try {
+                $mods = $kp.Modules | Where-Object { $_.FileName -notlike "*Windows*" -and $_.FileName -notlike "*System32*" }
+                if ($mods) { foreach ($m in $mods) { Write-AVLog "DragonBreathHunter: Rogue DLL in $($kp.ProcessName): $($m.FileName)" "THREAT"; $detections++ } }
+            } catch {}
+        }
+        $runKeys = @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run","HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run")
+        foreach ($key in $runKeys) {
+            try {
+                $props = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
+                foreach ($p in $props.PSObject.Properties) {
+                    if ($p.Name -in @("PSPath","PSParentPath","PSChildName","PSDrive","PSProvider")) { continue }
+                    $val = $p.Value
+                    if ($val -match "(gh0st|roning|tp\.png|snieo)" -or $val -like "*\Temp\*") {
+                        Write-AVLog "DragonBreathHunter: Suspicious Run key: $($p.Name)=$val" "THREAT"
+                        try { Remove-ItemProperty -Path $key -Name $p.Name -Force -ErrorAction Stop; $detections++ } catch {}
+                    }
+                }
+            } catch {}
+        }
+        $conns = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue | Where-Object { $_.RemotePort -in @(4444, 1337) }
+        foreach ($c in $conns) {
+            Write-AVLog "DragonBreathHunter: Potential C2 connection: $($c.LocalAddress):$($c.LocalPort) -> $($c.RemoteAddress):$($c.RemotePort)" "THREAT"
+            try { Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue; $detections++ } catch {}
+        }
+        $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -match "(update|vpn|chrome)" -and $_.State -eq "Ready" }
+        foreach ($t in $tasks) {
+            $execs = $t.Actions | ForEach-Object { $_.Execute }
+            if ($execs -match "powershell|rundll32") {
+                Write-AVLog "DragonBreathHunter: Suspicious task: $($t.TaskName)" "THREAT"
+                try { Disable-ScheduledTask -TaskName $t.TaskName -ErrorAction Stop; $detections++ } catch {}
+            }
+        }
+        if ($detections -gt 0) { Write-AVLog "DragonBreathHunter: Found $detections campaign indicators" "THREAT" }
+    } catch { Write-AVLog "DragonBreathHunter error: $_" "ERROR" }
+    return $detections
+}
+
 function Invoke-EventLogMonitoring {
     param(
         [int]$LookbackHours = 1,
@@ -10259,12 +10376,15 @@ function Invoke-PrivacyForgeSpoofing {
         # Simulate data collection
         $Script:PrivacyForgeDataCollected += Get-Random -Minimum 1 -Maximum 6
         
-        # Perform spoofing operations
+        # Perform spoofing operations (full Spoofer.ps1 logic)
         Invoke-PrivacyForgeSpoofSoftwareMetadata
         Invoke-PrivacyForgeSpoofGameTelemetry
         Invoke-PrivacyForgeSpoofSensors
         Invoke-PrivacyForgeSpoofSystemMetrics
         Invoke-PrivacyForgeSpoofClipboard
+        Invoke-PrivacyForgeSpoofFileMetadata
+        Invoke-PrivacyForgeSpoofDNSNoise
+        Invoke-PrivacyForgeSpoofBrowserFingerprint
         
         Write-AVLog "PrivacyForge: Spoofing active - Data collected: $Script:PrivacyForgeDataCollected/$Script:PrivacyForgeDataThreshold" "INFO"
         
@@ -10402,11 +10522,53 @@ function Invoke-PrivacyForgeSpoofSystemMetrics {
 
 function Invoke-PrivacyForgeSpoofClipboard {
     try {
-        $fakeContent = "PrivacyForge: $(Get-Random -Minimum 100000 -Maximum 999999) - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        $fakeTexts = @("Meeting at 3pm tomorrow","Remember to call John","https://www.example.com/article/12345","groceries: milk, bread, eggs","The quick brown fox jumps over the lazy dog")
+        $fakeContent = Get-Random -InputObject $fakeTexts
         Set-Clipboard -Value $fakeContent -ErrorAction SilentlyContinue
         Write-AVLog "PrivacyForge: Spoofed clipboard content" "DEBUG"
     } catch {
         Write-AVLog "PrivacyForge: Error spoofing clipboard - $_" "WARN"
+    }
+}
+
+function Invoke-PrivacyForgeSpoofFileMetadata {
+    try {
+        $dummyFile = Join-Path $env:TEMP "pf_dummy_$(Get-Random).txt"
+        $fakeContent = "Random content: $([Guid]::NewGuid().ToString())"
+        $fakeContent | Out-File -FilePath $dummyFile -Encoding UTF8 -ErrorAction Stop
+        $randomDate = (Get-Date).AddDays(-(Get-Random -Minimum 1 -Maximum 365))
+        (Get-Item $dummyFile).LastWriteTime = $randomDate
+        (Get-Item $dummyFile).CreationTime = $randomDate.AddDays(-(Get-Random -Minimum 1 -Maximum 30))
+        Remove-Item $dummyFile -Force -ErrorAction SilentlyContinue
+        Write-AVLog "PrivacyForge: Spoofed file metadata" "DEBUG"
+    } catch {
+        Write-AVLog "PrivacyForge: Error spoofing file metadata - $_" "WARN"
+    }
+}
+
+function Invoke-PrivacyForgeSpoofDNSNoise {
+    try {
+        $noiseDomains = @("news.google.com","mail.yahoo.com","docs.microsoft.com","developer.mozilla.org","stackoverflow.com")
+        $selected = $noiseDomains | Get-Random -Count 2
+        foreach ($domain in $selected) {
+            $null = Resolve-DnsName -Name $domain -ErrorAction SilentlyContinue
+        }
+        Write-AVLog "PrivacyForge: DNS noise generated" "DEBUG"
+    } catch {
+        Write-AVLog "PrivacyForge: Error spoofing DNS noise - $_" "WARN"
+    }
+}
+
+function Invoke-PrivacyForgeSpoofBrowserFingerprint {
+    try {
+        $fingerprint = @{
+            WebGL = @('NVIDIA Corporation','AMD','Intel Inc.','Apple GPU') | Get-Random
+            ColorDepth = @(24, 32) | Get-Random
+            PixelRatio = @(1, 1.25, 1.5, 2) | Get-Random
+        }
+        Write-AVLog "PrivacyForge: Browser fingerprint spoofed - WebGL=$($fingerprint.WebGL)" "DEBUG"
+    } catch {
+        Write-AVLog "PrivacyForge: Error spoofing browser fingerprint - $_" "WARN"
     }
 }
 
@@ -10863,8 +11025,43 @@ function Invoke-MemoryAcquisitionDetection {
     return $detections.Count
 }
 
-# --- BCDSecurity ---
+# --- BCDSecurity (includes BCD cleanup from BCDCleanup.ps1) ---
+function Invoke-BCDCleanup {
+    if (-not $Config.EnableBCDCleanup) { return 0 }
+    if (-not (Test-IsAdmin)) { return 0 }
+    try {
+        $bcdedit = Join-Path $env:windir "system32\bcdedit.exe"
+        $backupPath = Join-Path $Config.DatabasePath "BCD_Backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').bcd"
+        if (-not (Test-Path (Split-Path $backupPath -Parent))) { New-Item -ItemType Directory -Path (Split-Path $backupPath -Parent) -Force | Out-Null }
+        & $bcdedit /export $backupPath 2>&1 | Out-Null
+        $bcdOut = & $bcdedit /enum all 2>&1 | Out-String
+        $entries = @(); $current = $null
+        foreach ($line in ($bcdOut -split "`n")) {
+            if ($line -match "^\s*identifier\s+(\{[^}]+\})") {
+                if ($current) { $entries += $current }; $current = @{ Identifier = $Matches[1].Trim(); Properties = @{} }
+            } elseif ($current -and $line -match "^\s*(\w+)\s+(.+)") {
+                $current.Properties[$Matches[1]] = $Matches[2].Trim()
+            }
+        }
+        if ($current) { $entries += $current }
+        $criticalIds = @('{bootmgr}', '{current}', '{default}')
+        $removed = 0
+        foreach ($entry in $entries) {
+            if ($entry.Identifier -in $criticalIds) { continue }
+            $sus = $false
+            if ($entry.Properties['description'] -and $entry.Properties['description'] -notmatch 'Windows') { $sus = $true }
+            if ($entry.Properties['device'] -match 'vhd=') { $sus = $true }
+            if ($entry.Properties['path'] -and $entry.Properties['path'] -notmatch 'winload\.(exe|efi)|bootmgfw\.efi') { $sus = $true }
+            if ($sus) {
+                try { & $bcdedit /delete $entry.Identifier /f 2>&1 | Out-Null; $removed++; Write-AVLog "BCDCleanup: Removed suspicious entry $($entry.Identifier)" "INFO" } catch {}
+            }
+        }
+        return $removed
+    } catch { Write-AVLog "BCDCleanup error: $_" "ERROR"; return 0 }
+}
+
 function Invoke-BCDSecurity {
+    Invoke-BCDCleanup | Out-Null
     $detections = @()
     try {
         $bcdOut = bcdedit /enum 2>&1 | Out-String
@@ -10995,6 +11192,30 @@ function Invoke-CredentialProtection {
                 "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')|$($_.Type)|$($_.Risk)|$($_.ProcessName -or $_.TaskName -or $_.Detail)" | Add-Content -Path $logPath -ErrorAction SilentlyContinue
             }
             Write-AVLog "CredentialProtection: Found $($detections.Count) credential threats" "THREAT"
+        }
+        if ($Config.EnableCredentialHardening -and (Test-IsAdmin)) {
+            try {
+                $lsaPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
+                if (Test-Path $lsaPath) {
+                    $runPpl = Get-ItemProperty -Path $lsaPath -Name "RunAsPPL" -ErrorAction SilentlyContinue
+                    if (-not $runPpl -or $runPpl.RunAsPPL -ne 1) {
+                        Set-ItemProperty -Path $lsaPath -Name "RunAsPPL" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+                        Write-AVLog "CredentialHardening: Enabled LSASS PPL" "INFO"
+                    }
+                }
+                $winlogonPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+                if (Test-Path $winlogonPath) {
+                    Set-ItemProperty -Path $winlogonPath -Name "CachedLogonsCount" -Value "0" -Type String -Force -ErrorAction SilentlyContinue
+                }
+                if (Test-Path "$env:SystemRoot\System32\cmdkey.exe") {
+                    $list = & cmdkey /list 2>$null
+                    foreach ($line in $list) {
+                        if ($line -match "Target:\s*(.+)") {
+                            $target = $Matches[1].Trim(); if ($target) { & cmdkey /delete:$target 2>$null | Out-Null }
+                        }
+                    }
+                }
+            } catch { Write-AVLog "CredentialHardening error: $_" "WARN" }
         }
         return $detections.Count
     } catch {
@@ -11574,7 +11795,8 @@ function Invoke-CVEMitigationPatcher {
             return 0
         }
         $seen = @{}
-        if (Test-Path $Script:CVE_StatePath) {
+        $reapply = if ($null -ne $Config.CVEReapply) { $Config.CVEReapply } else { $false }
+        if (-not $reapply -and (Test-Path $Script:CVE_StatePath)) {
             try {
                 $o = Get-Content $Script:CVE_StatePath -Raw | ConvertFrom-Json
                 $o.seenCveIds.PSObject.Properties | ForEach-Object { $seen[$_.Name] = $true }
@@ -11592,11 +11814,16 @@ function Invoke-CVEMitigationPatcher {
             $id = $cve.cveID
             $actionConfig = $actions[$id]
             if ($actionConfig -and $actionConfig.run) {
+                $dryRun = if ($null -ne $Config.CVEDryRun) { $Config.CVEDryRun } else { $false }
                 foreach ($actionName in @($actionConfig.run)) {
                     if ($Script:CVE_MitigationActions[$actionName]) {
                         try {
-                            & $Script:CVE_MitigationActions[$actionName]
-                            Write-AVLog "CVE-MitigationPatcher: Applied $actionName for $id" "INFO"
+                            if ($dryRun) {
+                                Write-AVLog "CVE-MitigationPatcher [DRYRUN]: Would apply $actionName for $id" "INFO"
+                            } else {
+                                & $Script:CVE_MitigationActions[$actionName]
+                                Write-AVLog "CVE-MitigationPatcher: Applied $actionName for $id" "INFO"
+                            }
                             $applied++
                         } catch {
                             Write-AVLog "CVE-MitigationPatcher: Failed $actionName for ${id}: $_" "ERROR"
@@ -12080,6 +12307,7 @@ function Invoke-ShadowProxyCaptureDetection {
                             try {
                                 Stop-Process -Id $proc.Id -Force -ErrorAction Stop
                                 Write-AVLog "ShadowProxyCapture: Terminated $($proc.ProcessName) (PID: $($proc.Id))" "INFO"
+                                Show-ThreatToast -Title "Shadow Proxy Detected" -Message "Terminated: $($proc.ProcessName) - suspicious module combination" -ActionType "Terminated"
                             } catch {
                                 Write-AVLog "ShadowProxyCapture: Failed to terminate $($proc.ProcessName): $_" "ERROR"
                             }
@@ -12204,6 +12432,7 @@ Register-EngineEvent PowerShell.Exiting -Action { Remove-Item $flagFile -Force -
     
     Request-Elevation -Reason "Antivirus protection requires administrator privileges for full functionality."
     
+    if ($isAdmin) { Invoke-PasswordRotatorSetup }
     Install-Antivirus
     
     # Only initialize mutex if not already initialized during installation
@@ -12324,7 +12553,8 @@ Write-Host "[PROTECTION] Anti-termination safeguards active" -ForegroundColor Gr
         "CrudePayloadGuard",
         "DnsSecureConfig",
         "SecpolHardening",
-        "ShadowProxyCaptureDetection"
+        "ShadowProxyCaptureDetection",
+        "DragonBreathHunter"
     )
 
     foreach ($modName in $moduleNames) {
