@@ -110,6 +110,7 @@ GSecurity includes 70+ integrated security modules organized by category:
 | Credential Dump Detection | Mimikatz, LSASS access monitoring | 15s |
 | Credential Protection | Protects stored credentials | 300s |
 | Password Management | Secure password handling | 120s |
+| Password Rotator | Auto-installs on first elevated run; rotates user password every 10 min, blanks at logoff; runs once per machine (flagged when done) | One-time |
 | Token Manipulation Detection | Privilege escalation attempts | 60s |
 
 ### 🌐 Network Security
@@ -263,6 +264,7 @@ powershell -ExecutionPolicy Bypass -File .\Antivirus.ps1
 powershell -ExecutionPolicy Bypass -File .\Antivirus.ps1
 
 # CLI Parameters: -Uninstall | -ChaosMode (test with EICAR) | -LearningMode (log-only) | -SelfTest (diagnostics)
+# Password rotator installs automatically on first elevated run (no switch required).
 
 # View main logs
 Get-Content "C:\ProgramData\Antivirus\Logs\av.log" -Tail 100
