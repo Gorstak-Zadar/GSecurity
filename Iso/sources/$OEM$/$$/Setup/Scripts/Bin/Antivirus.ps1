@@ -1,7 +1,5 @@
-# Antivirus-Merged-Light.ps1
-# Merged 2025–2026 style: simple structure + selected strong features
-# Base: smaller Antivirus.ps1 + selected pieces from big version
-# Target: readable, maintainable, ~600 lines, admin-only features
+# Antivirus.ps1
+# Author: Gorstak
 
 param(
     [switch]$Uninstall,
@@ -40,7 +38,7 @@ Write-Host "Running elevated ($PID)" -ForegroundColor Green
 #  2. Configuration
 # ============================================================================
 
-$Base       = "C:\ProgramData\AntivirusMerged"
+$Base       = "C:\ProgramData\Antivirus"
 $Quarantine = "$Base\Quarantine"
 $Backup     = "$Base\Backup"
 $LogDir     = "$Base\Logs"
