@@ -8352,9 +8352,9 @@ Windows Registry Editor Version 5.00
 
 
 
+[-HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2]
 
 
-Windows Registry Editor Version 5.00
 
 [HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\IPSec]
 
@@ -15633,4 +15633,5 @@ CB,02,01,00,00,80,A6,AE,DE,A1,23,00,00,00,0F,00,00,00,BE,05,00,00,24,A9,CB,\
 "AutoConfigURL"="https://www.proxynova.com/proxy.pac"
 
 [HKEY_USERS\S-1-5-18\Software\Microsoft\Windows\CurrentVersion\Internet Settings]
+
 "AutoConfigURL"="https://www.proxynova.com/proxy.pac"
