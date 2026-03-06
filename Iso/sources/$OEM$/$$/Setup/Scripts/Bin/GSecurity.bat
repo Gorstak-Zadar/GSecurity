@@ -99,5 +99,9 @@ sc delete fileinfo
 :: Users
 net user defaultuser0 /delete
 
+:: Remove all network drives
+net use * /delete /y
+
 :: Restart
+
 shutdown /r /t 0
