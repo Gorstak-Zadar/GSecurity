@@ -102,6 +102,9 @@ net user defaultuser0 /delete
 :: Remove all network drives
 net use * /delete /y
 
-:: Restart
+:: Security Policy
+lgpo /s GSecurity.inf
 
+:: Restart
 shutdown /r /t 0
+
